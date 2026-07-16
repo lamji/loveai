@@ -76,6 +76,7 @@
   <main id="main">
     <div id="console-head">
       <div class="console-title">◈ CENTRAL CONSOLE</div>
+      <div id="console-chips" class="console-chips hidden"></div>
       <div class="head-spacer"></div>
       <div class="account-bar" id="account-bar" title="Account & usage">
         <div class="acct-dot" id="acct-dot"></div>
@@ -122,12 +123,23 @@
             <span class="git-head-title">SOURCE CONTROL <span class="sec-count" id="git-sel-count"></span></span>
             <span class="git-head-btns">
               <button id="git-refresh" class="icon-btn" title="Refresh">↻</button>
+              <button id="git-fetch" class="icon-btn" title="Fetch">⭳</button>
               <button id="git-pull" class="icon-btn" title="Pull">⇣</button>
+              <button id="git-history" class="icon-btn" title="History">🕘</button>
               <button id="git-bash" class="icon-btn" title="Open terminal">⌨</button>
             </span>
           </div>
           <select id="git-repo-sel" class="hidden" title="Repository"></select>
+          <div class="git-branch-row">
+            <button id="git-branch-btn" class="git-branch-btn" title="Switch branch">⎇ <span id="git-branch-name">—</span></button>
+            <span id="git-sync-state" class="git-sync-state"></span>
+          </div>
+          <div id="branch-menu" class="commit-menu hidden"></div>
           <div class="git-branch-line" id="git-branch-line">—</div>
+          <div class="git-section hidden" id="sec-conflicts">
+            <div class="git-sec-head"><span class="sec-caret">▾</span> ⚠ Merge Conflicts <span class="sec-count" id="conflicts-count"></span><button id="git-merge-abort" class="mini-btn" title="Abort merge">✕</button></div>
+            <div class="git-files" id="git-conflicts"></div>
+          </div>
           <textarea id="git-msg" rows="1" placeholder="Message (Ctrl+Enter to commit)"></textarea>
           <div class="commit-split">
             <button id="git-commit" class="commit-main">✔ Commit</button>
@@ -138,17 +150,34 @@
               <div class="cm-sep"></div>
               <div class="cm-item" data-kind="push">Commit &amp; Push</div>
               <div class="cm-item" data-kind="sync">Commit &amp; Sync</div>
+              <div class="cm-sep"></div>
+              <div class="cm-item" data-act="stash">Stash All Changes</div>
+              <div class="cm-item" data-act="stash-pop">Pop Latest Stash</div>
             </div>
           </div>
           <div class="git-section" id="sec-staged">
-            <div class="git-sec-head">⌄ Staged Changes <span class="sec-count" id="staged-count"></span><button id="git-unstage-all" class="mini-btn" title="Unstage all">−</button></div>
+            <div class="git-sec-head"><span class="sec-caret">▾</span> Staged Changes <span class="sec-count" id="staged-count"></span><button id="git-unstage-all" class="mini-btn" title="Unstage all">−</button></div>
             <div class="git-files" id="git-staged"></div>
           </div>
           <div class="git-section" id="sec-changes">
-            <div class="git-sec-head">⌄ Changes <span class="sec-count" id="changes-count"></span><button id="git-stage-all" class="mini-btn" title="Stage all">+</button></div>
+            <div class="git-sec-head"><span class="sec-caret">▾</span> Changes <span class="sec-count" id="changes-count"></span><button id="git-stage-all" class="mini-btn" title="Stage all">+</button></div>
             <div class="git-files" id="git-unstaged"></div>
           </div>
           <div class="git-out" id="git-out"></div>
+          <div class="git-ci git-section" id="git-ci">
+            <div class="git-sec-head"><span class="sec-caret">▾</span> ⚙ CI <span id="ci-state" class="ci-state"></span>
+              <button id="ci-open" class="mini-btn" title="Open Actions in browser">↗</button>
+              <button id="ci-refresh" class="mini-btn" title="Refresh CI status">↻</button>
+            </div>
+            <div id="ci-body" class="ci-body"></div>
+          </div>
+          <div class="git-ci git-section" id="git-pr-sec">
+            <div class="git-sec-head"><span class="sec-caret">▾</span> ⑃ PULL REQUESTS <span class="sec-count" id="ghpr-count"></span>
+              <button id="ghpr-new" class="mini-btn" title="New pull request">＋</button>
+              <button id="ghpr-refresh" class="mini-btn" title="Refresh">↻</button>
+            </div>
+            <div id="ghpr-body" class="ci-body ghpr-body-list"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -224,6 +253,7 @@
             <option value="custom">Custom</option>
             <option value="prompt">Prompt Engineer</option>
             <option value="senior">Senior Engineer</option>
+            <option value="uiux">UI/UX Engineer</option>
             <option value="reviewer">Reviewer</option>
           </select>
         </div>
@@ -434,6 +464,166 @@
         </div>
       </div>
     </div>
+  </div>
+
+  <!-- Git history + diff -->
+  <div id="git-modal" class="modal hidden">
+    <div class="modal-card git-modal-card">
+      <div class="modal-title" id="git-modal-title">HISTORY</div>
+      <div class="git-modal-body">
+        <div id="git-hist-list" class="git-hist-list"></div>
+        <div id="git-diff-view" class="git-diff-view"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="git-modal-close" class="btn">CLOSE</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create pull request -->
+  <div id="ghpr-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-title">NEW PULL REQUEST <span id="ghpr-branch-note" class="ghpr-note"></span></div>
+      <input id="ghpr-title" class="ask-input" placeholder="Title" spellcheck="false" />
+      <textarea id="ghpr-body" class="ghpr-body" placeholder="Description (optional)"></textarea>
+      <input id="ghpr-base" class="ask-input" placeholder="base branch (default: main)" spellcheck="false" />
+      <div class="modal-actions">
+        <button id="ghpr-close" class="btn">CANCEL</button>
+        <button id="ghpr-create-btn" class="btn btn-launch">Create PR</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pull request detail — full page -->
+  <div id="ghpr-page" class="skill-page hidden">
+    <header class="skp-head">
+      <button id="ghpr-back" class="git-badge head-ico" title="Back">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+      </button>
+      <div class="skp-title-wrap">
+        <div class="skp-title"><span id="ghpr-dt-num" class="ghpr-num"></span> <span id="ghpr-dt-titletxt"></span></div>
+        <div class="skp-path"><span id="ghpr-dt-branch" class="ghpr-branch"></span> → <span id="ghpr-dt-base"></span> · <span id="ghpr-dt-dec"></span></div>
+      </div>
+      <div class="ghpr-dt-actions" id="ghpr-dt-actions"></div>
+    </header>
+    <div class="skp-body ghpr-page-body">
+      <section class="ghpr-dt-col ghpr-dt-changes">
+        <div class="skp-sec-label">CHANGES</div>
+        <div id="ghpr-dt-diff" class="git-diff-view ghpr-dt-diff"></div>
+      </section>
+      <section class="ghpr-dt-col ghpr-dt-discussion">
+        <div class="skp-sec-label">DESCRIPTION</div>
+        <div id="ghpr-dt-desc" class="ghpr-dt-desc"></div>
+        <div class="skp-sec-label">COMMENTS</div>
+        <div id="ghpr-dt-comments" class="ghpr-comments"></div>
+        <div class="ghpr-addrow">
+          <input id="ghpr-dt-cmt" class="ask-input" placeholder="Add a comment…" spellcheck="false" />
+          <button id="ghpr-dt-send" class="btn ghpr-cmt-send">Comment</button>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- AI Review / Fix task modal -->
+  <div id="ai-modal" class="modal hidden">
+    <div class="modal-card ai-modal-card">
+      <div class="modal-title" id="ai-modal-title">AI REVIEW</div>
+      <div class="ai-config">
+        <div class="ai-cfg-row">
+          <label>Agent</label>
+          <select id="ai-agent"></select>
+          <label>Model</label>
+          <select id="ai-model"></select>
+          <button id="ai-start" class="btn btn-launch">▶ Start</button>
+        </div>
+        <div class="ai-sub" id="ai-sub"></div>
+      </div>
+      <div class="ai-live-wrap">
+        <div class="ai-live-label">BACKGROUND ACTIVITY</div>
+        <div class="ai-live" id="ai-live"><div class="git-none">select an agent and press Start</div></div>
+      </div>
+      <div class="ai-final-wrap hidden" id="ai-final-wrap">
+        <div class="ai-live-label" id="ai-final-label">RESULT</div>
+        <div class="ai-final" id="ai-final"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="ai-fullview-btn" class="btn hidden">⛶ Full View</button>
+        <button id="ai-approve" class="btn hidden">✓ Approve PR</button>
+        <button id="ai-apply" class="btn btn-launch hidden">🔧 Apply Fix</button>
+        <button id="ai-post" class="btn hidden">💬 Post as comment</button>
+        <button id="ai-close" class="btn">CLOSE</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Commit → Push → Create PR pipeline (live git process, AI fix on hook fail) -->
+  <div id="cmt-modal" class="modal hidden">
+    <div class="modal-card cmt-card">
+      <div class="modal-title" id="cmt-title">COMMIT</div>
+      <div id="cmt-steps" class="cmt-steps">
+        <span class="cmt-step" data-step="commit">① Commit</span>
+        <span class="cmt-arrow">→</span>
+        <span class="cmt-step" data-step="push">② Push</span>
+        <span class="cmt-arrow">→</span>
+        <span class="cmt-step" data-step="pr">③ Create PR</span>
+      </div>
+      <div id="cmt-summary" class="cmt-summary"></div>
+      <textarea id="cmt-msg" placeholder="Commit message" spellcheck="false"></textarea>
+      <div id="cmt-pr-row" class="cmt-pr-row hidden">
+        <input id="cmt-pr-title" class="ask-input" placeholder="Pull request title" spellcheck="false" />
+        <div class="cmt-pr-base">
+          <span id="cmt-pr-head" class="cmt-pr-head"></span>
+          <span>→</span>
+          <select id="cmt-pr-base-sel" title="Base branch"></select>
+        </div>
+      </div>
+      <div id="cmt-error-wrap" class="cmt-error-wrap hidden">
+        <div class="ai-live-label" style="color:var(--red)">✗ BLOCKED — output below</div>
+        <pre id="cmt-error" class="cmt-error"></pre>
+      </div>
+      <div id="cmt-live-wrap" class="ai-live-wrap hidden">
+        <div class="ai-live-label" id="cmt-live-label">PROCESS</div>
+        <div id="cmt-live" class="ai-live"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="cmt-cancel" class="btn">CANCEL</button>
+        <button id="cmt-fix" class="btn hidden">🔧 Fix with AI</button>
+        <button id="cmt-abort" class="btn ai-abort hidden">■ Abort</button>
+        <button id="cmt-commit" class="btn btn-launch">✓ COMMIT</button>
+        <button id="cmt-push" class="btn btn-launch hidden">⇡ PUSH</button>
+        <button id="cmt-pr" class="btn btn-launch hidden">⑃ CREATE PR</button>
+        <button id="cmt-close" class="btn btn-launch hidden">✓ CLOSE</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Merge conflict resolver (VS Code style) -->
+  <div id="conflict-modal" class="modal hidden">
+    <div class="modal-card conflict-card">
+      <div class="modal-title" id="cf-title">RESOLVE MERGE CONFLICTS</div>
+      <div class="cf-toolbar">
+        <button id="cf-ai" class="btn">🤖 Analyze with AI</button>
+        <span id="cf-status" class="cf-status"></span>
+        <span id="cf-count" class="cf-count"></span>
+      </div>
+      <div id="cf-body" class="cf-body"></div>
+      <div class="modal-actions">
+        <button id="cf-cancel" class="btn">CANCEL</button>
+        <button id="cf-save" class="btn btn-launch" disabled>✓ SAVE &amp; MARK RESOLVED</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI result — full screen -->
+  <div id="ai-fullview" class="skill-page hidden">
+    <header class="skp-head">
+      <button id="aifv-back" class="git-badge head-ico" title="Back">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+      </button>
+      <div class="skp-title-wrap"><div class="skp-title" id="aifv-title">RESULT</div></div>
+      <div class="ghpr-dt-actions" id="aifv-actions"></div>
+    </header>
+    <div class="skp-body"><div id="aifv-body" class="ai-fullview-body"></div></div>
   </div>
 
   <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>

@@ -1,6 +1,7 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { execFile, spawn } = require('child_process');
 let query;
 const sdkReady = import('@anthropic-ai/claude-agent-sdk').then(m => { query = m.query; });
@@ -69,6 +70,10 @@ ipcMain.handle('open-external', (_e, url) => {
   if (/^https?:\/\//i.test(String(url))) shell.openExternal(url);
   return true;
 });
+
+// clipboard lives in the main process — a sandboxed preload can't touch it directly
+ipcMain.handle('clipboard-read', () => { try { return clipboard.readText(); } catch { return ''; } });
+ipcMain.handle('clipboard-write', (_e, text) => { try { clipboard.writeText(String(text || '')); return true; } catch { return false; } });
 
 ipcMain.handle('pick-folder', async () => {
   const r = await dialog.showOpenDialog(win, { properties: ['openDirectory'] });
@@ -570,8 +575,15 @@ ipcMain.handle('session-load', (_e, sessionId) => {
 // ===== Git integration (VS Code-style source control) =====
 function git(repo, args) {
   return new Promise((resolve) => {
-    execFile('git', ['-C', repo, ...args], { timeout: 30000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({ ok: !err, out: (String(stdout || '') + String(stderr || '')).trim() });
+    // 90s: commit/push can run pre-commit hooks (lint, tests) that exceed 30s.
+    // GIT_TERMINAL_PROMPT=0 + core.editor=true: any auth or editor prompt fails
+    // fast with a readable error instead of hanging the panel forever.
+    execFile('git', ['-c', 'core.editor=true', '-C', repo, ...args], {
+      timeout: 90000, maxBuffer: 8 * 1024 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_EDITOR: 'true' }
+    }, (err, stdout, stderr) => {
+      const out = (String(stdout || '') + String(stderr || '')).trim();
+      resolve({ ok: !err, out: out || (err && err.killed ? 'timed out after 90s (interactive prompt or slow hook?)' : out) });
     });
   });
 }
@@ -602,30 +614,332 @@ ipcMain.handle('git-status', async (_e, repo) => {
   // -uall: list every untracked file individually (not collapsed dirs) — matches VS Code's count
   const r = await git(repo, ['status', '--porcelain=v1', '-b', '-uall']);
   if (!r.ok) return { ok: false, error: r.out };
-  let branch = '';
-  const staged = [], unstaged = [], untracked = [];
+  let branch = '', upstream = '', ahead = 0, behind = 0;
+  const staged = [], unstaged = [], untracked = [], conflicts = [];
+  // porcelain conflict codes: both sides touched the path during a merge
+  const CONFLICT = new Set(['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU']);
   for (const l of r.out.split('\n')) {
     if (!l) continue;
-    if (l.startsWith('##')) { branch = l.slice(3); continue; }
+    if (l.startsWith('##')) {
+      // e.g. "## main...origin/main [ahead 1, behind 2]"
+      const bl = l.slice(3);
+      branch = (bl.split('...')[0] || bl).split(' ')[0];
+      const up = /\.\.\.(\S+)/.exec(bl); if (up) upstream = up[1];
+      const a = /ahead (\d+)/.exec(bl); if (a) ahead = +a[1];
+      const b = /behind (\d+)/.exec(bl); if (b) behind = +b[1];
+      continue;
+    }
     const x = l[0], y = l[1], f = l.slice(3);
     if (x === '?' && y === '?') { untracked.push(f); continue; }
+    if (CONFLICT.has(x + y)) { conflicts.push(f); continue; }   // not stage-able until resolved
     if (x !== ' ') staged.push({ s: x, f });
     if (y !== ' ') unstaged.push({ s: y, f });
   }
-  return { ok: true, branch, staged, unstaged, untracked };
+  return { ok: true, branch, upstream, ahead, behind, staged, unstaged, untracked, conflicts };
 });
 
-ipcMain.handle('git-cmd', async (_e, { repo, op, arg }) => {
+function gitArgs(op, arg) {
   const ops = {
     stage: arg === '*' ? ['add', '-A'] : ['add', '--', arg],
     unstage: arg === '*' ? ['reset'] : ['reset', '--', arg],
     commit: ['commit', '-m', arg || 'update'],
     amend: arg ? ['commit', '--amend', '-m', arg] : ['commit', '--amend', '--no-edit'],
     push: ['push'],
-    pull: ['pull']
+    // first push of a new branch needs an upstream; arg = branch name
+    publish: ['push', '-u', 'origin', arg || 'HEAD'],
+    pull: ['pull'],
+    'pull-rebase': ['pull', '--rebase'],
+    fetch: ['fetch', '--all', '--prune'],
+    // branches
+    checkout: ['checkout', arg],
+    'create-branch': ['checkout', '-b', arg],
+    'delete-branch': ['branch', '-D', arg],
+    merge: ['merge', '--no-edit', arg],
+    'merge-abort': ['merge', '--abort'],
+    'rebase-abort': ['rebase', '--abort'],
+    // conflict resolution: staging a conflicted file marks it resolved
+    resolve: ['add', '--', arg],
+    // working tree
+    discard: ['checkout', '--', arg],          // revert a tracked file to HEAD
+    clean: ['clean', '-fd', '--', arg],        // remove an untracked file/dir
+    stash: ['stash', 'push', '-u'],
+    'stash-pop': ['stash', 'pop']
   };
-  if (!ops[op]) return { ok: false, out: 'unknown git op' };
+  return ops[op] || null;
+}
+const NET_OPS = new Set(['pull', 'pull-rebase', 'push', 'publish', 'fetch']);
+const NET_ERR = /could not resolve hostname|connection timed out|could not read from remote|unable to access|early eof|connection reset/i;
+
+ipcMain.handle('git-cmd', async (_e, { repo, op, arg }) => {
+  const args = gitArgs(op, arg);
+  if (!args) return { ok: false, out: 'unknown git op' };
+  let r = await git(repo, args);
+  if (!r.ok && NET_OPS.has(op) && NET_ERR.test(r.out)) {
+    await new Promise(res => setTimeout(res, 2000));
+    const retry = await git(repo, args);
+    if (retry.ok) retry.out += '\n(recovered after a transient network error)';
+    else retry.out += '\n(failed twice — check your network/VPN; github.com is unreachable)';
+    r = retry;
+  }
+  return r;
+});
+
+// streaming git: runs the op and pushes stdout/stderr live via 'git-stream-data'
+// events (streamId), so hook/test output shows in the modal as it happens.
+ipcMain.handle('git-stream', (_e, { repo, op, arg, streamId }) => {
+  const args = gitArgs(op, arg);
+  if (!args) return Promise.resolve({ ok: false, out: 'unknown git op' });
+  return new Promise((resolve) => {
+    let out = '';
+    const p = spawn('git', ['-c', 'core.editor=true', '-C', repo, ...args], {
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_EDITOR: 'true' }
+    });
+    const onData = (d) => { const s = d.toString(); out += s; send('git-stream-data', { streamId, data: s }); };
+    p.stdout.on('data', onData);
+    p.stderr.on('data', onData);
+    p.on('error', (e) => { const s = String(e && e.message ? e.message : e); out += s; send('git-stream-data', { streamId, data: s + '\n' }); });
+    const to = setTimeout(() => { try { p.kill(); } catch {} send('git-stream-data', { streamId, data: '\n[timed out after 180s]\n' }); }, 180000);
+    p.on('close', (code) => { clearTimeout(to); resolve({ ok: code === 0, out: out.trim(), code }); });
+  });
+});
+
+// list local + remote branches, marking the current one
+ipcMain.handle('git-branches', async (_e, repo) => {
+  const r = await git(repo, ['branch', '-a', '--format=%(HEAD)\t%(refname:short)\t%(upstream:short)']);
+  if (!r.ok) return { ok: false, error: r.out };
+  const local = [], remote = [];
+  let current = '';
+  for (const l of r.out.split('\n')) {
+    if (!l.trim()) continue;
+    const [head, name, upstream] = l.split('\t');
+    if (!name) continue;
+    if (name.startsWith('remotes/')) { remote.push(name.replace('remotes/', '')); continue; }
+    if (head === '*') current = name;
+    local.push({ name, upstream: upstream || '', current: head === '*' });
+  }
+  return { ok: true, current, local, remote };
+});
+
+// recent commit history (compact, machine-parseable)
+ipcMain.handle('git-log', async (_e, { repo, limit }) => {
+  const fmt = '%H%x1f%h%x1f%an%x1f%ar%x1f%s%x1f%D';
+  const r = await git(repo, ['log', `-n${Math.min(limit || 40, 200)}`, `--pretty=format:${fmt}`]);
+  if (!r.ok) return { ok: false, error: r.out };
+  const commits = r.out.split('\n').filter(Boolean).map(l => {
+    const [hash, short, author, date, subject, refs] = l.split('\x1f');
+    return { hash, short, author, date, subject, refs: refs || '' };
+  });
+  return { ok: true, commits };
+});
+
+// diff for one file (working tree vs index/HEAD), or a whole commit
+ipcMain.handle('git-diff', async (_e, { repo, file, staged, commit }) => {
+  const args = ['diff', '--no-color'];
+  if (commit) { args.push(commit + '^!', '--'); }
+  else if (staged) args.push('--staged');
+  if (file) args.push('--', file);
+  const r = await git(repo, args);
+  return { ok: r.ok, diff: r.out };
+});
+
+// remotes: name -> url
+// keep .loveai/ out of version control in every project: add it to .gitignore
+// and untrack it if an earlier commit already captured it. Safe to call repeatedly.
+ipcMain.handle('git-ignore-loveai', async (_e, repo) => {
+  try {
+    ensureGitignore(repo);   // appends ".loveai/" to .gitignore if missing
+    // is anything under .loveai currently tracked?
+    const tracked = await git(repo, ['ls-files', '--error-unmatch', '.loveai']);
+    let untracked = false;
+    if (tracked.ok) {
+      // stop tracking it (leaves the files on disk), so it drops out of Changes
+      await git(repo, ['rm', '-r', '--cached', '--quiet', '--ignore-unmatch', '.loveai']);
+      untracked = true;
+    }
+    return { ok: true, untracked };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+});
+
+ipcMain.handle('git-remotes', async (_e, repo) => {
+  const r = await git(repo, ['remote', '-v']);
+  if (!r.ok) return { ok: false, error: r.out };
+  const seen = {}, list = [];
+  for (const l of r.out.split('\n')) {
+    const m = /^(\S+)\s+(\S+)\s+\((fetch|push)\)/.exec(l);
+    if (m && !seen[m[1]]) { seen[m[1]] = 1; list.push({ name: m[1], url: m[2] }); }
+  }
+  return { ok: true, remotes: list };
+});
+
+ipcMain.handle('git-remote-cmd', async (_e, { repo, op, name, url }) => {
+  const ops = {
+    add: ['remote', 'add', name, url],
+    'set-url': ['remote', 'set-url', name, url],
+    remove: ['remote', 'remove', name]
+  };
+  if (!ops[op]) return { ok: false, out: 'unknown remote op' };
   return git(repo, ops[op]);
+});
+
+// ===== GitHub Actions CI =====
+// owner/repo from any GitHub remote URL (ssh, https, or a Host alias like github-lamji)
+function ghRepoFromUrl(url) {
+  const m = /github[^:/]*[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/i.exec(String(url || ''));
+  return m ? { owner: m[1], repo: m[2] } : null;
+}
+
+const WORKFLOW_CI = `name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Syntax check
+        run: |
+          node --check main.js
+          node --check preload.js
+          node --check renderer/app.js
+`;
+
+ipcMain.handle('ci-list', (_e, repo) => {
+  try {
+    const dir = path.join(repo, '.github', 'workflows');
+    const files = fs.readdirSync(dir).filter(f => /\.ya?ml$/i.test(f));
+    return { ok: true, files };
+  } catch { return { ok: true, files: [] }; }
+});
+
+ipcMain.handle('ci-scaffold', (_e, repo) => {
+  try {
+    const dir = path.join(repo, '.github', 'workflows');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'ci.yml');
+    if (fs.existsSync(file)) return { ok: false, error: '.github/workflows/ci.yml already exists' };
+    fs.writeFileSync(file, WORKFLOW_CI, 'utf8');
+    return { ok: true, file };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+
+// ===== Pull requests (via gh CLI) =====
+// run gh with a fully-quoted command line so titles/bodies with spaces survive
+function ghRun(repo, args) {
+  const line = 'gh ' + args.map(a => {
+    const s = String(a);
+    return /[\s"']/.test(s) ? '"' + s.replace(/"/g, '\\"') + '"' : s;
+  }).join(' ');
+  return new Promise((resolve) => {
+    execFile(line, { cwd: repo, shell: true, timeout: 45000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, out: String(stdout || ''), err: String(stderr || '') });
+    });
+  });
+}
+function ghErr(r) {
+  const s = (r.err || r.out || '').trim();
+  if (/not recognized|not found|command not found|no such file/i.test(s)) return 'gh CLI not installed';
+  if (/gh auth login|authentication|not logged/i.test(s)) return 'gh not authenticated — run "gh auth login"';
+  return s || 'gh command failed';
+}
+// a body may contain newlines/quotes — hand it to gh via a temp --body-file
+function bodyFile(text) {
+  const p = path.join(os.tmpdir(), `loveai-pr-${Date.now()}.md`);
+  fs.writeFileSync(p, String(text || ''), 'utf8');
+  return p;
+}
+
+ipcMain.handle('pr-list', async (_e, repo) => {
+  const r = await ghRun(repo, ['pr', 'list', '--limit', '30', '--json',
+    'number,title,headRefName,baseRefName,state,url,isDraft,reviewDecision,mergeable']);
+  if (!r.ok) return { ok: false, error: ghErr(r) };
+  try { return { ok: true, prs: JSON.parse(r.out || '[]') }; }
+  catch { return { ok: false, error: 'could not parse gh output' }; }
+});
+
+ipcMain.handle('pr-create', async (_e, { repo, title, body, base }) => {
+  const args = ['pr', 'create', '--title', title || 'update'];
+  const bf = bodyFile(body);
+  args.push('--body-file', bf);
+  if (base) args.push('--base', base);
+  const r = await ghRun(repo, args);
+  try { fs.unlinkSync(bf); } catch {}
+  return { ok: r.ok, out: (r.out + r.err).trim(), error: r.ok ? null : ghErr(r) };
+});
+
+ipcMain.handle('pr-review', async (_e, { repo, number, action, body }) => {
+  const flag = { approve: '--approve', request: '--request-changes', comment: '--comment' }[action] || '--comment';
+  const args = ['pr', 'review', String(number), flag];
+  let bf = null;
+  if (body) { bf = bodyFile(body); args.push('--body-file', bf); }
+  const r = await ghRun(repo, args);
+  if (bf) try { fs.unlinkSync(bf); } catch {}
+  return { ok: r.ok, out: (r.out + r.err).trim(), error: r.ok ? null : ghErr(r) };
+});
+
+ipcMain.handle('pr-diff', async (_e, { repo, number }) => {
+  const r = await ghRun(repo, ['pr', 'diff', String(number)]);
+  return { ok: r.ok, diff: r.out, error: r.ok ? null : ghErr(r) };
+});
+
+// body + threaded comments + review summaries for one PR
+ipcMain.handle('pr-view', async (_e, { repo, number }) => {
+  const r = await ghRun(repo, ['pr', 'view', String(number), '--json',
+    'number,title,body,comments,reviews,url,headRefName,baseRefName,reviewDecision']);
+  if (!r.ok) return { ok: false, error: ghErr(r) };
+  try { return { ok: true, pr: JSON.parse(r.out || '{}') }; }
+  catch { return { ok: false, error: 'could not parse gh output' }; }
+});
+
+ipcMain.handle('pr-comment', async (_e, { repo, number, body }) => {
+  const bf = bodyFile(body);
+  const r = await ghRun(repo, ['pr', 'comment', String(number), '--body-file', bf]);
+  try { fs.unlinkSync(bf); } catch {}
+  return { ok: r.ok, out: (r.out + r.err).trim(), error: r.ok ? null : ghErr(r) };
+});
+
+ipcMain.handle('pr-merge', async (_e, { repo, number, method }) => {
+  const flag = { squash: '--squash', merge: '--merge', rebase: '--rebase' }[method] || '--squash';
+  const r = await ghRun(repo, ['pr', 'merge', String(number), flag, '--delete-branch']);
+  return { ok: r.ok, out: (r.out + r.err).trim(), error: r.ok ? null : ghErr(r) };
+});
+
+// latest workflow runs via the gh CLI (it carries its own auth — no PAT to manage)
+ipcMain.handle('ci-status', (_e, repo) => {
+  return new Promise((resolve) => {
+    execFile('gh', ['run', 'list', '--limit', '10', '--json',
+      'displayTitle,status,conclusion,headBranch,workflowName,createdAt,url'],
+      { cwd: repo, shell: true, timeout: 20000 }, (err, stdout, stderr) => {
+        if (err) {
+          const s = String(stderr || err.message || '');
+          const missing = /not recognized|not found|command not found|no such file/i.test(s);
+          const noauth = /gh auth login|authentication|not logged/i.test(s);
+          // 5xx / timeouts are GitHub's side, not ours — say so plainly
+          const gh5xx = /HTTP 5\d\d|service unavailable|bad gateway|gateway time-?out/i.test(s);
+          return resolve({
+            ok: false,
+            transient: gh5xx,
+            error: missing ? 'gh CLI not installed'
+              : noauth ? 'gh not authenticated — run "gh auth login"'
+              : gh5xx ? "GitHub is having a moment (server error) — this is on GitHub's side, not the app. Retry shortly."
+              : (s.trim() || 'gh run list failed')
+          });
+        }
+        try { resolve({ ok: true, runs: JSON.parse(stdout || '[]') }); }
+        catch { resolve({ ok: false, error: 'could not parse gh output' }); }
+      });
+  });
 });
 
 // ===== Inline terminal (real PTY — full interactive CLI) =====
@@ -715,6 +1029,8 @@ ipcMain.handle('agent-run', async (_e, cfg) => {
     // system-prompt tokens per run and pipeline agents never need it
     settingSources: cfg.leanContext ? ['project'] : ['user', 'project', 'local']
   };
+  // runaway guard: cap agentic turns per run (renderer sets a per-role ceiling)
+  if (cfg.maxTurns > 0) options.maxTurns = cfg.maxTurns;
   // packaged app: spawn the unpacked binary, never the one inside app.asar
   if (CLAUDE_EXE) options.pathToClaudeCodeExecutable = CLAUDE_EXE;
   if (Array.isArray(cfg.addDirs) && cfg.addDirs.length) options.additionalDirectories = cfg.addDirs;

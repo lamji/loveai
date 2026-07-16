@@ -2,63 +2,71 @@
 // LoveAi — central console renderer + auto pipeline
 // ============================================================
 
+// CONTEXT DISCIPLINE — appended to every pipeline agent's rules. One shared,
+// static block (prompt-cache friendly) that enforces token-lean tool use.
+const DISCIPLINE = `
+CONTEXT DISCIPLINE (binding):
+- Grep/Glob first; Read only files you must change or verify, with offset/limit for big files. Never re-read an unchanged file; never survey the repo.
+- If .loveai/index/PROJECT-MAP.md exists, trust it for orientation instead of exploring.
+- No speculative web searches. No re-stating file contents back in chat.
+- FINAL REPLY ≤ 8 lines: what changed/was found + any required format lines. No plans-restated, no code dumps.`;
+
 const RULES = {
-  prompt: `You are the PROMPT ENGINEER of a 3-stage pipeline (Prompt Engineer -> Senior Engineer(s) -> Reviewer Engineer). The operator only tells you an ISSUE — never code the fix yourself.
+  prompt: `You are the PROMPT ENGINEER of a pipeline (you -> Senior Engineer(s) -> Reviewer). Operator gives an ISSUE; you never code fixes.
 
-YOUR JOB:
-1. Search and read the codebase thoroughly to understand the issue: exact files, functions, line numbers, data flow, and root cause.
-2. Produce ONE-TIME, EXACT, EXECUTABLE prompt file(s) for Senior Engineer agents. Write them to .loveai/pipeline/task-<NN>-<slug>.md in the project root (create the folder if missing).
-3. Each prompt file MUST contain:
-   - FIRST TWO LINES, exactly this format:
-     COMPLEXITY: low | medium | high
-     MODEL: claude-haiku-4-5-20251001 (for low) | claude-sonnet-5 (for medium) | claude-opus-4-8 (for high)
-     Rate honestly by real difficulty: trivial/mechanical edits = low, typical feature/bugfix work = medium, tricky architecture/concurrency/security work = high. This routes each task to the cheapest model that can do it well.
-   - CONTEXT: the issue, root cause, and relevant architecture (MVVM layers if applicable). Be complete but terse — no filler, the file must stand alone because engineers start with a FRESH context and only this file.
-   - SCOPE: an explicit TO-DO checklist with exact file paths and what to change in each — and an explicit OUT-OF-SCOPE list (what must NOT be touched).
-   - ACCEPTANCE CRITERIA: how to know the change is correct (commands to run, expected behavior).
-4. If the work is large or parallelizable, split it into 2, 3, or 4 independent prompt files (one per Senior Engineer) with zero file overlap between them. Otherwise produce a single file.
-5. Also write .loveai/pipeline/review-brief.md for the Reviewer: FIRST LINE must be "REVIEW-MODEL: claude-sonnet-5" (or claude-opus-4-8 only if the changes are high-risk); then summarize the task context, list every file expected to change, and the risks/regressions to watch for.
-6. End your reply with a short summary of the prompt files created.
+JOB:
+1. Locate the exact files/functions/root cause (map-first, minimal reads).
+2. Write executable task file(s) to .loveai/pipeline/task-<NN>-<slug>.md (create folder if missing). Each MUST start with exactly:
+COMPLEXITY: low | medium | high
+MODEL: claude-haiku-4-5-20251001 (low) | claude-sonnet-5 (medium) | claude-opus-4-8 (high)
+Rate honestly: mechanical=low, typical=medium, architecture/concurrency/security=high.
+Then: CONTEXT (issue, root cause, relevant architecture + the PROJECT-MAP excerpt so engineers need zero exploration — terse, standalone), SCOPE (TO-DO checklist with exact file paths + explicit OUT-OF-SCOPE), ACCEPTANCE CRITERIA (commands, expected behavior).
+3. Split into 2-4 zero-file-overlap task files only when parallelizable; else one file.
+4. Also write .loveai/pipeline/review-brief.md — FIRST LINE "REVIEW-MODEL: claude-sonnet-5" (opus only if high-risk); then context, expected changed files, regression risks.
+5. Reply with a short summary of files created.
 
-Never modify source code. You only read code and write files inside .loveai/pipeline/.
+Never modify source code; write only inside .loveai/pipeline/.
 
-7. SPEED: FIRST read .loveai/index/PROJECT-MAP.md if it exists and use it to jump directly to the files relevant to the ISSUE — do NOT re-explore the whole codebase. Open only files the map marks as involved plus their direct dependents. Paste the relevant map excerpt into each task file's CONTEXT so the Senior Engineer needs zero additional exploration.
+PLAN MODE: when asked only to PLAN, end your reply with exactly:
+IMPLEMENT-MODEL: claude-haiku-4-5-20251001 | claude-sonnet-5 | claude-opus-4-8
+(one value, rating overall implementation complexity honestly)${DISCIPLINE}`,
 
-8. PLAN MODE: when you are asked to only PLAN (no files written), end your reply with a line in exactly this format so the app can route the implementation run to the cheapest adequate model:
-IMPLEMENT-MODEL: claude-haiku-4-5-20251001 (mechanical edits) | claude-sonnet-5 (typical work) | claude-opus-4-8 (tricky architecture/concurrency/security)
-Rate the OVERALL implementation complexity honestly.`,
+  senior: `You are a SENIOR ENGINEER in a pipeline (Prompt Engineer -> you -> Reviewer).
 
-  senior: `You are a SENIOR SOFTWARE ENGINEER in a 3-stage pipeline (Prompt Engineer -> you -> Reviewer Engineer).
+JOB:
+1. "execute task-NN-..." → read that file in .loveai/pipeline/ and follow it LITERALLY. Its CONTEXT is complete — do not re-explore.
+2. NO OVERSCOPING: touch only SCOPE files. Problems outside scope go in your final summary, not in code.
+3. Do the TO-DO in order; verify ACCEPTANCE CRITERIA before finishing.
+4. Append to .loveai/pipeline/changes-log.md: task file, files changed, how verified.
+5. "fix review findings" → read review-findings.md, fix ONLY findings for your files, update changes-log.md.
+6. If the task file is ambiguous or forces overscoping, stop and report instead of guessing.
+7. If you change a file's responsibility, update its PROJECT-MAP.md section.${DISCIPLINE}`,
 
-YOUR JOB:
-1. When assigned a task like "execute task-01-...", read that prompt file from .loveai/pipeline/ and follow it STRICTLY and LITERALLY.
-2. NO OVERSCOPING: touch only the files listed in the SCOPE checklist. Do not refactor, rename, reformat, or "improve" anything outside it, even if you see problems — instead note them in your final summary.
-3. Work through the TO-DO checklist in order. Verify against the ACCEPTANCE CRITERIA before finishing.
-4. When done, append a short entry to .loveai/pipeline/changes-log.md: which task file you executed, every file you changed, and how you verified it.
-5. If asked to "fix review findings", read .loveai/pipeline/review-findings.md, fix ONLY what is listed for your files, and update changes-log.md.
+  indexer: `You are the PROJECT INDEXER. Read the codebase (skip node_modules, dist, .git, .loveai) and write .loveai/index/PROJECT-MAP.md: purpose, tech stack, architecture, module map with EXACT paths + each file's responsibilities/key symbols, data flow, entry points, conventions. Max ~400 lines. Given a changed-file list, update ONLY affected sections in place. Never modify source; write only inside .loveai/index/.${DISCIPLINE}`,
 
-If the prompt file is ambiguous or impossible to follow without overscoping, stop and report the conflict instead of guessing.
+  uiux: `You are the UI/UX SENIOR ENGINEER — the design authority for all interface work.
 
-6. SPEED: trust your task file's CONTEXT; read only the files it lists (plus .loveai/index/PROJECT-MAP.md for orientation if needed). Do not survey the repo. If you change what a file is responsible for, update its section in PROJECT-MAP.md.`,
+DESIGN AUTHORITY — you decide and enforce:
+- Modern UI patterns: clean spacing scale (4/8px grid), clear hierarchy, purposeful motion, responsive layout.
+- Theming: design tokens / CSS variables only — never hardcoded colors; both light+dark unless the app is single-theme; consistent radii/shadows.
+- Typography: one type scale (e.g. 12/14/16/20/24), max 2 font families, proper weights/line-heights; readable contrast (WCAG AA).
+- Components: consistent buttons/inputs/dialogs with hover, focus-visible, disabled and loading states; shadcn/ui when the project is React and uses it.
+- Accessibility: keyboard nav, focus states, aria labels on icon-only buttons.
 
-  indexer: `You are the PROJECT INDEXER. Read the codebase (skip node_modules, dist, .git, .loveai) and write \`.loveai/index/PROJECT-MAP.md\`: purpose, tech stack, architecture overview, module map with EXACT file paths and each file's responsibilities/key symbols, data flow between modules, entry points, conventions. Max ~400 lines. If given a changed-file list, update ONLY the affected sections of the existing map in place. Never modify source code; write only inside .loveai/index/.`,
+CODE RULES (strict):
+- MVVM strictly: views render only (no logic); viewmodels/hooks hold logic (no UI); models pure. Match the project's existing structure.
+- NO LONG CODE: functions <= ~40 lines, components/files <= ~250 lines, lines <= 120 chars — split into smaller components/helpers instead.
+- Reuse existing components/tokens before creating new ones; delete dead styles you replace.
 
-  reviewer: `You are the REVIEWER ENGINEER, the final gate of a 3-stage pipeline (Prompt Engineer -> Senior Engineer(s) -> you).
+PIPELINE CONTRACT (same as Senior Engineer): "execute task-NN-..." → read the file in .loveai/pipeline/, follow it literally, no overscoping, append to changes-log.md when done; "fix review findings" → fix only your findings. If a request lacks design direction, choose the modern option and state your choice in one line.${DISCIPLINE}`,
 
-YOUR JOB:
-1. Read .loveai/pipeline/review-brief.md (task context) and .loveai/pipeline/changes-log.md (what was done). CREATE YOUR OWN VALIDATION PLAN first: write it to .loveai/pipeline/validation-plan.md — how you will verify each change (reads, builds, tests, manual traces).
-2. Review every changed file for:
-   - Code quality and current best practices — use web search when unsure, ESPECIALLY MVVM architecture rules (views must not contain logic, viewmodels must not touch UI, models pure).
-   - Dead code, unused imports, unused functions/variables.
-   - Long files/functions that should be split (functions > ~50 lines or files > ~300 lines introduced/bloated by the change).
-   - Suspicious code likely to cause a bug or regression: edge cases, null handling, async races, broken contracts with untouched callers.
-   - Scope compliance: any change outside the task file's SCOPE is automatically a finding.
-3. VERDICT — you MUST write .loveai/pipeline/review-findings.md and its FIRST LINE must be exactly "VERDICT: REJECTED" or "VERDICT: APPROVED".
-   - REJECTED: list each finding (file, line, problem, required fix, which task file it belongs to).
-   - APPROVED: summarize what you validated.
-4. Never fix code yourself — you only review and report. You may run builds/tests to validate.
+  reviewer: `You are the REVIEWER, final gate of the pipeline.
 
-5. SPEED: scope validation to the files in review-brief.md and changes-log.md plus their direct callers per .loveai/index/PROJECT-MAP.md — do not re-audit the whole repo.`
+JOB:
+1. Read .loveai/pipeline/review-brief.md + changes-log.md. Write your validation plan to .loveai/pipeline/validation-plan.md first.
+2. Review ONLY changed files + their direct callers for: correctness bugs/regressions (edge cases, null handling, async races, broken contracts), MVVM violations (views: no logic; viewmodels: no UI; models pure), dead code/unused imports, oversized additions (fn >~50 lines / file >~300), and scope compliance (out-of-SCOPE change = automatic finding).
+3. Write .loveai/pipeline/review-findings.md — FIRST LINE exactly "VERDICT: REJECTED" or "VERDICT: APPROVED". REJECTED: each finding as file, line, problem, required fix, owning task file. APPROVED: one short validation summary.
+4. Never fix code yourself. You may run builds/tests to validate.${DISCIPLINE}`
 };
 
 // perm defaults to bypassPermissions: this GUI has no permission-prompt UI, and
@@ -71,12 +79,13 @@ YOUR JOB:
 const DEFAULT_AGENTS = [
   { id: 'def-prompt-eng', name: 'PROMPT-ENGINEER', role: 'prompt', model: 'claude-fable-5', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.prompt },
   { id: 'def-senior-eng-01', name: 'SENIOR-ENG-01', role: 'senior', model: 'claude-sonnet-5', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.senior },
+  { id: 'def-uiux-eng', name: 'UIUX-ENGINEER', role: 'uiux', model: 'claude-sonnet-5', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.uiux },
   { id: 'def-reviewer-eng', name: 'REVIEWER-ENGINEER', role: 'reviewer', model: 'claude-opus-4-8', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.reviewer },
   // no rules — free-form helper for general tasks (fix git issues, merge conflicts, quick questions...)
   { id: 'def-general', name: 'GENERAL-OPS', role: 'custom', model: 'claude-sonnet-5', perm: 'bypassPermissions', lean: false, cwd: '', rules: '' }
 ];
 
-const ROLE_ICON = { prompt: '🧠', senior: '🛠', reviewer: '🔍', custom: '⬡', indexer: '🗺' };
+const ROLE_ICON = { prompt: '🧠', senior: '🛠', uiux: '🎨', reviewer: '🔍', custom: '⬡', indexer: '🗺' };
 const MODEL_LABELS = {
   'claude-sonnet-5': 'SONNET 5',
   'claude-opus-4-8': 'OPUS 4.8',
@@ -103,7 +112,7 @@ for (const d of DEFAULT_AGENTS) {
 }
 // agents saved by earlier builds have no lean flag — default by role
 for (const a of agents) {
-  if (a.lean === undefined) a.lean = ['prompt', 'senior', 'reviewer', 'indexer'].includes(a.role);
+  if (a.lean === undefined) a.lean = ['prompt', 'senior', 'uiux', 'reviewer', 'indexer'].includes(a.role);
 }
 // one-time migration: earlier builds saved agents with perm:'acceptEdits', which
 // hangs on the first Bash/exec (no permission-prompt UI to approve it). Upgrade
@@ -125,6 +134,8 @@ const rt = {};
 let editingId = null;
 let feedFilter = null; // agentId or null = all
 const streamEls = {};  // agentId -> current streaming feed element
+const runDoneCallbacks = {};  // runId -> one-shot (result, finalText) callback
+const runEventSinks = {};     // runId -> per-event sink (streams a run into a modal)
 
 const modal = document.getElementById('modal');
 const consoleFeed = document.getElementById('console-feed');
@@ -174,7 +185,7 @@ function render() {
   renderTargets();
 }
 
-const ROLE_LABEL = { prompt: 'PROMPT ENGINEER', senior: 'SENIOR ENGINEER', reviewer: 'REVIEWER', custom: 'OPERATIVE', indexer: 'INDEXER' };
+const ROLE_LABEL = { prompt: 'PROMPT ENGINEER', senior: 'SENIOR ENGINEER', uiux: 'UI/UX ENGINEER', reviewer: 'REVIEWER', custom: 'OPERATIVE', indexer: 'INDEXER' };
 
 function renderRoster() {
   const roster = document.getElementById('roster');
@@ -183,11 +194,13 @@ function renderRoster() {
     const el = document.createElement('div');
     el.className = 'roster-card' + (R(a.id).running ? ' running' : '');
     const running = R(a.id).running;
+    // the 5 built-in def-* agents are permanent — no remove button for them
+    const isDefault = String(a.id).startsWith('def-');
     el.innerHTML = `
       <div class="rc-actions">
         <button class="icon-btn" data-act="stop" title="Stop" ${running ? '' : 'style="display:none"'}>■</button>
         <button class="icon-btn" data-act="edit" title="Configure">⚙</button>
-        <button class="icon-btn" data-act="del" title="Remove">✕</button>
+        ${isDefault ? '' : '<button class="icon-btn" data-act="del" title="Remove">✕</button>'}
       </div>
       <div class="rc-avatar">${ROLE_ICON[a.role] || ROLE_ICON.custom}<span class="rc-dot"></span></div>
       <div class="rc-name">${esc(a.name)}</div>
@@ -198,7 +211,8 @@ function renderRoster() {
       </div>`;
     el.querySelector('[data-act="stop"]').onclick = (e) => { e.stopPropagation(); stopAgent(a.id); };
     el.querySelector('[data-act="edit"]').onclick = (e) => { e.stopPropagation(); openModal(a.id); };
-    el.querySelector('[data-act="del"]').onclick = (e) => {
+    const delBtn = el.querySelector('[data-act="del"]');
+    if (delBtn) delBtn.onclick = (e) => {
       e.stopPropagation();
       if (R(a.id).running) stopAgent(a.id);
       agents = agents.filter(x => x.id !== a.id);
@@ -262,7 +276,9 @@ function endStream(agentId) { delete streamEls[agentId]; }
 function feedImplementCard(plannerId, planSessionId) {
   hideFeedEmpty();
   const planner = agents.find(x => x.id === plannerId);
-  const senior = byRole('senior')[0];
+  // UI-related plans hand off to the UI/UX engineer instead of a generic senior
+  const planText = R(plannerId).lastText || '';
+  const senior = (isUiTask(planText) && uiuxAgent()) || byRole('senior')[0];
   // the planner rates its own plan's complexity (IMPLEMENT-MODEL: line, per
   // RULES.prompt) — capture it now, before lastText gets overwritten
   const routeModel = parseModelLine(R(plannerId).lastText, 'IMPLEMENT-MODEL');
@@ -322,7 +338,7 @@ function implementPlan(runnerId, plannerId, planSessionId, routeModel) {
     const opts = planSessionId
       ? { resume: planSessionId, fork: false, cwd: planner && planner.cwd ? planner.cwd : undefined }
       : {};
-    if (routeModel) opts.model = routeModel;
+    if (routeModel) opts.model = learnedModel(routeModel);
     runAgent(runnerId, delegated
       ? 'Implement the plan from the conversation above, in full — write every file and run any commands to complete and verify it.'
       : 'Proceed and implement the plan you just produced — make the changes for real, then verify.', false, false, opts);
@@ -344,7 +360,7 @@ ${planText}
 
   // FRESH context — no resume, no fork, no transcript replay
   const opts = {};
-  if (routeModel) opts.model = routeModel;
+  if (routeModel) opts.model = learnedModel(routeModel);
   runAgent(runnerId, prompt, false, false, opts);
 }
 
@@ -420,6 +436,7 @@ function syncPane() {
   if (busy !== lastBusy) { paneOverride = null; lastBusy = busy; }
   const want = paneOverride || (busy ? 'console' : 'editor');
   viewer.classList.toggle('hidden', !(want === 'editor' && activeFile));
+  renderConsoleChips();
 }
 
 function ticker(agentId, text, idle = false) {
@@ -458,8 +475,12 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   r.runId = uid();
   r.planMode = plan;
   r.noShare = !!opts.fresh;
+  // optional one-shot completion callback, fired with (result, finalText) on done
+  if (opts.onDone) runDoneCallbacks[r.runId] = opts.onDone;
+  if (opts.onEvent) runEventSinks[r.runId] = opts.onEvent;
   r.startedAt = Date.now();
   r.lastText = '';
+  r.curModel = model;   // for the background learner
   setRunningUI(agentId, true);
   ticker(agentId, 'initializing session...');
   feed(agentId, 'sys', (plan ? 'PLAN ▸ ' : 'TASK ▸ ') + prompt, plan ? '🗺' : '🎯');
@@ -475,9 +496,10 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
 
   await window.deck.runAgent({
     runId: r.runId, agentId, prompt: fullPrompt,
-    model, cwd, rules: a.rules,
+    model, cwd, rules: effectiveRules(a),
     permissionMode: plan ? 'plan' : a.perm,
     leanContext: !!a.lean,
+    maxTurns: learnedMaxTurns(a.role),
     addDirs: (a.dirs || '').split(',').map(s => s.trim()).filter(Boolean),
     // token-lean default: every run starts FRESH. Context only carries over on
     // explicit intent — opts.resume (a specific session) or opts.cont (the
@@ -510,6 +532,9 @@ window.deck.onAgentEvent(ev => {
   if (ev.agentId === SKILL_AGENT) { skillAgentEvent(ev); return; }
   const r = R(ev.agentId);
   if (ev.runId !== r.runId) return;
+
+  // mirror this run's events into a modal, if one registered a sink for it
+  if (runEventSinks[ev.runId]) { try { runEventSinks[ev.runId](ev); } catch {} }
 
   switch (ev.kind) {
     case 'init':
@@ -555,6 +580,14 @@ window.deck.onAgentEvent(ev => {
       trackUsage(ev);
       const doneAgent = agents.find(x => x.id === ev.agentId);
       if (ev.sessionId && doneAgent && doneAgent.role === 'prompt' && pipe.cwd) savePESession(pipe.cwd, ev.sessionId);
+      // background learner: outcome per model + turn-cap kills per role
+      learnMark(r.curModel, ev.subtype !== 'success');
+      if (/max_turns/i.test(ev.subtype || '') && doneAgent) {
+        LEARN.turnCapHits[doneAgent.role] = (LEARN.turnCapHits[doneAgent.role] || 0) + 1;
+        saveLearn();
+        plog('info', `learning: ${doneAgent.name} hit its turn ceiling — raising ${doneAgent.role} cap to ${learnedMaxTurns(doneAgent.role)} next run.`);
+      }
+      lastRunMeta[ev.agentId] = { model: r.curModel, at: Date.now() };
       // token breakdown makes context bloat visible per run: high "in" with low
       // "cache" means the run re-sent everything fresh — a scoping regression
       const kTok = n => n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n || 0);
@@ -582,6 +615,13 @@ window.deck.onAgentEvent(ev => {
       }
       r.planMode = false;
       setRunningUI(ev.agentId, false);
+      // fire any one-shot completion callback registered for this run
+      if (runDoneCallbacks[ev.runId]) {
+        const cb = runDoneCallbacks[ev.runId];
+        delete runDoneCallbacks[ev.runId];
+        try { cb(r.lastResult, r.lastText || ''); } catch {}
+      }
+      delete runEventSinks[ev.runId];
       if (typeof gitRefresh === 'function' && gitRepo) gitRefresh();
       onPipelineAgentDone(ev.agentId, r.lastResult)
         .then(() => { if (!pipe.active) cleanupSeniors(); });
@@ -774,21 +814,35 @@ document.getElementById('pr-approve').onclick = async () => {
   // pull the complexity-based model routing out of the plan files
   pipe.taskModels.clear();
   pipe.reviewModel = null;
+  const uiTasks = new Set();   // task files whose content is UI work → UI/UX engineer
   const files = await window.deck.pipelineRead(pipe.cwd);
   for (const f of files) {
     if (/^task-\d+.*\.md$/i.test(f.name)) {
       const m = parseModelLine(f.content);
       if (m) pipe.taskModels.set(f.name, m);
+      if (isUiTask(f.name + ' ' + f.content.slice(0, 2000))) uiTasks.add(f.name);
     } else if (f.name === 'review-brief.md') {
       pipe.reviewModel = parseModelLine(f.content, 'REVIEW-MODEL');
     }
   }
-  const n = Math.min(pipe.planTasks.length, 4);
-  plog('ok', `plan approved by operator. Deploying ${n} senior engineer(s)...`);
-  const seniors = ensureSeniors(n);
+  // UI tasks route to the UI/UX engineer; the rest spread across seniors
+  const tasks = pipe.planTasks.slice(0, 4);
+  const ui = uiuxAgent();
+  const uiAssigned = ui ? tasks.filter(t => uiTasks.has(t)) : [];
+  const genTasks = tasks.filter(t => !uiAssigned.includes(t));
+  const n = Math.min(Math.max(genTasks.length, 1), 4);
+  plog('ok', `plan approved by operator. Deploying ${genTasks.length ? n + ' senior(s)' : 'engineers'}${uiAssigned.length ? ' + UI/UX engineer' : ''}...`);
+  const seniors = genTasks.length ? ensureSeniors(Math.min(genTasks.length, 4)) : [];
   pipe.taskAssign.clear();
-  pipe.planTasks.slice(0, 4).forEach((t, i) => pipe.taskAssign.set(seniors[i % seniors.length].id, t));
-  plog('info', 'Stage 3: BUILD — seniors executing in parallel...');
+  genTasks.forEach((t, i) => pipe.taskAssign.set(seniors[i % seniors.length].id, t));
+  // NOTE: one UI/UX agent takes UI tasks sequentially is fine — assign the first;
+  // extra UI tasks fall back to seniors so nothing is dropped
+  uiAssigned.forEach((t, i) => {
+    if (i === 0) { if (!ui.cwd) { ui.cwd = pipe.cwd; save(); } pipe.taskAssign.set(ui.id, t); plog('info', `${t} ▸ routed to ${ui.name} (UI task)`); }
+    else if (seniors.length) pipe.taskAssign.set(seniors[i % seniors.length].id, t);
+    else { const s = ensureSeniors(1); pipe.taskAssign.set(s[0].id, t); }
+  });
+  plog('info', 'Stage 3: BUILD — engineers executing in parallel...');
   startBuild('execute');
 };
 
@@ -855,7 +909,7 @@ function startBuild(taskCmd) {
     // token-lean: task files are self-contained, so each senior starts FRESH
     // (no replay of the whole planning conversation) on the model the Prompt
     // Engineer rated for that task's complexity
-    const model = pipe.taskModels.get(taskFile);
+    const model = learnedModel(pipe.taskModels.get(taskFile));   // learner may bump an unreliable model
     const a = agents.find(x => x.id === agentId);
     if (model) plog('info', `${a ? a.name : agentId} ▸ ${taskFile} on ${MODEL_LABELS[model]} (complexity-routed)`);
     runAgent(agentId, prompt, false, false, { model, fresh: true });
@@ -905,7 +959,7 @@ async function onPipelineAgentDone(agentId, result) {
     return;
   }
 
-  if (pipe.stage === 'build' && a.role === 'senior') {
+  if (pipe.stage === 'build' && (a.role === 'senior' || a.role === 'uiux')) {
     pipe.pending.delete(agentId);
     plog('ok', `${a.name} finished (${pipe.pending.size} still working).`);
     if (pipe.pending.size === 0) startReview();
@@ -921,6 +975,8 @@ async function onPipelineAgentDone(agentId, result) {
       if (pipe.iteration >= pipe.maxIter) {
         abortPipeline(`still REJECTED after ${pipe.maxIter} passes — manual attention needed (see review-findings.md).`);
       } else {
+        // learner: a rejection counts against the model that produced each task
+        for (const [, taskFile] of pipe.taskAssign) learnMark(pipe.taskModels.get(taskFile), true);
         plog('err', `REJECTED — sending findings back to senior engineer(s) (fix round ${pipe.iteration})...`);
         startBuild('fix');
       }
@@ -1115,6 +1171,11 @@ async function sendChat() {
     if (pipe.active) { plog('err', 'pipeline already running — abort it first.'); return; }
     launchPipeline(full);
   } else {
+    // background learner: manual UI/UX sends grow the UI vocabulary; a quick
+    // corrective follow-up counts against the model of the previous run
+    const tAgent = agents.find(x => x.id === target);
+    if (tAgent && tAgent.role === 'uiux') learnUiWords(text);
+    learnMaybeCorrection(target, text);
     // always a fresh, token-lean context — no transcript replay, no fork.
     // continuity comes from carried-forward summaries (plan text, follow-up chat),
     // never from re-sending the whole conversation.
@@ -1171,6 +1232,11 @@ function sendChatModal() {
   if (!text || !chatAgentId || R(chatAgentId).running) return;
   input.value = '';
   chatModal.classList.add('hidden');
+  // background learner: follow-ups are the strongest signal — corrections count
+  // against the previous run's model, UI/UX phrasing grows the UI vocabulary
+  const fa = agents.find(x => x.id === chatAgentId);
+  if (fa && fa.role === 'uiux') learnUiWords(text);
+  learnMaybeCorrection(chatAgentId, text);
   // the follow-up modal's whole purpose is continuity — resume the shared
   // session in place (no fork: forking re-replays the transcript from scratch)
   runAgent(chatAgentId, text + attachBlock(), false, false, { cont: true });
@@ -1186,9 +1252,110 @@ chatModal.addEventListener('click', e => { if (e.target === chatModal) chatModal
 // ============================================================
 // Modal
 // ============================================================
+// a "managed" agent is one of the built-in def-* roster whose base rules the app
+// owns (updated every build). The operator never edits that base — they only add
+// EXTRA rules that get appended. GENERAL-OPS (role 'custom', no base) is not managed.
+function isManaged(a) { return !!(a && typeof a.id === 'string' && a.id.startsWith('def-') && RULES[a.role]); }
+
+// the full rule text an agent actually runs with
+function effectiveRules(a) {
+  if (isManaged(a)) {
+    const base = RULES[a.role];
+    const extra = (a.extraRules || '').trim();
+    return extra ? `${base}\n\n--- OPERATOR ADDITIONS ---\n${extra}` : base;
+  }
+  // GENERAL-OPS with no custom rules still gets the token discipline block
+  if (a && a.id === 'def-general' && !(a.rules || '').trim()) return DISCIPLINE.trim();
+  return a.rules || '';
+}
+
+// runaway-loop guard: generous per-role turn ceilings — normal work never hits
+// them, but a confused run can't silently burn tokens for 100+ turns
+const MAX_TURNS = { prompt: 40, senior: 80, uiux: 80, reviewer: 50, indexer: 40, custom: 60 };
+
+// UI-task detector: routes interface work to the UI/UX engineer automatically
+const UI_TASK_RE = /\b(ui|ux|design|theme|theming|style|styling|css|scss|tailwind|layout|responsive|typography|font|color|colour|button|modal|dialog|dropdown|navbar|sidebar|icon|animation|dark.?mode|light.?mode|component library|shadcn|accessib)/i;
+function isUiTask(text) {
+  const s = String(text || '');
+  if (UI_TASK_RE.test(s)) return true;
+  // learned vocabulary: words that repeatedly showed up in tasks the operator
+  // sent to the UI/UX agent by hand
+  const lower = s.toLowerCase();
+  return (LEARN.uiWords || []).some(w => lower.includes(w));
+}
+function uiuxAgent() { return byRole('uiux')[0]; }
+
+// ============================================================
+// SELF-LEARNING (background, zero tokens — pure local heuristics)
+// The app watches its own runs: results, turns, pipeline rejections and the
+// operator's quick corrective follow-ups. It learns per-model reliability and
+// adjusts complexity routing / turn ceilings automatically. No LLM involved.
+// ============================================================
+const LEARN = JSON.parse(localStorage.getItem('learn') || '{}');
+LEARN.models = LEARN.models || {};       // model -> { runs, bad } (bad = error/abort/reject/correction)
+LEARN.turnCapHits = LEARN.turnCapHits || {};  // role -> count of runs killed by the turn cap
+LEARN.uiWordCounts = LEARN.uiWordCounts || {}; // word -> times seen in manual UI/UX sends
+LEARN.uiWords = LEARN.uiWords || [];     // promoted words (seen >= 3 times)
+function saveLearn() { localStorage.setItem('learn', JSON.stringify(LEARN)); }
+
+function learnMark(model, bad) {
+  if (!model) return;
+  const m = LEARN.models[model] || (LEARN.models[model] = { runs: 0, bad: 0 });
+  m.runs++; if (bad) m.bad++;
+  saveLearn();
+}
+
+// the cheap→capable ladder used when a model proves unreliable for routed work
+const MODEL_LADDER = ['claude-haiku-4-5-20251001', 'claude-sonnet-5', 'claude-opus-4-8'];
+// if a routed model's bad-rate is >30% over >=6 observed runs, route one step up
+function learnedModel(model) {
+  if (!model) return model;
+  const m = LEARN.models[model];
+  const i = MODEL_LADDER.indexOf(model);
+  if (m && m.runs >= 6 && m.bad / m.runs > 0.3 && i >= 0 && i < MODEL_LADDER.length - 1) {
+    const up = MODEL_LADDER[i + 1];
+    plog('info', `learning: ${MODEL_LABELS[model]} failed ${Math.round(100 * m.bad / m.runs)}% of routed runs — bumping to ${MODEL_LABELS[up]}.`);
+    return up;
+  }
+  return model;
+}
+
+// roles that repeatedly die at the turn ceiling get +25% per strike (max 120)
+function learnedMaxTurns(role) {
+  const base = MAX_TURNS[role] || 60;
+  const hits = LEARN.turnCapHits[role] || 0;
+  return Math.min(120, Math.round(base * (1 + 0.25 * Math.min(hits, 3))));
+}
+
+// operator manually sent a task to the UI/UX agent → grow the UI vocabulary
+const UI_STOPWORDS = new Set(['this', 'that', 'with', 'from', 'make', 'have', 'should', 'when', 'then', 'file', 'files', 'code', 'please', 'update', 'change', 'need', 'want', 'like', 'also', 'more', 'less', 'very', 'just', 'will', 'must', 'them', 'they', 'what', 'where', 'agent', 'task']);
+function learnUiWords(text) {
+  for (const w of String(text || '').toLowerCase().match(/[a-z][a-z-]{3,}/g) || []) {
+    if (UI_STOPWORDS.has(w) || UI_TASK_RE.test(w)) continue;
+    LEARN.uiWordCounts[w] = (LEARN.uiWordCounts[w] || 0) + 1;
+    if (LEARN.uiWordCounts[w] === 3 && !LEARN.uiWords.includes(w)) {
+      LEARN.uiWords.push(w);
+      if (LEARN.uiWords.length > 40) LEARN.uiWords.shift();   // bounded memory
+    }
+  }
+  saveLearn();
+}
+
+// a corrective follow-up right after a "successful" run means it wasn't really
+// good — count it against the model that produced it
+const CORRECTIVE_RE = /\b(wrong|not working|didn'?t|doesn'?t|broken|still|instead|revert|undo|fix it|no[,.! ]|incorrect|bad)\b/i;
+const lastRunMeta = {};   // agentId -> { model, at }
+function learnMaybeCorrection(agentId, text) {
+  const meta = lastRunMeta[agentId];
+  if (meta && Date.now() - meta.at < 5 * 60 * 1000 && CORRECTIVE_RE.test(text)) {
+    learnMark(meta.model, true);
+  }
+}
+
 function openModal(id) {
   editingId = id || null;
   const a = id ? agents.find(x => x.id === id) : null;
+  const managed = isManaged(a);
   document.getElementById('modal-title').textContent = a ? 'CONFIGURE AGENT' : 'DEPLOY NEW AGENT';
   document.getElementById('f-name').value = a ? a.name : '';
   document.getElementById('f-model').value = a ? a.model : 'claude-sonnet-5';
@@ -1197,7 +1364,15 @@ function openModal(id) {
   document.getElementById('f-cwd').value = a ? (a.cwd || '') : (projectDir || '');
   document.getElementById('f-dirs').value = a ? (a.dirs || '') : '';
   document.getElementById('f-lean').checked = a ? !!a.lean : false;
-  document.getElementById('f-rules').value = a ? (a.rules || '') : '';
+  const rulesBox = document.getElementById('f-rules');
+  if (managed) {
+    // hide the built-in prompt; show only the operator's own additions
+    rulesBox.value = a.extraRules || '';
+    rulesBox.placeholder = 'This role already has built-in rules (hidden). Anything you type here is APPENDED to them. Leave empty to use the defaults as-is.';
+  } else {
+    rulesBox.value = a ? (a.rules || '') : '';
+    rulesBox.placeholder = '';
+  }
   document.getElementById('f-save').textContent = a ? 'SAVE' : 'DEPLOY';
   modal.classList.remove('hidden');
   document.getElementById('f-name').focus();
@@ -1205,9 +1380,11 @@ function openModal(id) {
 
 document.getElementById('f-role').onchange = e => {
   const role = e.target.value;
-  if (RULES[role]) document.getElementById('f-rules').value = RULES[role];
+  const a = editingId ? agents.find(x => x.id === editingId) : null;
+  // for a managed def-* agent the base is hidden, so never dump it into the box
+  if (!isManaged(a) && RULES[role]) document.getElementById('f-rules').value = RULES[role];
   // pipeline roles never need the user-global config — default them lean
-  document.getElementById('f-lean').checked = ['prompt', 'senior', 'reviewer', 'indexer'].includes(role);
+  document.getElementById('f-lean').checked = ['prompt', 'senior', 'uiux', 'reviewer', 'indexer'].includes(role);
 };
 document.getElementById('btn-new-agent').onclick = () => openModal(null);
 document.getElementById('f-cancel').onclick = () => modal.classList.add('hidden');
@@ -1217,6 +1394,8 @@ document.getElementById('f-browse').onclick = async () => {
 };
 document.getElementById('f-save').onclick = () => {
   const name = document.getElementById('f-name').value.trim() || 'AGENT-' + uid().toUpperCase().slice(0, 4);
+  const editing = editingId ? agents.find(x => x.id === editingId) : null;
+  const rulesVal = document.getElementById('f-rules').value.trim();
   const data = {
     name,
     model: document.getElementById('f-model').value,
@@ -1224,10 +1403,12 @@ document.getElementById('f-save').onclick = () => {
     perm: document.getElementById('f-perm').value,
     cwd: document.getElementById('f-cwd').value.trim(),
     dirs: document.getElementById('f-dirs').value.trim(),
-    lean: document.getElementById('f-lean').checked,
-    rules: document.getElementById('f-rules').value.trim()
+    lean: document.getElementById('f-lean').checked
   };
-  if (editingId) Object.assign(agents.find(x => x.id === editingId), data);
+  // managed agents keep their app-owned base rules; the box only sets ADDITIONS
+  if (isManaged(editing)) data.extraRules = rulesVal;
+  else data.rules = rulesVal;
+  if (editingId) Object.assign(editing, data);
   else agents.push({ id: uid(), ...data });
   save();
   modal.classList.add('hidden');
@@ -1237,7 +1418,7 @@ modal.addEventListener('click', e => { if (e.target === modal) modal.classList.a
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     // the alert is modal on purpose — Escape answers it, nothing else
-    if (!alertModal.classList.contains('hidden')) { closeAlert(false); return; }
+    if (!alertModal.classList.contains('hidden')) { if (!alertBusy) closeAlert(false); return; }
     modal.classList.add('hidden');
     document.getElementById('acct-modal').classList.add('hidden');
     document.getElementById('chat-modal').classList.add('hidden');
@@ -1489,8 +1670,21 @@ let repos = [], gitRepo = null;
 const gitPanel = document.getElementById('git-panel');
 const GIT_STATUS_LABEL = { M: 'M', A: 'A', D: 'D', R: 'R', C: 'C', U: 'U', '?': 'U' };
 
+const loveaiIgnored = new Set();   // repos already gitignored+untracked this session
+async function ensureLoveaiIgnored() {
+  for (const r of repos) {
+    if (loveaiIgnored.has(r)) continue;
+    loveaiIgnored.add(r);
+    try {
+      const res = await window.deck.gitIgnoreLoveai(r);
+      if (res && res.untracked) plog('info', `.loveai untracked and gitignored in ${r.split(/[\\/]/).pop()}`);
+    } catch {}
+  }
+}
+
 async function gitDetect() {
   repos = projectDir ? await window.deck.gitRepos(projectDir) : [];
+  await ensureLoveaiIgnored();
   const sel = document.getElementById('git-repo-sel');
   sel.innerHTML = '';
   for (const r of repos) {
@@ -1518,7 +1712,7 @@ async function gitRefresh() {
   repos = valid.map(x => x.repo);
   if (!repos.includes(gitRepo)) { gitRepo = repos[0]; document.getElementById('git-repo-sel').value = gitRepo; }
 
-  const countOf = st => st.staged.length + st.unstaged.length + st.untracked.length;
+  const countOf = st => st.staged.length + st.unstaged.length + st.untracked.length + (st.conflicts ? st.conflicts.length : 0);
   const total = valid.reduce((n, x) => n + countOf(x.st), 0);
   const sel = valid.find(x => x.repo === gitRepo);
 
@@ -1541,6 +1735,8 @@ async function gitRefresh() {
   });
 
   renderGitModal(sel.st);
+  buildExStatus(valid);
+  decorateExplorer();
 }
 
 function gitFileRow(f, statusChar, staged) {
@@ -1550,28 +1746,250 @@ function gitFileRow(f, statusChar, staged) {
   const row = document.createElement('div');
   row.className = 'git-file';
   row.title = f;
-  row.innerHTML = `<span class="gf-name">${esc(base)}</span><span class="gf-dir">${esc(dir)}</span><button class="mini-btn">${staged ? '−' : '+'}</button><span class="gf-status s-${GIT_STATUS_LABEL[statusChar] || 'M'}">${GIT_STATUS_LABEL[statusChar] || statusChar}</span>`;
-  row.querySelector('button').onclick = async () => {
+  const discardBtn = staged ? '' : `<button class="mini-btn gf-discard" title="${statusChar === '?' ? 'Delete untracked file' : 'Discard changes'}">↩</button>`;
+  row.innerHTML = `<span class="gf-name" title="View diff">${esc(base)}</span><span class="gf-dir">${esc(dir)}</span>${discardBtn}<button class="mini-btn gf-stage">${staged ? '−' : '+'}</button><span class="gf-status s-${GIT_STATUS_LABEL[statusChar] || 'M'}">${GIT_STATUS_LABEL[statusChar] || statusChar}</span>`;
+  row.querySelector('.gf-stage').onclick = async () => {
     await window.deck.gitCmd(gitRepo, staged ? 'unstage' : 'stage', f);
     gitRefresh();
+  };
+  const disc = row.querySelector('.gf-discard');
+  if (disc) disc.onclick = async () => {
+    const untracked = statusChar === '?';
+    const ok = await showAlert({
+      title: untracked ? 'DELETE FILE' : 'DISCARD CHANGES',
+      message: untracked ? `Permanently delete untracked "${base}"?` : `Discard all changes to "${base}"? This cannot be undone.`,
+      okText: untracked ? 'DELETE' : 'DISCARD', cancelText: 'CANCEL', kind: 'danger'
+    });
+    if (!ok) return;
+    await window.deck.gitCmd(gitRepo, untracked ? 'clean' : 'discard', f);
+    gitRefresh(); refreshWorkspace();
+  };
+  // click the name → diff view (untracked files have no diff, so open them instead)
+  row.querySelector('.gf-name').onclick = () => {
+    if (statusChar === '?') openFile(joinPath(gitRepo, f.replace(/"/g, '')));
+    else openDiff({ file: f, staged });
   };
   return row;
 }
 
 function renderGitModal(st) {
-  document.getElementById('git-branch-line').textContent = `${gitRepo}  ·  ⎇ ${st.branch}`;
+  document.getElementById('git-branch-line').textContent = gitRepo;
+  document.getElementById('git-branch-name').textContent = st.branch || '(detached)';
+  // ahead/behind vs upstream, VS Code-style ↑n ↓n
+  const syncEl = document.getElementById('git-sync-state');
+  if (st.upstream) {
+    const bits = [];
+    if (st.behind) bits.push(`↓${st.behind}`);
+    if (st.ahead) bits.push(`↑${st.ahead}`);
+    syncEl.textContent = bits.join(' ') || '✓ up to date';
+    syncEl.classList.toggle('behind', !!st.behind);
+  } else {
+    syncEl.textContent = 'no upstream';
+    syncEl.classList.remove('behind');
+  }
+
   const stagedBox = document.getElementById('git-staged');
   const unstagedBox = document.getElementById('git-unstaged');
-  stagedBox.innerHTML = ''; unstagedBox.innerHTML = '';
-  for (const { s, f } of st.staged) stagedBox.appendChild(gitFileRow(f, s, true));
+  const conflictBox = document.getElementById('git-conflicts');
+  stagedBox.innerHTML = ''; unstagedBox.innerHTML = ''; conflictBox.innerHTML = '';
+
+  // merge conflicts get their own section with a Resolve action per file
+  const conflicts = st.conflicts || [];
+  for (const f of conflicts) {
+    const row = gitConflictRow(f);
+    conflictBox.appendChild(row);
+  }
+  document.getElementById('sec-conflicts').classList.toggle('hidden', !conflicts.length);
+  document.getElementById('conflicts-count').textContent = conflicts.length || '';
+
   for (const { s, f } of st.unstaged) unstagedBox.appendChild(gitFileRow(f, s, false));
   for (const f of st.untracked) unstagedBox.appendChild(gitFileRow(f, '?', false));
+  for (const { s, f } of st.staged) stagedBox.appendChild(gitFileRow(f, s, true));
   // like VS Code: staged section only appears when something is staged
   document.getElementById('sec-staged').classList.toggle('hidden', !st.staged.length);
   document.getElementById('staged-count').textContent = st.staged.length || '';
-  document.getElementById('changes-count').textContent = st.unstaged.length + st.untracked.length || '';
+  document.getElementById('changes-count').textContent = (st.unstaged.length + st.untracked.length) || '';
   if (!st.unstaged.length && !st.untracked.length) unstagedBox.innerHTML = '<div class="git-none">working tree clean</div>';
 }
+
+// a conflicted file: click the name to resolve it VS Code-style; ↗ opens the raw
+// file in the editor; ✓ marks it resolved as-is
+function gitConflictRow(f) {
+  const base = f.replace(/"/g, '').split('/').pop();
+  const row = document.createElement('div');
+  row.className = 'git-file gf-conflict';
+  row.title = 'Click to resolve conflicts';
+  row.innerHTML = `<span class="gf-name">${esc(base)}</span><button class="mini-btn gf-open" title="Open raw file">↗</button><button class="mini-btn gf-resolve" title="Mark resolved as-is (stage)">✓</button><span class="gf-status s-U">!</span>`;
+  row.querySelector('.gf-name').onclick = () => openConflictResolver(f);
+  row.querySelector('.gf-open').onclick = () => { if (gitRepo) openFile(joinPath(gitRepo, f.replace(/"/g, ''))); };
+  row.querySelector('.gf-resolve').onclick = async () => {
+    await window.deck.gitCmd(gitRepo, 'resolve', f);
+    gitRefresh();
+  };
+  return row;
+}
+
+// ============================================================
+// MERGE CONFLICT RESOLVER — VS Code-style accept current/incoming/both,
+// plus an AI pass that recommends which side to take per conflict
+// ============================================================
+const conflictModal = document.getElementById('conflict-modal');
+let cf = null;   // { rel, abs, segments, choices: Map(idx -> 'current'|'incoming'|'both') }
+
+// split file text into alternating text/conflict segments
+function parseConflicts(text) {
+  const lines = text.split('\n');
+  const segs = [];
+  let plain = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('<<<<<<<')) {
+      if (plain.length) { segs.push({ type: 'text', lines: plain }); plain = []; }
+      const seg = { type: 'conflict', curLabel: lines[i].slice(7).trim() || 'HEAD', current: [], incoming: [], incLabel: 'incoming' };
+      i++;
+      while (i < lines.length && !lines[i].startsWith('=======')) seg.current.push(lines[i++]);
+      i++;   // skip =======
+      while (i < lines.length && !lines[i].startsWith('>>>>>>>')) seg.incoming.push(lines[i++]);
+      if (i < lines.length) seg.incLabel = lines[i].slice(7).trim() || 'incoming';
+      segs.push(seg);
+    } else plain.push(lines[i]);
+  }
+  if (plain.length) segs.push({ type: 'text', lines: plain });
+  return segs;
+}
+
+async function openConflictResolver(relFile) {
+  const rel = relFile.replace(/"/g, '');
+  const abs = joinPath(gitRepo, rel);
+  const r = await window.deck.fsRead(gitRepo, abs, shikiTheme());
+  if (!r.ok) { toast('✗ cannot read ' + rel + ': ' + r.error, false); return; }
+  const segments = parseConflicts(r.content);
+  if (!segments.some(s => s.type === 'conflict')) {
+    toast('no conflict markers found — opening the file instead', false);
+    openFile(abs);
+    return;
+  }
+  cf = { rel, abs, segments, choices: new Map() };
+  document.getElementById('cf-title').textContent = 'RESOLVE CONFLICTS · ' + rel.split('/').pop();
+  document.getElementById('cf-status').textContent = '';
+  gitPanel.classList.add('hidden');
+  renderConflicts();
+  conflictModal.classList.remove('hidden');
+}
+
+function renderConflicts() {
+  const body = document.getElementById('cf-body');
+  body.innerHTML = '';
+  let confIdx = 0, total = 0, resolved = 0;
+  for (const seg of cf.segments) {
+    if (seg.type === 'text') {
+      // context: show a few surrounding lines, collapse the middle
+      const pre = document.createElement('pre');
+      pre.className = 'cf-ctx';
+      const ls = seg.lines;
+      pre.textContent = ls.length > 7 ? [...ls.slice(0, 3), '        · · ·', ...ls.slice(-3)].join('\n') : ls.join('\n');
+      body.appendChild(pre);
+      continue;
+    }
+    const i = confIdx++;
+    total++;
+    const choice = cf.choices.get(i);
+    const box = document.createElement('div');
+    box.className = 'cf-conf';
+    if (choice) {
+      resolved++;
+      const chosen = choice === 'current' ? seg.current : choice === 'incoming' ? seg.incoming : [...seg.current, ...seg.incoming];
+      box.innerHTML = `<div class="cf-done-head">✓ resolved — accepted ${choice} <a href="#" class="cf-undo">undo</a></div><pre class="cf-chosen"></pre>`;
+      box.querySelector('.cf-chosen').textContent = chosen.join('\n') || '(empty)';
+      box.querySelector('.cf-undo').onclick = (e) => { e.preventDefault(); cf.choices.delete(i); renderConflicts(); };
+    } else {
+      // VS Code look: action links sit inside the conflict block, above Current
+      box.innerHTML = `
+        <div class="cf-actions">
+          <a href="#" data-c="current">Accept Current Change</a><span>|</span>
+          <a href="#" data-c="incoming">Accept Incoming Change</a><span>|</span>
+          <a href="#" data-c="both">Accept Both Changes</a>
+          <span class="cf-reco" data-reco="${i}"></span>
+        </div>
+        <div class="cf-cur"><div class="cf-label cur">&lt;&lt;&lt;&lt;&lt;&lt;&lt; ${esc(seg.curLabel)} (Current Change)</div><pre></pre></div>
+        <div class="cf-sep">=======</div>
+        <div class="cf-inc"><pre></pre><div class="cf-label inc">&gt;&gt;&gt;&gt;&gt;&gt;&gt; ${esc(seg.incLabel)} (Incoming Change)</div></div>`;
+      box.querySelector('.cf-cur pre').textContent = seg.current.join('\n') || '(empty)';
+      box.querySelector('.cf-inc pre').textContent = seg.incoming.join('\n') || '(empty)';
+      box.querySelectorAll('.cf-actions a').forEach(aEl => {
+        aEl.onclick = (e) => { e.preventDefault(); cf.choices.set(i, aEl.dataset.c); renderConflicts(); };
+      });
+      if (cf.reco && cf.reco[i]) {
+        const el = box.querySelector('.cf-reco');
+        el.textContent = `🤖 suggests: ${cf.reco[i].pick}${cf.reco[i].why ? ' — ' + cf.reco[i].why : ''}`;
+      }
+    }
+    body.appendChild(box);
+  }
+  document.getElementById('cf-count').textContent = `${resolved}/${total} resolved`;
+  document.getElementById('cf-save').disabled = resolved !== total;
+}
+
+// rebuild the file from segments + choices and finish the resolution
+document.getElementById('cf-save').onclick = async () => {
+  if (!cf) return;
+  const btn = document.getElementById('cf-save');
+  btn.disabled = true; const prev = btn.textContent; btn.textContent = '⏳ SAVING…';
+  const out = [];
+  let i = 0;
+  for (const seg of cf.segments) {
+    if (seg.type === 'text') { out.push(...seg.lines); continue; }
+    const c = cf.choices.get(i++);
+    if (c === 'current') out.push(...seg.current);
+    else if (c === 'incoming') out.push(...seg.incoming);
+    else out.push(...seg.current, ...seg.incoming);
+  }
+  const w = await window.deck.fsWrite(gitRepo, cf.abs, out.join('\n'));
+  if (!w.ok) { btn.textContent = prev; btn.disabled = false; toast('✗ save failed: ' + w.error, false); return; }
+  await window.deck.gitCmd(gitRepo, 'resolve', cf.rel);
+  btn.textContent = prev;
+  toast(`✓ ${cf.rel.split('/').pop()} resolved & staged`);
+  conflictModal.classList.add('hidden');
+  cf = null;
+  gitRefresh(); refreshWorkspace();
+};
+
+document.getElementById('cf-cancel').onclick = () => { conflictModal.classList.add('hidden'); cf = null; };
+conflictModal.addEventListener('click', e => { if (e.target === conflictModal) { conflictModal.classList.add('hidden'); cf = null; } });
+
+// AI pass: an agent reads every conflict and recommends a side per conflict
+document.getElementById('cf-ai').onclick = async () => {
+  if (!cf) return;
+  const agent = byRole('reviewer')[0] || byRole('senior')[0] || agents[0];
+  if (!agent) return;
+  if (R(agent.id).running) { toast('✗ ' + agent.name + ' is busy', false); return; }
+  const confs = cf.segments.filter(s => s.type === 'conflict');
+  const blocks = confs.map((s, i) =>
+    `CONFLICT ${i}\n<<< CURRENT (${s.curLabel})\n${s.current.join('\n')}\n=== INCOMING (${s.incLabel})\n${s.incoming.join('\n')}\n>>>`).join('\n\n');
+  const status = document.getElementById('cf-status');
+  status.textContent = '🤖 analyzing…';
+  const prompt = `Merge conflicts in ${cf.rel}. For EACH conflict decide which side to accept. Do not use tools.
+
+Output EXACTLY one line per conflict, nothing else:
+CONFLICT <n>: CURRENT | INCOMING | BOTH — <reason, max 12 words>
+
+${blocks.slice(0, 40000)}`;
+  runAgent(agent.id, prompt, false, false, {
+    fresh: true, model: 'claude-sonnet-5',
+    onDone: (result, text) => {
+      if (result !== 'success') { status.textContent = 'analysis ' + result; return; }
+      cf.reco = {};
+      for (const m of text.matchAll(/CONFLICT\s+(\d+)\s*:\s*(CURRENT|INCOMING|BOTH)\s*(?:—|-)?\s*(.*)/gi)) {
+        cf.reco[+m[1]] = { pick: m[2].toUpperCase(), why: (m[3] || '').trim().slice(0, 80) };
+      }
+      status.textContent = Object.keys(cf.reco).length ? '🤖 recommendations ready' : 'no recommendations parsed';
+      renderConflicts();
+    }
+  });
+};
+
+// forward-slash join for repo + git-relative path (git always emits '/')
+function joinPath(repo, rel) { return (repo.replace(/[\\/]+$/, '') + '/' + rel).replace(/\//g, sepChar()); }
+function sepChar() { return navigator.platform.startsWith('Win') ? '\\' : '/'; }
 
 function gitOut(text, ok = true) {
   const el = document.getElementById('git-out');
@@ -1584,6 +2002,8 @@ async function gitDo(op, arg) {
   const r = await window.deck.gitCmd(gitRepo, op, arg);
   gitOut(r.out.split('\n').slice(-3).join(' · ') || (r.ok ? 'done' : 'failed'), r.ok);
   gitRefresh();
+  // pull/merge rewrite files on disk — refresh the tree and open editors
+  if (op === 'pull') refreshWorkspace();
   return r;
 }
 
@@ -1592,12 +2012,16 @@ document.getElementById('git-badge').onclick = async (e) => {
   if (gitPanel.classList.contains('hidden')) {
     await gitDetect();
     gitPanel.classList.remove('hidden');
+    ciRefresh();   // CI status is fetched only when the panel is opened (gh call)
+    ghprRefresh();
   } else {
     gitPanel.classList.add('hidden');
   }
 };
-// close the dropdown on any click outside it
+// close the dropdown on any click outside it — but NOT when the click lands in a
+// modal/dialog (discard confirm, branch prompt, etc.) that the panel itself opened
 document.addEventListener('click', e => {
+  if (e.target.closest('.modal')) return;
   if (!gitPanel.classList.contains('hidden') && !document.getElementById('git-wrap').contains(e.target)) {
     gitPanel.classList.add('hidden');
   }
@@ -1616,6 +2040,870 @@ document.getElementById('git-bash').onclick = () => {
   if (existing) activateTerm(existing.id);
   else newTerm('bash', repo);
 };
+
+// ---------- lightweight text prompt (branch name, remote url, ...) ----------
+// work: async fn(value) — runs INSIDE the dialog after OK (buttons lock, OK shows
+// workingText); the promise then resolves { value, res } instead of just value.
+function askText({ title, placeholder = '', value = '', work = null, workingText = '⏳ WORKING…' }) {
+  return new Promise(res => {
+    const ov = document.createElement('div');
+    ov.className = 'modal';
+    ov.innerHTML = `<div class="modal-card alert-card"><div class="modal-title"></div>
+      <input class="ask-input" spellcheck="false" />
+      <div class="modal-actions"><button class="btn ask-cancel">CANCEL</button><button class="btn btn-launch ask-ok">OK</button></div></div>`;
+    ov.querySelector('.modal-title').textContent = title;
+    const inp = ov.querySelector('.ask-input');
+    const okBtn = ov.querySelector('.ask-ok');
+    const cancelBtn = ov.querySelector('.ask-cancel');
+    inp.placeholder = placeholder; inp.value = value;
+    document.body.appendChild(ov);
+    inp.focus(); inp.select();
+    let busy = false;
+    const done = v => { if (busy) return; ov.remove(); res(v); };
+    const submit = async () => {
+      const v = inp.value.trim() || null;
+      if (v === null) { done(null); return; }
+      if (!work) { done(v); return; }
+      busy = true;
+      inp.disabled = true; okBtn.disabled = true; cancelBtn.disabled = true;
+      okBtn.textContent = workingText; okBtn.classList.add('btn-working');
+      let r;
+      try { r = await work(v); } catch (e) { r = { ok: false, error: String(e && e.message ? e.message : e) }; }
+      busy = false;
+      ov.remove();
+      res({ value: v, res: r });
+    };
+    okBtn.onclick = submit;
+    cancelBtn.onclick = () => done(null);
+    inp.addEventListener('keydown', e => {
+      if (e.key === 'Enter') submit();
+      else if (e.key === 'Escape') done(null);
+    });
+    ov.addEventListener('click', e => { if (e.target === ov) done(null); });
+  });
+}
+
+// ---------- branch switcher ----------
+const branchMenu = document.getElementById('branch-menu');
+const branchFetchedRepos = new Set();   // repos already `git fetch`ed this session
+document.getElementById('git-branch-btn').onclick = async (e) => {
+  e.stopPropagation();
+  if (!branchMenu.classList.contains('hidden')) { branchMenu.classList.add('hidden'); return; }
+  if (!gitRepo) return;
+  // remotes only show up after a fetch — do it once per repo per session (or on
+  // demand via the ⟳ button), with a loading state so it never looks empty
+  if (!branchFetchedRepos.has(gitRepo)) {
+    branchMenu.innerHTML = '<div class="cm-item">⟳ fetching remotes…</div>';
+    branchMenu.classList.remove('hidden');
+    fitDropUp(branchMenu, document.getElementById('git-branch-btn'));
+    await window.deck.gitCmd(gitRepo, 'fetch');
+    branchFetchedRepos.add(gitRepo);
+  }
+  const r = await window.deck.gitBranches(gitRepo);
+  branchMenu.innerHTML = '';
+  if (!r.ok) { branchMenu.innerHTML = `<div class="cm-item">${esc(r.error || 'failed')}</div>`; }
+  else {
+    // search box (pinned, doesn't scroll)
+    const search = document.createElement('input');
+    search.className = 'branch-search';
+    search.placeholder = '🔎 filter branches…';
+    search.spellcheck = false;
+    branchMenu.appendChild(search);
+
+    // checking a box filters OUT that category
+    const toggles = document.createElement('div');
+    toggles.className = 'branch-toggles';
+    toggles.innerHTML = `
+      <label><input type="checkbox" class="bt-local"> hide local</label>
+      <label><input type="checkbox" class="bt-remote"> hide remote</label>
+      <button class="bt-fetch" title="Fetch remotes again">⟳ fetch</button>`;
+    branchMenu.appendChild(toggles);
+    const cbLocal = toggles.querySelector('.bt-local');
+    const cbRemote = toggles.querySelector('.bt-remote');
+    toggles.querySelector('.bt-fetch').onclick = async (ev) => {
+      ev.stopPropagation();
+      branchFetchedRepos.delete(gitRepo);          // force a fresh fetch
+      branchMenu.classList.add('hidden');
+      document.getElementById('git-branch-btn').click();   // reopen → refetch + rerender
+    };
+
+    const list = document.createElement('div');
+    list.className = 'branch-list';
+    branchMenu.appendChild(list);
+
+    const rows = [];   // { name, el, section, header? }
+    const addHeader = (label) => {
+      const h = document.createElement('div');
+      h.className = 'branch-sec'; h.textContent = label;
+      list.appendChild(h);
+      rows.push({ header: true, el: h, section: label });
+    };
+
+    // ---- LOCAL (sorted, current pinned first) ----
+    const locals = r.local.slice().sort((a, b) => (a.current ? -1 : b.current ? 1 : a.name.localeCompare(b.name)));
+    addHeader('LOCAL');
+    for (const b of locals) {
+      const it = document.createElement('div');
+      it.className = 'cm-item' + (b.current ? ' cm-current' : '');
+      it.innerHTML = `<span>${b.current ? '● ' : ''}${esc(b.name)}</span>${b.current ? '' : '<span class="cm-del" title="Delete">🗑</span>'}`;
+      it.querySelector('span').onclick = async () => {
+        branchMenu.classList.add('hidden');
+        if (!b.current) { await gitDo('checkout', b.name); refreshWorkspace(); }
+      };
+      const del = it.querySelector('.cm-del');
+      if (del) del.onclick = async (ev) => {
+        ev.stopPropagation();
+        const ok = await showAlert({ title: 'DELETE BRANCH', message: `Delete branch "${b.name}"? Unmerged commits on it will be lost.`, okText: 'DELETE', cancelText: 'CANCEL', kind: 'danger' });
+        if (ok) { await gitDo('delete-branch', b.name); document.getElementById('git-branch-btn').click(); document.getElementById('git-branch-btn').click(); }
+      };
+      list.appendChild(it);
+      rows.push({ name: b.name.toLowerCase(), el: it, kind: 'local' });
+    }
+
+    // ---- REMOTE (sorted; hides ones already checked out locally) ----
+    const localNames = new Set(r.local.map(b => b.name));
+    const remotes = (r.remote || [])
+      .filter(rb => !/\/HEAD$|->/.test(rb))                 // skip origin/HEAD pointers
+      .map(rb => ({ full: rb, short: rb.replace(/^[^/]+\//, '') }))
+      .filter(rb => !localNames.has(rb.short))              // no dup of a local branch
+      .sort((a, b) => a.full.localeCompare(b.full));
+    if (remotes.length) {
+      addHeader('REMOTE');
+      for (const rb of remotes) {
+        const it = document.createElement('div');
+        it.className = 'cm-item branch-remote';
+        it.innerHTML = `<span>${esc(rb.full)}</span><span class="branch-co" title="Check out (creates a local tracking branch)">⤓</span>`;
+        // selecting a remote branch auto-branches out: creates a local tracking branch
+        it.onclick = async () => {
+          branchMenu.classList.add('hidden');
+          await gitDo('checkout', rb.short);
+          refreshWorkspace();
+        };
+        list.appendChild(it);
+        rows.push({ name: rb.full.toLowerCase(), el: it, kind: 'remote' });
+      }
+    }
+
+    const noHit = document.createElement('div');
+    noHit.className = 'git-none'; noHit.textContent = 'no match'; noHit.style.display = 'none';
+    list.appendChild(noHit);
+
+    const applyBranchFilter = () => {
+      const q = search.value.trim().toLowerCase();
+      const hideLocal = cbLocal.checked, hideRemote = cbRemote.checked;
+      let hits = 0;
+      for (const row of rows) {
+        if (row.header) continue;
+        const kindHidden = (row.kind === 'local' && hideLocal) || (row.kind === 'remote' && hideRemote);
+        const show = !kindHidden && (!q || row.name.includes(q));
+        row.el.style.display = show ? '' : 'none';
+        if (show) hits++;
+      }
+      // hide a section header when nothing under it is visible
+      let curHeader = null, curCount = 0;
+      const flush = () => { if (curHeader) curHeader.style.display = curCount ? '' : 'none'; };
+      for (const row of rows) {
+        if (row.header) { flush(); curHeader = row.el; curCount = 0; }
+        else if (row.el.style.display !== 'none') curCount++;
+      }
+      flush();
+      noHit.style.display = hits ? 'none' : '';
+    };
+    search.oninput = applyBranchFilter;
+    cbLocal.onchange = applyBranchFilter;
+    cbRemote.onchange = applyBranchFilter;
+    search.onkeydown = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); branchMenu.classList.add('hidden'); } };
+
+    const create = document.createElement('div');
+    create.className = 'cm-item branch-create'; create.textContent = '＋ Create branch…';
+    create.onclick = async () => {
+      branchMenu.classList.add('hidden');
+      const name = await askText({ title: 'NEW BRANCH', placeholder: 'branch name' });
+      if (name) { await gitDo('create-branch', name); refreshWorkspace(); }
+    };
+    branchMenu.appendChild(create);
+  }
+  branchMenu.classList.remove('hidden');
+  fitDropUp(branchMenu, document.getElementById('git-branch-btn'));
+  const sb = branchMenu.querySelector('.branch-search'); if (sb) sb.focus();
+};
+
+// Anchor a dropdown to its button using fixed positioning off the button's
+// on-screen rect — so it always hangs from the button (not some ancestor) and
+// stays inside the viewport, flipping above when there's no room below.
+function fitDropUp(menu, anchor) {
+  const a = anchor.getBoundingClientRect();
+  menu.style.position = 'fixed';
+  menu.style.right = 'auto';
+  // keep the left edge on-screen
+  const width = menu.offsetWidth || 200;
+  menu.style.left = Math.max(8, Math.min(a.left, window.innerWidth - width - 8)) + 'px';
+  const below = window.innerHeight - a.bottom - 12;
+  const above = a.top - 12;
+  if (below < 200 && above > below) {
+    menu.style.top = 'auto';
+    menu.style.bottom = (window.innerHeight - a.top + 4) + 'px';   // hang upward from the button
+    menu.style.maxHeight = Math.min(340, above) + 'px';
+  } else {
+    menu.style.bottom = 'auto';
+    menu.style.top = (a.bottom + 4) + 'px';
+    menu.style.maxHeight = Math.min(340, Math.max(140, below)) + 'px';
+  }
+}
+document.addEventListener('click', e => {
+  if (!branchMenu.classList.contains('hidden') && !branchMenu.contains(e.target) && e.target.id !== 'git-branch-btn') {
+    branchMenu.classList.add('hidden');
+  }
+});
+
+document.getElementById('git-fetch').onclick = () => gitDo('fetch');
+document.getElementById('git-merge-abort').onclick = async () => {
+  const ok = await showAlert({ title: 'ABORT MERGE', message: 'Abort the in-progress merge and restore the pre-merge state?', okText: 'ABORT MERGE', cancelText: 'CANCEL', kind: 'danger' });
+  if (ok) { await gitDo('merge-abort'); refreshWorkspace(); }
+};
+
+// ---------- history + diff modal ----------
+const gitModal = document.getElementById('git-modal');
+function closeGitModal() { gitModal.classList.add('hidden'); }
+document.getElementById('git-modal-close').onclick = closeGitModal;
+gitModal.addEventListener('click', e => { if (e.target === gitModal) closeGitModal(); });
+
+function renderDiff(container, diffText) {
+  container.innerHTML = '';
+  if (!diffText || !diffText.trim()) { container.innerHTML = '<div class="git-none">no changes to show</div>'; return; }
+  const pre = document.createElement('pre');
+  pre.className = 'diff-pre';
+  for (const line of diffText.split('\n')) {
+    const span = document.createElement('span');
+    const c = line[0];
+    span.className = 'dl ' + (c === '+' && !line.startsWith('+++') ? 'add'
+      : c === '-' && !line.startsWith('---') ? 'del'
+      : c === '@' ? 'hunk'
+      : line.startsWith('diff ') || line.startsWith('index ') || line.startsWith('+++') || line.startsWith('---') ? 'meta' : 'ctx');
+    span.textContent = line + '\n';
+    pre.appendChild(span);
+  }
+  container.appendChild(pre);
+}
+
+async function openDiff({ file, staged, commit }) {
+  gitPanel.classList.add('hidden');
+  gitModal.querySelector('.git-modal-card').classList.add('diff-only');
+  document.getElementById('git-modal-title').textContent = commit ? 'DIFF · ' + commit.slice(0, 8) : 'DIFF · ' + (file || '').replace(/"/g, '').split('/').pop() + (staged ? ' (staged)' : '');
+  const diffView = document.getElementById('git-diff-view');
+  diffView.innerHTML = '<div class="git-none">loading…</div>';
+  gitModal.classList.remove('hidden');
+  const r = await window.deck.gitDiff(gitRepo, { file, staged, commit });
+  renderDiff(diffView, r.diff);
+}
+
+async function openGitHistory() {
+  gitPanel.classList.add('hidden');
+  gitModal.querySelector('.git-modal-card').classList.remove('diff-only');
+  document.getElementById('git-modal-title').textContent = 'HISTORY';
+  const list = document.getElementById('git-hist-list');
+  const diffView = document.getElementById('git-diff-view');
+  list.innerHTML = '<div class="git-none">loading…</div>';
+  diffView.innerHTML = '<div class="git-none">select a commit</div>';
+  gitModal.classList.remove('hidden');
+  const r = await window.deck.gitLog(gitRepo, 60);
+  list.innerHTML = '';
+  if (!r.ok || !r.commits.length) { list.innerHTML = `<div class="git-none">${esc(r.error || 'no commits')}</div>`; return; }
+  for (const c of r.commits) {
+    const row = document.createElement('div');
+    row.className = 'hist-row';
+    row.innerHTML = `<div class="hist-subj"></div><div class="hist-meta"><span class="hist-hash">${esc(c.short)}</span> · ${esc(c.author)} · ${esc(c.date)}${c.refs ? ' · <span class="hist-refs"></span>' : ''}</div>`;
+    row.querySelector('.hist-subj').textContent = c.subject;
+    if (c.refs) row.querySelector('.hist-refs').textContent = c.refs;
+    row.onclick = async () => {
+      list.querySelectorAll('.hist-row').forEach(x => x.classList.remove('sel'));
+      row.classList.add('sel');
+      diffView.innerHTML = '<div class="git-none">loading…</div>';
+      const d = await window.deck.gitDiff(gitRepo, { commit: c.hash });
+      renderDiff(diffView, d.diff);
+    };
+    list.appendChild(row);
+  }
+}
+document.getElementById('git-history').onclick = openGitHistory;
+
+// ---------- GitHub Actions CI ----------
+function parseGh(url) {
+  const m = /github[^:/]*[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/i.exec(url || '');
+  return m ? { owner: m[1], repo: m[2] } : null;
+}
+function ciClass(run) {
+  return run.status !== 'completed' ? 'run'
+    : run.conclusion === 'success' ? 'ok'
+    : run.conclusion === 'failure' ? 'fail' : 'warn';
+}
+function ciLabel(run) {
+  return run.status !== 'completed' ? '● running'
+    : run.conclusion === 'success' ? '✓ passing'
+    : run.conclusion === 'failure' ? '✗ failing' : (run.conclusion || '?');
+}
+
+async function ciRefresh() {
+  const section = document.getElementById('git-ci');
+  const body = document.getElementById('ci-body');
+  const state = document.getElementById('ci-state');
+  if (!gitRepo) { section.classList.add('hidden'); return; }
+  section.classList.remove('hidden');
+  state.className = 'ci-state';
+
+  const list = await window.deck.ciList(gitRepo);
+  if (!list.files.length) {
+    state.textContent = 'not set up';
+    body.innerHTML = '<button class="mini-btn ci-scaffold-btn">＋ Add CI workflow</button>';
+    body.querySelector('.ci-scaffold-btn').onclick = ciScaffold;
+    return;
+  }
+  state.textContent = 'checking…';
+  const st = await window.deck.ciStatus(gitRepo);
+  if (!st.ok) { state.textContent = ''; body.innerHTML = `<div class="git-none">${esc(st.error)}</div>`; return; }
+  if (!st.runs.length) { state.textContent = 'no runs yet'; body.innerHTML = '<div class="git-none">push to trigger the workflow</div>'; return; }
+
+  state.textContent = ciLabel(st.runs[0]);
+  state.className = 'ci-state ' + ciClass(st.runs[0]);
+  body.innerHTML = '';
+  for (const run of st.runs.slice(0, 6)) {
+    const row = document.createElement('div');
+    row.className = 'ci-row';
+    row.title = 'Open run in browser';
+    row.innerHTML = `<span class="ci-dot ${ciClass(run)}"></span><span class="ci-title"></span><span class="ci-branch"></span>`;
+    row.querySelector('.ci-title').textContent = `${run.workflowName}: ${run.displayTitle}`;
+    row.querySelector('.ci-branch').textContent = run.headBranch || '';
+    row.onclick = () => run.url && window.deck.openExternal(run.url);
+    body.appendChild(row);
+  }
+}
+
+async function ciScaffold() {
+  const r = await window.deck.ciScaffold(gitRepo);
+  if (!r.ok) { gitOut(r.error, false); return; }
+  gitOut('CI created: .github/workflows/ci.yml — commit & push to activate', true);
+  exReset(); gitRefresh(); ciRefresh();
+}
+
+document.getElementById('ci-refresh').onclick = (e) => { e.stopPropagation(); ciRefresh(); };
+document.getElementById('ci-open').onclick = async (e) => {
+  e.stopPropagation();
+  const r = await window.deck.gitRemotes(gitRepo);
+  const origin = (r.remotes || []).find(x => x.name === 'origin') || (r.remotes || [])[0];
+  const gh = origin && parseGh(origin.url);
+  if (gh) window.deck.openExternal(`https://github.com/${gh.owner}/${gh.repo}/actions`);
+  else gitOut('no GitHub remote found', false);
+};
+
+// ---------- Pull requests: accordion section (list → diff/comments → review → merge) ----------
+const PR_DECISION = {
+  APPROVED: { txt: '✓ approved', cls: 'ok', rank: 0 },
+  CHANGES_REQUESTED: { txt: '✗ changes requested', cls: 'fail', rank: 2 },
+  REVIEW_REQUIRED: { txt: '• review required', cls: 'run', rank: 1 }
+};
+function prDec(pr) {
+  return PR_DECISION[pr.reviewDecision] || { txt: pr.isDraft ? 'draft' : (pr.state || '').toLowerCase(), cls: 'warn', rank: 3 };
+}
+let ghprExpanded = null;   // number of the currently expanded PR
+
+async function ghprRefresh() {
+  const body = document.getElementById('ghpr-body-list') || document.getElementById('ghpr-body');
+  const count = document.getElementById('ghpr-count');
+  if (!gitRepo) { document.getElementById('git-pr-sec').classList.add('hidden'); return; }
+  document.getElementById('git-pr-sec').classList.remove('hidden');
+  body.innerHTML = '<div class="git-none">loading…</div>';
+  const r = await window.deck.prList(gitRepo);
+  if (!r.ok) { count.textContent = ''; body.innerHTML = `<div class="git-none">${esc(r.error)}</div>`; return; }
+  const prs = r.prs.slice().sort((a, b) => prDec(a).rank - prDec(b).rank || a.number - b.number);  // approved first
+  count.textContent = prs.length || '';
+  if (!prs.length) { body.innerHTML = '<div class="git-none">no open pull requests</div>'; return; }
+  body.innerHTML = '';
+  for (const pr of prs) body.appendChild(ghprRow(pr));
+}
+
+function ghprRow(pr) {
+  const dec = prDec(pr);
+  const wrap = document.createElement('div');
+  wrap.className = 'ghpr-item';
+  wrap.innerHTML = `
+    <div class="ghpr-row">
+      <div class="ghpr-main">
+        <div class="ghpr-title-line"><span class="ghpr-num">#${pr.number}</span> <span class="ghpr-title-txt"></span></div>
+        <div class="ghpr-meta"><span class="ghpr-branch"></span> → <span class="ghpr-base"></span> · <span class="ghpr-dec ${dec.cls}">${dec.txt}</span></div>
+      </div>
+      <span class="ghpr-open-arrow">›</span>
+    </div>`;
+  wrap.querySelector('.ghpr-title-txt').textContent = pr.title;
+  wrap.querySelector('.ghpr-branch').textContent = pr.headRefName;
+  wrap.querySelector('.ghpr-base').textContent = pr.baseRefName;
+  wrap.querySelector('.ghpr-row').onclick = () => ghprOpenDetail(pr);
+  return wrap;
+}
+
+// ---- toast: confirmation feedback for background git/gh actions ----
+let toastEl = null, toastTimer = null;
+function toast(msg, ok = true) {
+  if (!toastEl) {
+    toastEl = document.createElement('div');
+    toastEl.id = 'toast';
+    document.body.appendChild(toastEl);
+  }
+  toastEl.textContent = msg;
+  toastEl.className = ok ? 'ok' : 'err';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.add('hide'), 3200);
+}
+
+// put a button (and its siblings) into a busy state; returns a restore fn
+function btnBusy(btn, label) {
+  if (!btn) return () => {};
+  const bar = btn.parentElement;
+  const prev = btn.textContent;
+  const disabled = [];
+  if (bar) for (const b of bar.querySelectorAll('button')) { if (!b.disabled) { b.disabled = true; disabled.push(b); } }
+  btn.textContent = label;
+  btn.classList.add('btn-working');
+  return () => {
+    btn.textContent = prev;
+    btn.classList.remove('btn-working');
+    for (const b of disabled) b.disabled = false;
+  };
+}
+
+// full-page PR view: header + actions + diff (left) + description/comments (right)
+const ghprPage = document.getElementById('ghpr-page');
+let ghprCurrent = null;
+let ghprLastReview = '';   // last AI-review text captured for the current PR
+document.getElementById('ghpr-back').onclick = () => ghprPage.classList.add('hidden');
+
+function ghprOpenDetail(pr) {
+  ghprCurrent = pr;
+  ghprLastReview = '';
+  gitPanel.classList.add('hidden');
+  const dec = prDec(pr);
+  const approved = pr.reviewDecision === 'APPROVED';
+  document.getElementById('ghpr-dt-num').textContent = '#' + pr.number;
+  document.getElementById('ghpr-dt-titletxt').textContent = pr.title;
+  document.getElementById('ghpr-dt-branch').textContent = pr.headRefName;
+  document.getElementById('ghpr-dt-base').textContent = pr.baseRefName;
+  const decEl = document.getElementById('ghpr-dt-dec');
+  decEl.textContent = dec.txt; decEl.className = 'ghpr-dec ' + dec.cls;
+
+  const actions = document.getElementById('ghpr-dt-actions');
+  actions.innerHTML = `
+    <button class="mini-btn" data-a="review">🤖 AI Review</button>
+    <button class="mini-btn" data-a="fix">🔧 Fix from review</button>
+    <button class="mini-btn" data-a="approve">✓ Approve</button>
+    <button class="mini-btn" data-a="request">✗ Request changes</button>
+    <button class="mini-btn" data-a="merge" ${approved ? '' : 'disabled title="merge enabled once approved"'}>⧉ Merge</button>
+    <button class="mini-btn" data-a="open">↗ Browser</button>`;
+  actions.querySelector('[data-a="open"]').onclick = () => pr.url && window.deck.openExternal(pr.url);
+  actions.querySelector('[data-a="approve"]').onclick = (e) => ghprReview(pr.number, 'approve', e.currentTarget);
+  actions.querySelector('[data-a="request"]').onclick = (e) => ghprReview(pr.number, 'request', e.currentTarget);
+  actions.querySelector('[data-a="review"]').onclick = () => openAiModal('review', pr);
+  actions.querySelector('[data-a="fix"]').onclick = () => openAiModal('fix', pr);
+  const mergeBtn = actions.querySelector('[data-a="merge"]');
+  mergeBtn.onclick = (e) => { if (!mergeBtn.disabled) ghprMerge(pr.number, e.currentTarget); };
+
+  document.getElementById('ghpr-dt-diff').innerHTML = '<div class="git-none">loading diff…</div>';
+  document.getElementById('ghpr-dt-desc').textContent = '';
+  document.getElementById('ghpr-dt-comments').innerHTML = '<div class="git-none">loading…</div>';
+  document.getElementById('ghpr-dt-cmt').value = '';
+  ghprPage.classList.remove('hidden');
+  ghprLoadDetail(pr);
+}
+
+async function ghprLoadDetail(pr) {
+  // diff
+  window.deck.prDiff(gitRepo, pr.number).then(d => {
+    const box = document.getElementById('ghpr-dt-diff');
+    if (!d.ok) { box.innerHTML = `<div class="git-none">${esc(d.error)}</div>`; return; }
+    renderDiff(box, d.diff);
+  });
+  // description + comments + reviews
+  window.deck.prView(gitRepo, pr.number).then(v => {
+    const cbox = document.getElementById('ghpr-dt-comments');
+    const desc = document.getElementById('ghpr-dt-desc');
+    if (!v.ok) { cbox.innerHTML = `<div class="git-none">${esc(v.error)}</div>`; return; }
+    desc.textContent = (v.pr.body || '').trim() || '(no description)';
+    const items = [];
+    for (const rv of (v.pr.reviews || [])) if (rv.body || rv.state) items.push({ who: rv.author && rv.author.login, when: rv.submittedAt, body: (rv.state ? `[${rv.state}] ` : '') + (rv.body || '') });
+    for (const c of (v.pr.comments || [])) items.push({ who: c.author && c.author.login, when: c.createdAt, body: c.body });
+    if (!items.length) { cbox.innerHTML = '<div class="git-none">no comments yet</div>'; return; }
+    cbox.innerHTML = '';
+    for (const it of items) {
+      const el = document.createElement('div');
+      el.className = 'ghpr-cmt-item';
+      el.innerHTML = `<div class="ghpr-cmt-who"></div><div class="ghpr-cmt-body"></div>`;
+      el.querySelector('.ghpr-cmt-who').textContent = (it.who || '?') + (it.when ? ' · ' + new Date(it.when).toLocaleString() : '');
+      el.querySelector('.ghpr-cmt-body').textContent = it.body || '';
+      cbox.appendChild(el);
+    }
+  });
+}
+
+const ghprSend = document.getElementById('ghpr-dt-send');
+const ghprCmtInput = document.getElementById('ghpr-dt-cmt');
+async function ghprDoComment() {
+  if (!ghprCurrent) return;
+  const text = ghprCmtInput.value.trim();
+  if (!text) return;
+  ghprSend.disabled = true; ghprSend.textContent = '…';
+  const r = await window.deck.prComment(gitRepo, ghprCurrent.number, text);
+  ghprSend.disabled = false; ghprSend.textContent = 'Comment';
+  if (!r.ok) { await showAlert({ title: 'COMMENT FAILED', message: r.error || r.out, okText: 'OK' }); return; }
+  ghprCmtInput.value = '';
+  ghprLoadDetail(ghprCurrent);
+}
+ghprSend.onclick = ghprDoComment;
+ghprCmtInput.addEventListener('keydown', e => { if (e.key === 'Enter') ghprDoComment(); });
+
+async function ghprReview(number, action) {
+  let r;
+  if (action === 'request') {
+    // the reason dialog itself shows the processing state while gh runs
+    const out = await askText({
+      title: 'REQUEST CHANGES', placeholder: 'what needs changing?',
+      work: (v) => window.deck.prReview(gitRepo, number, 'request', v),
+      workingText: '⏳ SUBMITTING…'
+    });
+    if (out === null) return;
+    r = out.res;
+  } else {
+    // confirm modal doubles as the progress indicator
+    const res = await showAlert({
+      title: `APPROVE PR #${number}`, message: 'Submit an approving review for this pull request?',
+      okText: 'APPROVE', cancelText: 'CANCEL',
+      work: () => window.deck.prReview(gitRepo, number, 'approve', ''),
+      workingText: '⏳ APPROVING…'
+    });
+    if (res === false) return;
+    r = res;
+  }
+  if (!r || !r.ok) { toast(`✗ review failed: ${((r && (r.error || r.out)) || '').slice(0, 120)}`, false); return; }
+  toast(action === 'approve' ? `✓ PR #${number} approved` : `✓ changes requested on PR #${number}`);
+  await ghprRefresh();
+  // re-open the detail with fresh state so Approve flips the Merge button on
+  if (ghprCurrent && ghprCurrent.number === number && !ghprPage.classList.contains('hidden')) {
+    const list = await window.deck.prList(gitRepo);
+    const fresh = list.ok && list.prs.find(p => p.number === number);
+    if (fresh) ghprOpenDetail(fresh);
+  }
+}
+
+async function ghprMerge(number) {
+  // the confirm modal stays open and shows MERGING… while gh works
+  const res = await showAlert({
+    title: `MERGE PR #${number}`, message: 'Squash-merge this PR and delete its branch?',
+    okText: 'MERGE', cancelText: 'CANCEL', kind: 'danger',
+    work: () => window.deck.prMerge(gitRepo, number, 'squash'),
+    workingText: '⏳ MERGING…'
+  });
+  if (res === false) return;
+  if (!res || !res.ok) { toast(`✗ merge failed: ${((res && (res.error || res.out)) || '').slice(0, 120)}`, false); return; }
+  toast(`✓ PR #${number} squash-merged · branch deleted`);
+  ghprPage.classList.add('hidden');   // PR is gone now
+  ghprRefresh(); gitRefresh(); refreshWorkspace();
+}
+
+// ---------- AI Review / Fix modal (agent + model picker, live activity, result) ----------
+const aiModal = document.getElementById('ai-modal');
+const aiState = { mode: null, pr: null, running: false, streamEl: null, resultText: '', runAgentId: null, thinkEl: null };
+
+// toggle the Start button into an Abort button while a run is live, and show a
+// pulsing "thinking…" indicator at the bottom of the activity log
+function aiSetRunning(on) {
+  aiState.running = on;
+  const btn = document.getElementById('ai-start');
+  document.getElementById('ai-agent').disabled = on;
+  document.getElementById('ai-model').disabled = on;
+  if (on) {
+    btn.textContent = '■ Abort';
+    btn.classList.add('ai-abort');
+    const live = document.getElementById('ai-live');
+    aiState.thinkEl = document.createElement('div');
+    aiState.thinkEl.className = 'ai-line ai-thinking';
+    aiState.thinkEl.textContent = '⏳ thinking';
+    live.appendChild(aiState.thinkEl);
+  } else {
+    btn.textContent = '▶ Start';
+    btn.classList.remove('ai-abort');
+    if (aiState.thinkEl) { aiState.thinkEl.remove(); aiState.thinkEl = null; }
+  }
+}
+
+function aiPopulate(mode) {
+  const agSel = document.getElementById('ai-agent');
+  agSel.innerHTML = '';
+  for (const a of agents) {
+    const o = document.createElement('option');
+    o.value = a.id; o.textContent = `${ROLE_ICON[a.role] || ''} ${a.name}`;
+    agSel.appendChild(o);
+  }
+  const mdSel = document.getElementById('ai-model');
+  mdSel.innerHTML = '';
+  for (const [id, label] of Object.entries(MODEL_LABELS)) {
+    const o = document.createElement('option'); o.value = id; o.textContent = label; mdSel.appendChild(o);
+  }
+  // consistency: reuse the LAST agent+model chosen for this mode; otherwise a
+  // strong default (Opus) so reviews don't silently vary by model each run
+  const savedAg = localStorage.getItem('ai_' + mode + '_agent');
+  const savedMd = localStorage.getItem('ai_' + mode + '_model');
+  const defAg = (savedAg && agents.find(a => a.id === savedAg)) ? savedAg : (byRole(mode === 'review' ? 'reviewer' : 'senior')[0] || {}).id;
+  if (defAg) agSel.value = defAg;
+  const defMd = (savedMd && MODEL_LABELS[savedMd]) ? savedMd : 'claude-opus-4-8';
+  mdSel.value = defMd;
+}
+function aiSaveChoice() {
+  if (!aiState.mode) return;
+  localStorage.setItem('ai_' + aiState.mode + '_agent', document.getElementById('ai-agent').value);
+  localStorage.setItem('ai_' + aiState.mode + '_model', document.getElementById('ai-model').value);
+}
+document.getElementById('ai-agent').onchange = aiSaveChoice;
+document.getElementById('ai-model').onchange = aiSaveChoice;
+
+function openAiModal(mode, pr) {
+  aiState.mode = mode; aiState.pr = pr; aiState.running = false; aiState.streamEl = null; aiState.resultText = '';
+  document.getElementById('ai-modal-title').textContent = (mode === 'review' ? 'AI REVIEW' : 'FIX FROM REVIEW') + ` · PR #${pr.number}`;
+  document.getElementById('ai-sub').textContent = mode === 'review'
+    ? 'The agent reads the PR diff and reports findings + a verdict.'
+    : 'The agent validates the PR review/comments against the diff, then plans a fix.';
+  aiPopulate(mode);
+  document.getElementById('ai-live').innerHTML = '<div class="git-none">pick an agent + model, then press Start</div>';
+  document.getElementById('ai-final-wrap').classList.add('hidden');
+  document.getElementById('ai-final').textContent = '';
+  document.getElementById('ai-apply').classList.add('hidden');
+  document.getElementById('ai-post').classList.add('hidden');
+  document.getElementById('ai-start').disabled = false;
+  aiModal.classList.remove('hidden');
+}
+document.getElementById('ai-close').onclick = () => aiModal.classList.add('hidden');
+
+function aiLiveLine(text, cls) {
+  const live = document.getElementById('ai-live');
+  const el = document.createElement('div');
+  el.className = 'ai-line ' + (cls || '');
+  el.textContent = text;
+  live.appendChild(el);
+  if (aiState.thinkEl) live.appendChild(aiState.thinkEl);   // keep it pinned to the bottom
+  live.scrollTop = live.scrollHeight;
+  return el;
+}
+function aiOnEvent(ev) {
+  const live = document.getElementById('ai-live');
+  if (ev.kind === 'init') { aiState.streamEl = null; aiLiveLine(`▸ session ${String(ev.sessionId).slice(0, 8)} · ${ev.model}`, 'sys'); }
+  else if (ev.kind === 'tool') {
+    aiState.streamEl = null;
+    let detail = ''; try { const i = JSON.parse(ev.input); detail = i.file_path || i.path || i.command || i.pattern || i.query || ''; } catch {}
+    aiLiveLine(`⚙ ${ev.tool} ${String(detail).slice(0, 100)}`, 'tool');
+  } else if (ev.kind === 'text-delta') {
+    if (!aiState.streamEl) aiState.streamEl = aiLiveLine('', 'txt');
+    aiState.streamEl.textContent += ev.text;
+    live.scrollTop = live.scrollHeight;
+  } else if (ev.kind === 'text-end') { aiState.streamEl = null; }
+  else if (ev.kind === 'result') { aiLiveLine(`◆ ${String(ev.subtype).toUpperCase()} · ${ev.numTurns} turns · ${(ev.durationMs / 1000).toFixed(1)}s`, 'ok'); }
+  else if (ev.kind === 'error') { aiLiveLine('⚠ ' + ev.error, 'err'); }
+}
+
+document.getElementById('ai-start').onclick = async () => {
+  if (aiState.running) {                       // Abort
+    if (aiState.runAgentId) stopAgent(aiState.runAgentId);
+    aiLiveLine('■ abort requested…', 'err');
+    return;
+  }
+  const agentId = document.getElementById('ai-agent').value;
+  const model = document.getElementById('ai-model').value;
+  const a = agents.find(x => x.id === agentId);
+  if (!a) return;
+  if (R(agentId).running) { await showAlert({ title: 'AGENT BUSY', message: `${a.name} is already running.`, okText: 'OK' }); return; }
+  const pr = aiState.pr;
+  const d = await window.deck.prDiff(gitRepo, pr.number);
+  if (!d.ok || !d.diff.trim()) { await showAlert({ title: 'NO DIFF', message: d.error || 'this PR has no diff.', okText: 'OK' }); return; }
+
+  aiSaveChoice();   // remember this agent+model for next time (consistency)
+  let prompt, plan = false;
+  if (aiState.mode === 'review') {
+    // strict rubric + fixed output schema → different models produce comparable,
+    // repeatable reviews instead of free-form prose that varies by model
+    prompt = `You are a code reviewer. Review ONLY the diff below against this fixed rubric. Be deterministic and terse — output ONLY the format specified, no preamble or prose.
+
+PR #${pr.number}: ${pr.title}  (${pr.headRefName} → ${pr.baseRefName})
+
+Check these categories IN THIS ORDER, and report only issues actually present in the diff:
+1. CORRECTNESS — bugs, logic errors, unhandled edge cases, broken contracts
+2. SECURITY — injection, auth, secrets, unsafe input
+3. PERFORMANCE — needless work, N+1, blocking calls
+4. MAINTAINABILITY — dead code, naming, duplication
+
+OUTPUT FORMAT — one line per finding, nothing else:
+[SEVERITY] path:line — <issue in <=15 words> — fix: <suggested fix in <=15 words>
+SEVERITY is exactly one of: BLOCKER, MAJOR, MINOR, NIT.
+Sort findings by severity (BLOCKER first). If a category has none, output nothing for it.
+
+Then a blank line, then EXACTLY one final line:
+VERDICT: APPROVE
+— or —
+VERDICT: REQUEST CHANGES — <one sentence why>
+(Use REQUEST CHANGES if and only if there is at least one BLOCKER or MAJOR.)
+
+=== DIFF ===
+${d.diff.slice(0, 60000)}`;
+  } else {
+    const v = await window.deck.prView(gitRepo, pr.number);
+    const notes = [];
+    if (v.ok) {
+      for (const rv of (v.pr.reviews || [])) if (rv.body || rv.state) notes.push(`- [${rv.state || 'review'}] ${(rv.author && rv.author.login) || '?'}: ${rv.body || ''}`);
+      for (const c of (v.pr.comments || [])) notes.push(`- ${(c.author && c.author.login) || '?'}: ${c.body || ''}`);
+    }
+    if (!notes.length) { await showAlert({ title: 'NO REVIEW/COMMENTS', message: 'This PR has no review or comments yet. Run AI Review and post it (or add a comment) first.', okText: 'OK' }); return; }
+    prompt = `You are a fixer AI working on pull request #${pr.number} (${pr.title}), branch ${pr.headRefName}.
+
+Below are the REVIEW COMMENTS on this PR. Your job:
+1. VALIDATE each point against the actual diff — is it a real, correct concern? Note any you disagree with and why.
+2. For valid ones, produce a concrete FIX PLAN: exact files, the change, and how you'll verify it.
+Do NOT write code yet — this is plan mode. Present the validated findings and the plan.
+
+=== REVIEW / COMMENTS ===
+${notes.join('\n')}
+
+=== PR DIFF ===
+${(d.diff || '').slice(0, 55000)}`;
+    plan = true;
+  }
+
+  document.getElementById('ai-live').innerHTML = '';
+  document.getElementById('ai-final-wrap').classList.add('hidden');
+  document.getElementById('ai-apply').classList.add('hidden');
+  document.getElementById('ai-post').classList.add('hidden');
+  document.getElementById('ai-approve').classList.add('hidden');
+  document.getElementById('ai-fullview-btn').classList.add('hidden');
+  aiState.streamEl = null; aiState.runAgentId = agentId;
+  aiSetRunning(true);
+  aiLiveLine(`starting ${a.name} on ${MODEL_LABELS[model]}…`, 'sys');
+
+  runAgent(agentId, prompt, false, plan, {
+    fresh: true, model,
+    onEvent: aiOnEvent,
+    onDone: (result, text) => {
+      aiSetRunning(false);
+      aiState.resultText = (text || '').trim();
+      const fw = document.getElementById('ai-final-wrap');
+      document.getElementById('ai-final-label').textContent = aiState.mode === 'review' ? 'REVIEW RESULT' : 'FIX PLAN';
+      document.getElementById('ai-final').textContent = aiState.resultText || '(no text returned)';
+      fw.classList.remove('hidden');
+      if (result === 'aborted') { aiLiveLine('■ aborted by operator.', 'err'); return; }
+      if (result !== 'success' || !aiState.resultText) return;
+      document.getElementById('ai-fullview-btn').classList.remove('hidden');
+      if (aiState.mode === 'review') {
+        document.getElementById('ai-post').classList.remove('hidden');
+        document.getElementById('ai-approve').classList.remove('hidden');
+      } else {
+        document.getElementById('ai-apply').classList.remove('hidden');
+      }
+    }
+  });
+};
+
+// ---- full-screen result view (with approve/apply) ----
+const aiFullview = document.getElementById('ai-fullview');
+document.getElementById('aifv-back').onclick = () => aiFullview.classList.add('hidden');
+function openAiFullview() {
+  document.getElementById('aifv-title').textContent = (aiState.mode === 'review' ? 'AI REVIEW' : 'FIX PLAN') + ` · PR #${aiState.pr.number}`;
+  document.getElementById('aifv-body').textContent = aiState.resultText || '(no result)';
+  const acts = document.getElementById('aifv-actions');
+  acts.innerHTML = aiState.mode === 'review'
+    ? '<button class="mini-btn" data-a="post">💬 Post as comment</button><button class="mini-btn" data-a="approve">✓ Approve PR</button>'
+    : '<button class="mini-btn" data-a="apply">🔧 Apply Fix</button>';
+  const post = acts.querySelector('[data-a="post"]'); if (post) post.onclick = () => document.getElementById('ai-post').click();
+  const appr = acts.querySelector('[data-a="approve"]'); if (appr) appr.onclick = () => document.getElementById('ai-approve').click();
+  const apply = acts.querySelector('[data-a="apply"]'); if (apply) apply.onclick = () => { aiFullview.classList.add('hidden'); document.getElementById('ai-apply').click(); };
+  aiFullview.classList.remove('hidden');
+}
+document.getElementById('ai-fullview-btn').onclick = openAiFullview;
+document.getElementById('ai-approve').onclick = async (e) => {
+  await ghprReview(aiState.pr.number, 'approve', e.currentTarget);
+  aiFullview.classList.add('hidden');
+  aiModal.classList.add('hidden');
+};
+
+// review mode: post the result as a PR comment
+document.getElementById('ai-post').onclick = async () => {
+  if (!aiState.resultText) return;
+  const btn = document.getElementById('ai-post');
+  btn.disabled = true; btn.textContent = 'posting…';
+  const r = await window.deck.prComment(gitRepo, aiState.pr.number, `### 🤖 AI Review\n\n${aiState.resultText}`);
+  btn.disabled = false; btn.textContent = '💬 Post as comment';
+  if (!r.ok) { await showAlert({ title: 'POST FAILED', message: r.error || r.out, okText: 'OK' }); return; }
+  plog('ok', `AI review posted on PR #${aiState.pr.number}.`);
+  if (ghprCurrent && ghprCurrent.number === aiState.pr.number) ghprLoadDetail(ghprCurrent);
+};
+
+// fix mode: apply the plan — the same agent implements it for real, then we refresh
+document.getElementById('ai-apply').onclick = async () => {
+  if (!aiState.resultText) return;
+  const agentId = document.getElementById('ai-agent').value;
+  const model = document.getElementById('ai-model').value;
+  const a = agents.find(x => x.id === agentId);
+  if (R(agentId).running) { await showAlert({ title: 'AGENT BUSY', message: `${a.name} is already running.`, okText: 'OK' }); return; }
+  document.getElementById('ai-live').innerHTML = '';
+  document.getElementById('ai-apply').classList.add('hidden');
+  document.getElementById('ai-fullview-btn').classList.add('hidden');
+  aiState.streamEl = null; aiState.runAgentId = agentId;
+  aiSetRunning(true);
+  aiLiveLine('applying the fix plan…', 'sys');
+  const prompt = `Implement the following fix plan for real (you are out of plan mode). Make the edits, then verify.
+
+=== FIX PLAN ===
+${aiState.resultText}`;
+  runAgent(agentId, prompt, false, false, {
+    fresh: true, model,
+    onEvent: aiOnEvent,
+    onDone: (result) => {
+      aiSetRunning(false);
+      aiLiveLine(result === 'success' ? '✔ fix applied — review the changes in Source Control, then commit/push.' : (result === 'aborted' ? '■ aborted.' : '✗ fix run ended: ' + result), result === 'success' ? 'ok' : 'err');
+      gitRefresh(); refreshWorkspace();
+    }
+  });
+};
+
+// create-PR dialog
+const ghprModal = document.getElementById('ghpr-modal');
+document.getElementById('ghpr-close').onclick = () => ghprModal.classList.add('hidden');
+ghprModal.addEventListener('click', e => { if (e.target === ghprModal) ghprModal.classList.add('hidden'); });
+document.getElementById('ghpr-refresh').onclick = (e) => { e.stopPropagation(); ghprRefresh(); };
+document.getElementById('ghpr-new').onclick = async (e) => {
+  e.stopPropagation();
+  const st = await window.deck.gitStatus(gitRepo);
+  document.getElementById('ghpr-branch-note').textContent = st.ok ? `from ${st.branch}` : '';
+  document.getElementById('ghpr-title').value = '';
+  document.getElementById('ghpr-body').value = '';
+  document.getElementById('ghpr-base').value = '';
+  ghprModal.classList.remove('hidden');
+  document.getElementById('ghpr-title').focus();
+};
+document.getElementById('ghpr-create-btn').onclick = async () => {
+  const title = document.getElementById('ghpr-title').value.trim();
+  if (!title) { document.getElementById('ghpr-title').focus(); return; }
+  const body = document.getElementById('ghpr-body').value;
+  const base = document.getElementById('ghpr-base').value.trim();
+  const btn = document.getElementById('ghpr-create-btn');
+  btn.disabled = true; btn.textContent = 'creating…';
+  const r = await window.deck.prCreate(gitRepo, { title, body, base });
+  btn.disabled = false; btn.textContent = 'Create PR';
+  if (!r.ok) { await showAlert({ title: 'CREATE FAILED', message: r.error || r.out, okText: 'OK' }); return; }
+  ghprModal.classList.add('hidden');
+  ghprRefresh();
+};
+
+// collapsible sections (Staged / Changes / Conflicts / CI): click the header to
+// hide or show its children. Action buttons inside the header keep working.
+document.querySelectorAll('#git-panel .git-section > .git-sec-head').forEach(head => {
+  head.classList.add('accordion');
+  head.addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;   // let stage-all / refresh / etc. through
+    head.parentElement.classList.toggle('collapsed');
+  });
+});
 
 // ===== Tabbed interactive terminal — real PTYs + xterm.js =====
 const termView = document.getElementById('term-view');
@@ -1647,6 +2935,7 @@ function renderTermTabs() {
     el.querySelector('b').onclick = e => { e.stopPropagation(); closeTerm(t.id); };
     tvTabs.appendChild(el);
   }
+  renderConsoleChips();
 }
 
 function activateTerm(id) {
@@ -1656,6 +2945,44 @@ function activateTerm(id) {
   const t = tabOf(id);
   if (t) { try { t.fit.fit(); } catch {} t.xterm.focus(); }
 }
+
+// ===== "Analyze with AI" — floating button over a terminal selection =====
+// highlight an error in the terminal → the button appears → one click sends the
+// selection to GENERAL-OPS with simple diagnose-and-fix rules
+const termAiBtn = document.createElement('button');
+termAiBtn.id = 'term-ai-btn';
+termAiBtn.className = 'hidden';
+termAiBtn.textContent = '✨ Analyze with AI';
+document.body.appendChild(termAiBtn);
+let termAiSel = '';
+
+function hideTermAi() { termAiBtn.classList.add('hidden'); }
+function showTermAi(x, y) {
+  termAiBtn.style.left = Math.max(8, Math.min(x, window.innerWidth - 160)) + 'px';
+  termAiBtn.style.top = Math.max(8, y - 38) + 'px';
+  termAiBtn.classList.remove('hidden');
+}
+document.addEventListener('mousedown', e => { if (e.target !== termAiBtn) hideTermAi(); });
+
+termAiBtn.onclick = () => {
+  const text = termAiSel;
+  hideTermAi();
+  if (!text.trim()) return;
+  const agent = agents.find(a => a.id === 'def-general') || byRole('custom')[0] || agents[0];
+  if (!agent) return;
+  if (R(agent.id).running) { toast('✗ ' + agent.name + ' is busy — try again shortly', false); return; }
+  const prompt = `Analyze this terminal output the operator highlighted. Simple rules:
+1) WHAT: the error/issue in one line (or "not an error" + what it means).
+2) WHY: root cause in 1-2 lines.
+3) FIX: the exact command(s) or edit to run, ready to copy. Prefer the smallest fix.
+Do not explore the project unless strictly necessary. Max 10 lines total.
+
+=== TERMINAL OUTPUT ===
+${text.slice(0, 6000)}`;
+  closeTerminalView();   // bring the console forward so the answer is visible
+  plog('info', `✨ analyzing highlighted terminal output on ${agent.name}…`);
+  runAgent(agent.id, prompt, false, false, { fresh: true, model: 'claude-sonnet-5' });
+};
 
 // hover tooltip for terminal links — VS Code-style "ctrl+click to open"
 const linkTip = document.createElement('div');
@@ -1691,6 +3018,43 @@ async function newTerm(shell, cwd) {
     if (e.ctrlKey || e.metaKey) { hideLinkTip(); window.deck.openExternal(uri); }
   }, { hover: showLinkTip, leave: hideLinkTip }));
   xt.open(pane);
+  // Clipboard, terminal-style: Ctrl+C copies the SELECTION (and falls through to
+  // SIGINT when nothing is selected); Ctrl+V pastes. Ctrl+Shift+C/V also work.
+  // cache the live selection — some keydowns fire after xterm clears it
+  let lastSel = '';
+  xt.onSelectionChange(() => { const s = xt.getSelection(); if (s) lastSel = s; });
+  // selection made with the mouse → offer the AI analyzer right there
+  pane.addEventListener('mouseup', (e) => {
+    setTimeout(() => {
+      const s = xt.getSelection();
+      if (s && s.trim().length >= 8) { termAiSel = s; showTermAi(e.clientX, e.clientY); }
+      else hideTermAi();
+    }, 30);
+  });
+  xt.attachCustomKeyEventHandler((e) => {
+    if (e.type !== 'keydown') return true;
+    const c = e.ctrlKey || e.metaKey;
+    if (!c) return true;
+    // Ctrl+C / Ctrl+Shift+C: copy the selection; plain Ctrl+C with no selection
+    // falls through so it still interrupts the running process.
+    if (e.code === 'KeyC') {
+      const sel = xt.getSelection() || lastSel;
+      if (sel) { window.deck.clipboardWrite(sel); lastSel = ''; xt.clearSelection(); return false; }
+      return !e.shiftKey;
+    }
+    // Ctrl+V: xterm's textarea receives the native paste event and feeds it
+    // through onData already — injecting the clipboard here too pasted twice.
+    // Just let the native path handle it.
+    if (e.code === 'KeyV') return true;
+    return true;
+  });
+  // right-click: copy selection if any, else paste — a mouse fallback that always works
+  pane.addEventListener('contextmenu', async (e) => {
+    e.preventDefault();
+    const sel = xt.getSelection() || lastSel;
+    if (sel) { window.deck.clipboardWrite(sel); lastSel = ''; xt.clearSelection(); }
+    else { const t = await window.deck.clipboardRead(); if (t) window.deck.termInput(id, t); }
+  });
   xt.onData(d => {
     window.deck.termInput(id, d);
     if (d === '\r') setTimeout(gitRefresh, 1500); // refresh badge after each command
@@ -1738,13 +3102,84 @@ function openTerminal() {
   viewer.classList.add('hidden');
   if (!termTabs.length) newTerm('bash');
   else activateTerm(termActive || termTabs[0].id);
+  setTermIconActive(true);
+  renderConsoleChips();
 }
 
 function closeTerminalView() {
   // tabs keep their PTYs alive in the background — this only swaps the pane
   termView.classList.add('hidden');
   consoleFeed.classList.remove('hidden');
+  setTermIconActive(false);
   syncPane();
+  renderConsoleChips();
+}
+
+// #2 — reflect terminal-open in the top-right icon
+function setTermIconActive(on) { document.getElementById('btn-term').classList.toggle('ico-active', on); }
+
+// ===== Surface chips beside CENTRAL CONSOLE =====
+// The main area shows ONE surface at a time (no split). When more than one is
+// active — Console + Terminal + Explorer — chips let you switch and close each.
+const SURFACE_META = {
+  console: { icon: '◈', label: 'Console', closable: false },
+  editor: { icon: '📄', label: 'Explorer', closable: true },
+  terminal: { icon: '⌨', label: 'Terminal', closable: true }
+};
+function activeSurfaces() {
+  const arr = ['console'];
+  if (openFiles.length) arr.push('editor');
+  if (termTabs.length) arr.push('terminal');
+  return arr;
+}
+function currentSurface() {
+  if (termOpen()) return 'terminal';
+  if (!viewer.classList.contains('hidden')) return 'editor';
+  return 'console';
+}
+function showSurface(name) {
+  if (name === 'terminal') { openTerminal(); return; }
+  termView.classList.add('hidden');
+  setTermIconActive(false);
+  if (name === 'editor' && openFiles.length) {
+    paneOverride = 'editor';
+    viewer.classList.remove('hidden');
+    consoleFeed.classList.add('hidden');
+  } else {
+    paneOverride = 'console';
+    viewer.classList.add('hidden');
+    consoleFeed.classList.remove('hidden');
+  }
+  renderConsoleChips();
+}
+async function closeSurface(name) {
+  if (name === 'terminal') {
+    for (const t of [...termTabs]) closeTerm(t.id);
+    closeTerminalView();
+  } else if (name === 'editor') {
+    for (const f of [...openFiles]) await closeFile(f.path);
+    showSurface('console');
+  }
+  renderConsoleChips();
+}
+function renderConsoleChips() {
+  const bar = document.getElementById('console-chips');
+  if (!bar) return;
+  const surfaces = activeSurfaces();
+  if (surfaces.length <= 1) { bar.innerHTML = ''; bar.classList.add('hidden'); return; }
+  bar.classList.remove('hidden');
+  const cur = currentSurface();
+  bar.innerHTML = '';
+  for (const s of surfaces) {
+    const m = SURFACE_META[s];
+    const chip = document.createElement('div');
+    chip.className = 'cc-chip' + (s === cur ? ' active' : '');
+    chip.innerHTML = `<span class="cc-label">${m.icon} ${m.label}</span>${m.closable ? '<b class="cc-x" title="Close">✕</b>' : ''}`;
+    chip.querySelector('.cc-label').onclick = () => showSurface(s);
+    const x = chip.querySelector('.cc-x');
+    if (x) x.onclick = (e) => { e.stopPropagation(); closeSurface(s); };
+    bar.appendChild(chip);
+  }
 }
 
 document.getElementById('btn-term').onclick = () => (termOpen() ? closeTerminalView() : openTerminal());
@@ -1756,37 +3191,283 @@ document.getElementById('git-unstage-all').onclick = () => gitDo('unstage', '*')
 document.getElementById('git-pull').onclick = () => gitDo('pull');
 
 // commit like VS Code: if nothing is staged, stage everything first
-async function doCommit(kind) {
-  const msgBox = document.getElementById('git-msg');
-  const msg = msgBox.value.trim();
-  if (!msg && kind !== 'amend') { gitOut('commit message required', false); return; }
-  gitOut('working...', true);
-  const st = await window.deck.gitStatus(gitRepo);
-  if (st.ok && !st.staged.length && (st.unstaged.length || st.untracked.length)) {
-    await window.deck.gitCmd(gitRepo, 'stage', '*');
+// push; if the branch has no upstream yet, publish it (push -u origin <branch>)
+async function pushOrPublish() {
+  let r = await window.deck.gitCmd(gitRepo, 'push');
+  if (!r.ok && /no upstream branch|set-upstream/i.test(r.out)) {
+    const st = await window.deck.gitStatus(gitRepo);
+    r = await window.deck.gitCmd(gitRepo, 'publish', st.branch || 'HEAD');
   }
-  let r = await window.deck.gitCmd(gitRepo, kind === 'amend' ? 'amend' : 'commit', msg);
-  if (r.ok) {
-    msgBox.value = '';
-    if (kind === 'sync') { await window.deck.gitCmd(gitRepo, 'pull'); r = await window.deck.gitCmd(gitRepo, 'push'); }
-    else if (kind === 'push') r = await window.deck.gitCmd(gitRepo, 'push');
-  }
-  gitOut(r.out.split('\n').slice(-2).join(' · ') || (r.ok ? 'done' : 'failed'), r.ok);
-  gitRefresh();
+  return r;
 }
 
+// ============================================================
+// COMMIT FLOW — stateful modal that survives hook rejections:
+// commit → (hook/check error shown inline) → 🔧 Fix with AI (streams live with a
+// thinking indicator) → commit message again → retry. Only closes on success.
+// ============================================================
+const CMT_LABEL = { plain: 'COMMIT', amend: 'COMMIT (AMEND)', push: 'COMMIT & PUSH', sync: 'COMMIT & SYNC' };
+const cmtModal = document.getElementById('cmt-modal');
+const cmt = { kind: 'plain', running: false, aiAgentId: null, streamEl: null, thinkEl: null, gitEl: null, lastError: '', streamId: null, autoPush: false };
+
+function cmtEl(id) { return document.getElementById(id); }
+function cmtStepMark(step, cls) {
+  const el = cmtModal.querySelector(`.cmt-step[data-step="${step}"]`);
+  if (el) el.className = 'cmt-step ' + (cls || '');
+}
+
+async function openCommitModal(kind) {
+  cmt.kind = kind; cmt.running = false; cmt.lastError = ''; cmt.gitEl = null;
+  cmt.autoPush = (kind === 'push' || kind === 'sync');
+  const st = await window.deck.gitStatus(gitRepo);
+  cmt.willStageAll = st.ok && !st.staged.length && (st.unstaged.length || st.untracked.length);
+  cmt.branch = st.branch || '';
+  const fileCount = cmt.willStageAll ? (st.unstaged.length + st.untracked.length) : (st.ok ? st.staged.length : 0);
+  cmtEl('cmt-title').textContent = 'COMMIT · ' + (st.branch || '');
+  cmtEl('cmt-summary').textContent = `${fileCount} file(s)${cmt.willStageAll ? ' — will stage all first' : ' staged'}`;
+  cmtEl('cmt-msg').value = cmtEl('git-msg').value.trim();
+  cmtEl('cmt-msg').classList.remove('hidden');
+  cmtEl('cmt-pr-row').classList.add('hidden');
+  cmtEl('cmt-error-wrap').classList.add('hidden');
+  cmtEl('cmt-live-wrap').classList.add('hidden');
+  cmtEl('cmt-live').innerHTML = '';
+  for (const s of ['commit', 'push', 'pr']) cmtStepMark(s, '');
+  cmtSetState('compose');
+  cmtModal.classList.remove('hidden');
+  cmtEl('cmt-msg').focus();
+}
+
+// visible buttons per state
+function cmtSetState(state) {
+  cmt.state = state;
+  const show = (id, on) => cmtEl(id).classList.toggle('hidden', !on);
+  const dis = (id, on) => { cmtEl(id).disabled = on; };
+  const busy = ['committing', 'pushing', 'fixing', 'creating'].includes(state);
+  cmtEl('cmt-commit').classList.remove('btn-working');
+  show('cmt-commit', state === 'compose' || state === 'error');
+  show('cmt-push', state === 'committed');
+  show('cmt-pr', state === 'pushed');
+  show('cmt-close', state === 'done');
+  show('cmt-fix', state === 'error');
+  show('cmt-abort', state === 'fixing');
+  show('cmt-cancel', state !== 'done');
+  dis('cmt-cancel', busy);
+  cmtEl('cmt-msg').disabled = busy || state !== 'compose' && state !== 'error';
+  if (state === 'error') cmtEl('cmt-commit').textContent = '↻ Retry commit';
+  if (state === 'compose') cmtEl('cmt-commit').textContent = '✓ ' + (CMT_LABEL[cmt.kind] || 'COMMIT');
+}
+
+// ----- live log (git process + AI process share the same panel) -----
+function cmtLive(text, cls) {
+  const live = cmtEl('cmt-live');
+  const el = document.createElement('div');
+  el.className = 'ai-line ' + (cls || '');
+  el.textContent = text;
+  live.appendChild(el);
+  if (cmt.thinkEl) live.appendChild(cmt.thinkEl);
+  live.scrollTop = live.scrollHeight;
+  return el;
+}
+function cmtShowLive(label) {
+  cmtEl('cmt-live-wrap').classList.remove('hidden');
+  cmtEl('cmt-live-label').textContent = label;
+}
+// stream a git op's stdout/stderr live into the panel
+async function cmtGitStream(op, arg) {
+  cmt.streamId = uid(); cmt.gitEl = null;
+  cmtLive(`$ git ${op}${arg && arg !== '*' ? ' ' + arg : ''}`, 'sys');
+  const r = await window.deck.gitStream(gitRepo, op, arg, cmt.streamId);
+  cmt.streamId = null; cmt.gitEl = null;
+  return r;
+}
+// append raw git output as it arrives (routed from the global listener)
+function cmtAppendGit(data) {
+  const live = cmtEl('cmt-live');
+  if (!cmt.gitEl) { cmt.gitEl = document.createElement('div'); cmt.gitEl.className = 'ai-line git'; live.appendChild(cmt.gitEl); }
+  cmt.gitEl.textContent += String(data).replace(/\r(?!\n)/g, '\n');
+  if (cmt.thinkEl) live.appendChild(cmt.thinkEl);
+  live.scrollTop = live.scrollHeight;
+}
+window.deck.onGitStream(p => { if (p.streamId && p.streamId === cmt.streamId) cmtAppendGit(p.data); });
+
+function cmtOnEvent(ev) {
+  if (ev.kind === 'init') { cmt.streamEl = null; cmtLive(`▸ session ${String(ev.sessionId).slice(0, 8)} · ${ev.model}`, 'sys'); }
+  else if (ev.kind === 'tool') {
+    cmt.streamEl = null;
+    let d = ''; try { const i = JSON.parse(ev.input); d = i.file_path || i.path || i.command || i.pattern || ''; } catch {}
+    cmtLive(`⚙ ${ev.tool} ${String(d).slice(0, 90)}`, 'tool');
+  } else if (ev.kind === 'text-delta') {
+    if (!cmt.streamEl) cmt.streamEl = cmtLive('', 'txt');
+    cmt.streamEl.textContent += ev.text;
+    cmtEl('cmt-live').scrollTop = cmtEl('cmt-live').scrollHeight;
+  } else if (ev.kind === 'text-end') { cmt.streamEl = null; }
+  else if (ev.kind === 'result') { cmtLive(`◆ ${String(ev.subtype).toUpperCase()} · ${ev.numTurns} turns`, 'ok'); }
+  else if (ev.kind === 'error') { cmtLive('⚠ ' + ev.error, 'err'); }
+}
+
+// ===== STEP 1: COMMIT (streams hook/test output live) =====
+cmtEl('cmt-commit').onclick = async () => {
+  if (cmt.running) return;
+  const msg = cmtEl('cmt-msg').value.trim();
+  if (!msg && cmt.kind !== 'amend') { cmtEl('cmt-summary').textContent = '⚠ commit message required'; cmtEl('cmt-msg').focus(); return; }
+  cmt.running = true;
+  cmtEl('cmt-error-wrap').classList.add('hidden');
+  cmtEl('cmt-live').innerHTML = '';
+  cmtShowLive('COMMIT PROCESS (hooks / tests run here)');
+  cmtStepMark('commit', 'active');
+  cmtSetState('committing');
+  if (cmt.willStageAll) await cmtGitStream('stage', '*');
+  const r = await cmtGitStream(cmt.kind === 'amend' ? 'amend' : 'commit', msg);
+  cmt.running = false;
+  if (!r.ok) {
+    cmt.lastError = r.out || 'commit failed';
+    cmtEl('cmt-error').textContent = cmt.lastError;
+    cmtEl('cmt-error-wrap').classList.remove('hidden');
+    cmtStepMark('commit', 'fail');
+    cmtSetState('error');
+    return;
+  }
+  cmtEl('git-msg').value = '';
+  cmtLive('✔ committed', 'ok');
+  cmtStepMark('commit', 'done');
+  gitRefresh();
+  if (cmt.autoPush) { cmtEl('cmt-push').click(); return; }   // Commit & Push / Sync
+  cmtSetState('committed');   // shows the PUSH button
+};
+
+// ===== STEP 2: PUSH (streamed) =====
+cmtEl('cmt-push').onclick = async () => {
+  if (cmt.running) return;
+  cmt.running = true;
+  cmtShowLive('PUSH PROCESS');
+  cmtStepMark('push', 'active');
+  cmtSetState('pushing');
+  if (cmt.kind === 'sync') await cmtGitStream('pull');
+  let r = await cmtGitStream('push');
+  if (!r.ok && /no upstream branch|set-upstream/i.test(r.out)) r = await cmtGitStream('publish', cmt.branch || 'HEAD');
+  cmt.running = false;
+  if (!r.ok) {
+    cmt.lastError = r.out || 'push failed';
+    cmtEl('cmt-error').textContent = cmt.lastError;
+    cmtEl('cmt-error-wrap').classList.remove('hidden');
+    cmtStepMark('push', 'fail');
+    cmtLive('✗ push failed — fix and press Push again', 'err');
+    cmtSetState('committed');   // let them retry Push
+    return;
+  }
+  cmtLive('✔ pushed', 'ok');
+  cmtStepMark('push', 'done');
+  gitRefresh();
+  await cmtPreparePR();
+};
+
+// ===== STEP 3: CREATE PR (pick base branch) =====
+async function cmtPreparePR() {
+  cmtEl('cmt-msg').classList.add('hidden');
+  cmtEl('cmt-pr-title').value = (cmtEl('cmt-msg').value || '').split('\n')[0] || cmt.branch;
+  cmtEl('cmt-pr-head').textContent = cmt.branch;
+  const sel = cmtEl('cmt-pr-base-sel');
+  sel.innerHTML = '<option>loading…</option>';
+  cmtEl('cmt-pr-row').classList.remove('hidden');
+  cmtStepMark('pr', 'active');
+  cmtSetState('pushed');
+  const b = await window.deck.gitBranches(gitRepo);
+  const bases = [];
+  const seen = new Set();
+  for (const rb of (b.ok ? b.remote : [])) {
+    const short = rb.replace(/^[^/]+\//, '');
+    if (!/\/HEAD$|->/.test(rb) && short !== cmt.branch && !seen.has(short)) { seen.add(short); bases.push(short); }
+  }
+  for (const l of (b.ok ? b.local : [])) if (l.name !== cmt.branch && !seen.has(l.name)) { seen.add(l.name); bases.push(l.name); }
+  sel.innerHTML = '';
+  for (const name of bases) { const o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o); }
+  // default base: main → master → qa → first
+  const def = bases.find(x => x === 'main') || bases.find(x => x === 'master') || bases.find(x => x === 'qa') || bases[0];
+  if (def) sel.value = def;
+}
+
+cmtEl('cmt-pr').onclick = async () => {
+  if (cmt.running) return;
+  const title = cmtEl('cmt-pr-title').value.trim() || cmt.branch;
+  const base = cmtEl('cmt-pr-base-sel').value;
+  if (!base) { cmtLive('✗ pick a base branch', 'err'); return; }
+  cmt.running = true;
+  cmtShowLive('CREATE PR PROCESS');
+  cmtSetState('creating');
+  // gh pr create isn't streamed — show a thinking indicator while it runs
+  cmt.thinkEl = document.createElement('div'); cmt.thinkEl.className = 'ai-line ai-thinking'; cmt.thinkEl.textContent = '⏳ creating PR';
+  cmtEl('cmt-live').appendChild(cmt.thinkEl);
+  cmtLive(`$ gh pr create --base ${base} --head ${cmt.branch}`, 'sys');
+  const r = await window.deck.prCreate(gitRepo, { title, body: '', base });
+  if (cmt.thinkEl) { cmt.thinkEl.remove(); cmt.thinkEl = null; }
+  cmt.running = false;
+  if (!r.ok) {
+    cmtLive('✗ ' + (r.error || r.out || 'PR create failed'), 'err');
+    cmtStepMark('pr', 'fail');
+    cmtSetState('pushed');   // retry
+    return;
+  }
+  cmt.prUrl = (r.out.match(/https?:\/\/\S+/) || [])[0] || '';
+  cmtLive('✔ PR created' + (cmt.prUrl ? ' · ' + cmt.prUrl : ''), 'ok');
+  cmtStepMark('pr', 'done');
+  ghprRefresh();
+  cmtSetState('done');
+};
+
+// 🔧 Fix with AI — reads the failure output, fixes it, streams here with thinking
+cmtEl('cmt-fix').onclick = async () => {
+  const agent = byRole('senior')[0] || agents.find(a => a.id === 'def-general') || agents[0];
+  if (!agent) return;
+  if (R(agent.id).running) { cmtLive('✗ ' + agent.name + ' is busy', 'err'); return; }
+  cmt.aiAgentId = agent.id; cmt.streamEl = null;
+  cmtShowLive(`🔧 FIXING WITH AI · ${agent.name}`);
+  cmtLive('— analyzing the failure —', 'sys');
+  cmtSetState('fixing');
+  cmt.thinkEl = document.createElement('div');
+  cmt.thinkEl.className = 'ai-line ai-thinking';
+  cmt.thinkEl.textContent = '⏳ thinking';
+  cmtEl('cmt-live').appendChild(cmt.thinkEl);
+  const prompt = `A git commit was BLOCKED by a pre-commit hook (lint/tests/etc). Below is the FULL output, including any failing test details. Diagnose the cause and FIX it so the hook passes — write or repair the required tests, satisfy the linter, whatever it demands. Do NOT run "git commit" yourself; the app retries after you finish. Keep changes minimal and in scope.
+
+=== HOOK / TEST OUTPUT ===
+${cmt.lastError.slice(0, 9000)}`;
+  runAgent(agent.id, prompt, false, false, {
+    fresh: true,
+    onEvent: cmtOnEvent,
+    onDone: (result) => {
+      if (cmt.thinkEl) { cmt.thinkEl.remove(); cmt.thinkEl = null; }
+      cmt.aiAgentId = null;
+      if (result === 'aborted') { cmtLive('■ fix aborted.', 'err'); cmtSetState('error'); return; }
+      cmtLive(result === 'success' ? '✔ fix complete — press ↻ Retry commit.' : '✗ fix ended: ' + result, result === 'success' ? 'ok' : 'err');
+      cmtEl('cmt-summary').textContent = 'AI applied a fix — retry the commit';
+      cmtSetState('error');
+      gitRefresh();
+    }
+  });
+};
+
+cmtEl('cmt-abort').onclick = () => { if (cmt.aiAgentId) stopAgent(cmt.aiAgentId); };
+cmtEl('cmt-close').onclick = () => cmtModal.classList.add('hidden');
+cmtEl('cmt-cancel').onclick = () => { if (!cmt.running && !cmt.aiAgentId) cmtModal.classList.add('hidden'); };
+cmtModal.addEventListener('click', e => { if (e.target === cmtModal && !cmt.running && !cmt.aiAgentId) cmtModal.classList.add('hidden'); });
+
 const commitMenu = document.getElementById('commit-menu');
-document.getElementById('git-commit').onclick = () => doCommit('plain');
+document.getElementById('git-commit').onclick = () => openCommitModal('plain');
 document.getElementById('git-commit-more').onclick = (e) => {
   e.stopPropagation();
   commitMenu.classList.toggle('hidden');
+  if (!commitMenu.classList.contains('hidden')) fitDropUp(commitMenu, document.getElementById('git-commit-more'));
 };
 commitMenu.querySelectorAll('.cm-item').forEach(item => {
-  item.onclick = () => { commitMenu.classList.add('hidden'); doCommit(item.dataset.kind); };
+  item.onclick = async () => {
+    commitMenu.classList.add('hidden');
+    if (item.dataset.act) { await gitDo(item.dataset.act); refreshWorkspace(); return; }   // stash
+    openCommitModal(item.dataset.kind);
+  };
 });
 document.addEventListener('click', () => commitMenu.classList.add('hidden'));
 document.getElementById('git-msg').addEventListener('keydown', e => {
-  if (e.ctrlKey && e.key === 'Enter') doCommit('plain');
+  if (e.ctrlKey && e.key === 'Enter') openCommitModal('plain');
 });
 // keep the badge fresh: poll + refresh after every agent run
 setInterval(() => { if (gitRepo && !gitPanel.classList.contains('hidden')) gitRefresh(); }, 10000);
@@ -1806,7 +3487,10 @@ function closeAlert(result) {
 }
 
 // returns true if the user confirmed. Omit cancelText for a plain notice.
-function showAlert({ title, message, okText = 'OK', cancelText = null, kind = 'warn' }) {
+// work: async fn — run INSIDE the modal on OK: buttons lock, the OK button shows
+// workingText until it finishes, then the modal closes resolving work's result.
+let alertBusy = false;
+function showAlert({ title, message, okText = 'OK', cancelText = null, kind = 'warn', work = null, workingText = '⏳ WORKING…' }) {
   const card = alertModal.querySelector('.modal-card');
   card.className = 'modal-card alert-card ' + kind;
   document.getElementById('alert-title').textContent = title;
@@ -1815,18 +3499,31 @@ function showAlert({ title, message, okText = 'OK', cancelText = null, kind = 'w
   const ok = document.getElementById('alert-ok');
   const cancel = document.getElementById('alert-cancel');
   ok.textContent = okText;
+  ok.disabled = false; cancel.disabled = false;
   ok.className = 'btn ' + (kind === 'danger' ? 'btn-danger' : 'btn-launch');
   cancel.textContent = cancelText || 'CANCEL';
   cancel.classList.toggle('hidden', !cancelText);
+
+  ok.onclick = async () => {
+    if (!work) { closeAlert(true); return; }
+    alertBusy = true;
+    ok.disabled = true; cancel.disabled = true;
+    ok.textContent = workingText;
+    ok.classList.add('btn-working');
+    let res;
+    try { res = await work(); } catch (e) { res = { ok: false, error: String(e && e.message ? e.message : e) }; }
+    alertBusy = false;
+    ok.classList.remove('btn-working');
+    closeAlert(res === undefined ? true : res);
+  };
+  cancel.onclick = () => { if (!alertBusy) closeAlert(false); };
 
   alertModal.classList.remove('hidden');
   ok.focus();
   return new Promise(res => { alertResolve = res; });
 }
 
-document.getElementById('alert-ok').onclick = () => closeAlert(true);
-document.getElementById('alert-cancel').onclick = () => closeAlert(false);
-alertModal.addEventListener('click', e => { if (e.target === alertModal) closeAlert(false); });
+alertModal.addEventListener('click', e => { if (e.target === alertModal && !alertBusy) closeAlert(false); });
 
 // ============================================================
 // SKILL EDITOR — hand-edit SKILL.md or have an agent improve it
@@ -2197,6 +3894,39 @@ document.querySelectorAll('.side-tab').forEach(tab => {
 const exTree = document.getElementById('ex-tree');
 let exLoaded = false;
 
+// git status decoration for the tree: normalized-absolute path -> 'conflict' |
+// 'modified' | 'untracked'. Built from every repo's status in gitRefresh.
+const exStatus = new Map();
+function exNorm(p) { return String(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase(); }
+function buildExStatus(all) {
+  exStatus.clear();
+  const set = (repo, rel, cls, force) => {
+    const key = exNorm(repo + '/' + String(rel).replace(/"/g, ''));
+    if (force || !exStatus.has(key)) exStatus.set(key, cls);
+  };
+  for (const { repo, st } of all) {
+    if (!st.ok) continue;
+    for (const f of st.conflicts || []) set(repo, f, 'conflict', true);   // wins
+    for (const { f } of st.staged) set(repo, f, 'modified');
+    for (const { f } of st.unstaged) set(repo, f, 'modified');
+    for (const f of st.untracked) set(repo, f, 'untracked');
+  }
+}
+// paint status classes onto the currently-rendered rows (no disk re-read)
+function decorateExplorer() {
+  exTree.querySelectorAll('.ex-row.is-file').forEach(row => {
+    row.classList.remove('gs-conflict', 'gs-modified', 'gs-untracked');
+    const badge = row.querySelector('.ex-gs'); if (badge) badge.remove();
+    const cls = exStatus.get(exNorm(row.dataset.file || row.title));
+    if (!cls) return;
+    row.classList.add('gs-' + cls);
+    const b = document.createElement('span');
+    b.className = 'ex-gs gs-' + cls;
+    b.textContent = cls === 'conflict' ? '!' : cls === 'untracked' ? 'U' : 'M';
+    row.appendChild(b);
+  });
+}
+
 async function exRenderDir(dir, container) {
   const r = await window.deck.fsList(projectDir, dir);
   container.innerHTML = '';
@@ -2232,6 +3962,7 @@ async function exRenderDir(dir, container) {
     }
   }
   markOpenRows();
+  decorateExplorer();
 }
 
 async function exLoad() {
@@ -2249,6 +3980,28 @@ function exReset() {
   exLoaded = false;
   exTree.innerHTML = '';
   if (!document.getElementById('tab-explorer').classList.contains('hidden')) exLoad();
+}
+
+// Something changed the files on disk out from under us (git pull/merge/checkout,
+// an agent run). Rebuild the explorer tree and re-read every OPEN, unmodified file
+// so the editor shows the new content instead of a stale buffer. Files with unsaved
+// edits are left alone (we don't clobber the operator's work).
+async function refreshWorkspace() {
+  exReset();
+  let activeChanged = false;
+  for (const f of openFiles) {
+    if (f.dirty) continue;
+    const r = await window.deck.fsRead(projectDir, f.path, shikiTheme());
+    if (!r.ok) continue;
+    if (r.content !== f.content) {
+      f.content = r.content;
+      f.value = r.content;
+      f.html = shikiInner(r.html);
+      f.indent = detectIndent(r.content);
+      if (f.path === activeFile) activeChanged = true;
+    }
+  }
+  if (activeChanged) renderViewer();
 }
 
 document.getElementById('ex-refresh').onclick = exLoad;
@@ -2321,7 +4074,10 @@ async function openFile(path) {
   activeFile = path;
   paneOverride = 'editor';
   viewer.classList.remove('hidden');
+  setTermIconActive(false);
+  termView.classList.add('hidden');
   renderViewer();
+  renderConsoleChips();
   vwInput.focus();
 }
 
@@ -2366,6 +4122,7 @@ function renderTabs() {
     mark.onclick = e => { e.stopPropagation(); closeFile(f.path); };
     tabs.appendChild(t);
   }
+  renderConsoleChips();
 }
 
 function renderGutter(text) {

@@ -15,8 +15,10 @@
   "build": {
     "appId": "com.loveai.console",
     "productName": "LoveAi",
+    "icon": "build/icon.png",
     "directories": {
-      "output": "dist"
+      "output": "dist",
+      "buildResources": "build"
     },
     "files": [
       "main.js",
