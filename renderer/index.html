@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>LoveAi</title>
+  <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="bg-glow"></div>
+
+  <!-- ===== Sidebar ===== -->
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div class="brand-text">LOVE<b>AI</b><span>MISSION CONTROL</span></div>
+    </div>
+
+    <!-- Sidebar tabs -->
+    <div class="side-tabs">
+      <button class="side-tab active" data-tab="agent">⬡ AGENT</button>
+      <button class="side-tab" data-tab="explorer">🗀 EXPLORER</button>
+    </div>
+
+    <!-- ===== AGENT tab ===== -->
+    <div id="tab-agent" class="side-pane">
+
+    <!-- Project -->
+    <section class="side-block">
+      <div class="side-title">◈ PROJECT <button id="btn-import" class="mini-btn">⇩ IMPORT</button></div>
+      <div id="project-path" class="project-path">no project imported</div>
+    </section>
+
+    <!-- Roster -->
+    <section class="side-block grow">
+      <div class="side-title">◈ AGENT ROSTER <button id="btn-new-agent" class="mini-btn">+ NEW</button></div>
+      <div id="roster"></div>
+    </section>
+
+    <!-- Chatbox (bottom) -->
+    <section class="side-block chatbox">
+      <div class="side-title">◈ COMMAND <button id="btn-new-session" class="mini-btn" title="Start a fresh shared session (clears context for all agents)">↺ NEW SESSION</button></div>
+      <select id="chat-target">
+        <option value="__pipeline__">⟢ AUTO PIPELINE</option>
+      </select>
+      <div id="slash-menu" class="slash-menu hidden"></div>
+      <textarea id="chat-input" placeholder="Describe the issue or task... / for skills &amp; commands, ! for shell. Drop images/files here. (Ctrl+Enter)"></textarea>
+      <div id="attach-chips" class="attach-chips"></div>
+      <label class="plan-toggle" title="Agent reads and plans only — no files are written until you approve with a follow-up">
+        <input type="checkbox" id="chat-plan" /> PLAN MODE
+      </label>
+      <div class="chat-actions">
+        <button id="btn-attach" class="btn" title="Attach files or images">📎</button>
+        <input type="file" id="file-in" multiple hidden />
+        <button id="btn-send" class="btn btn-launch">⟢ SEND</button>
+        <button id="btn-pipeline-stop" class="btn btn-danger hidden" title="Abort pipeline">■ ABORT</button>
+      </div>
+    </section>
+
+    </div><!-- /tab-agent -->
+
+    <!-- ===== EXPLORER tab ===== -->
+    <div id="tab-explorer" class="side-pane hidden">
+      <section class="side-block">
+        <div class="side-title">◈ EXPLORER <button id="ex-refresh" class="mini-btn" title="Refresh tree">↻</button></div>
+        <div id="ex-root" class="project-path">no project imported</div>
+        <input id="ex-filter" class="ex-filter" placeholder="Filter files in view..." />
+      </section>
+      <section class="side-block grow">
+        <div id="ex-tree" class="ex-tree"></div>
+      </section>
+    </div>
+  </aside>
+
+  <!-- ===== Central console ===== -->
+  <main id="main">
+    <div id="console-head">
+      <div class="console-title">◈ CENTRAL CONSOLE</div>
+      <div class="head-spacer"></div>
+      <div class="account-bar" id="account-bar" title="Account & usage">
+        <div class="acct-dot" id="acct-dot"></div>
+        <div class="acct-info">
+          <div class="acct-email" id="acct-email">checking account...</div>
+          <div class="acct-plan" id="acct-plan">—</div>
+        </div>
+      </div>
+      <button id="btn-theme" class="git-badge head-ico" title="Toggle light / dark">
+        <svg id="theme-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <circle cx="12" cy="12" r="4.2"/>
+          <path d="M12 2.5v2.4M12 19.1v2.4M2.5 12h2.4M19.1 12h2.4M5 5l1.7 1.7M17.3 17.3L19 19M19 5l-1.7 1.7M6.7 17.3L5 19"/>
+        </svg>
+        <svg id="theme-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="hidden">
+          <path d="M20.4 14.2A8.5 8.5 0 0 1 9.8 3.6a8.5 8.5 0 1 0 10.6 10.6z"/>
+        </svg>
+      </button>
+      <button id="btn-history" class="git-badge head-ico" title="Session history">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.2 2"/>
+        </svg>
+      </button>
+      <button id="btn-settings" class="git-badge head-ico" title="Settings — MCP, skills, account">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3.2"/>
+          <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01A1.7 1.7 0 0 0 10 3.09V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.55h.01a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1.03z"/>
+        </svg>
+      </button>
+      <button id="btn-term" class="git-badge head-ico" title="Interactive terminal — toggles the console area">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2.5" y="4" width="19" height="16" rx="2.5"/>
+          <path d="M7 9l3.5 3L7 15M12.5 15H17"/>
+        </svg>
+      </button>
+      <div id="git-wrap" class="git-wrap">
+        <div id="git-badge" class="git-badge hidden" title="Source control — click to open">
+          <span class="gb-ico">⎇</span>
+          <span class="gb-count" id="git-count">0</span>
+        </div>
+
+        <!-- Source control dropdown (VS Code style) -->
+        <div id="git-panel" class="git-panel hidden">
+          <div class="git-head-row">
+            <span class="git-head-title">SOURCE CONTROL <span class="sec-count" id="git-sel-count"></span></span>
+            <span class="git-head-btns">
+              <button id="git-refresh" class="icon-btn" title="Refresh">↻</button>
+              <button id="git-pull" class="icon-btn" title="Pull">⇣</button>
+              <button id="git-bash" class="icon-btn" title="Open terminal">⌨</button>
+            </span>
+          </div>
+          <select id="git-repo-sel" class="hidden" title="Repository"></select>
+          <div class="git-branch-line" id="git-branch-line">—</div>
+          <textarea id="git-msg" rows="1" placeholder="Message (Ctrl+Enter to commit)"></textarea>
+          <div class="commit-split">
+            <button id="git-commit" class="commit-main">✔ Commit</button>
+            <button id="git-commit-more" class="commit-caret">⌄</button>
+            <div id="commit-menu" class="commit-menu hidden">
+              <div class="cm-item" data-kind="plain">Commit</div>
+              <div class="cm-item" data-kind="amend">Commit (Amend)</div>
+              <div class="cm-sep"></div>
+              <div class="cm-item" data-kind="push">Commit &amp; Push</div>
+              <div class="cm-item" data-kind="sync">Commit &amp; Sync</div>
+            </div>
+          </div>
+          <div class="git-section" id="sec-staged">
+            <div class="git-sec-head">⌄ Staged Changes <span class="sec-count" id="staged-count"></span><button id="git-unstage-all" class="mini-btn" title="Unstage all">−</button></div>
+            <div class="git-files" id="git-staged"></div>
+          </div>
+          <div class="git-section" id="sec-changes">
+            <div class="git-sec-head">⌄ Changes <span class="sec-count" id="changes-count"></span><button id="git-stage-all" class="mini-btn" title="Stage all">+</button></div>
+            <div class="git-files" id="git-unstaged"></div>
+          </div>
+          <div class="git-out" id="git-out"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live activity strip — what the agents are doing right now -->
+    <div id="activity" class="activity hidden"></div>
+
+    <!-- Code editor (explorer) — highlighted layer with a transparent textarea on top -->
+    <div id="viewer" class="hidden">
+      <div class="vw-bar">
+        <div class="vw-tabs" id="vw-tabs"></div>
+        <button id="vw-close" class="icon-btn" title="Back to console">✕</button>
+      </div>
+      <div id="vw-body" class="vw-body">
+        <div id="vw-gutter" class="vw-gutter"></div>
+        <div class="vw-edit">
+          <pre id="vw-code" class="vw-code" aria-hidden="true"></pre>
+          <textarea id="vw-input" class="vw-input" wrap="off" spellcheck="false"
+                    autocomplete="off" autocapitalize="off" autocorrect="off"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <div id="console-feed" class="feed">
+      <div class="feed-empty" id="feed-empty">
+        <div class="empty-ring"></div>
+        <div class="empty-title">SYSTEMS NOMINAL</div>
+        <div class="empty-sub">Send a command from the panel on the left — the pipeline or a single agent.</div>
+      </div>
+    </div>
+
+    <!-- Tabbed interactive terminal (takes over the console area) -->
+    <div id="term-view" class="hidden">
+      <div class="tv-bar">
+        <div id="tv-tabs" class="tv-tabs"></div>
+        <button id="tv-new-bash" class="mini-btn" title="New Git Bash tab">＋ BASH</button>
+        <button id="tv-new-ps" class="mini-btn" title="New PowerShell tab">＋ PS</button>
+        <button id="tv-close" class="icon-btn" title="Back to console">✕</button>
+      </div>
+      <div id="tv-body" class="tv-body"></div>
+    </div>
+  </main>
+
+  <!-- ===== Session history drawer ===== -->
+  <div id="history-panel" class="history-panel hidden">
+    <div class="hp-head">
+      <span>🕘 SESSION HISTORY</span>
+      <button id="hp-close" class="icon-btn">✕</button>
+    </div>
+    <div class="hp-hint">Click a session to resume its context (like <b>claude --resume</b>).</div>
+    <div id="hp-list" class="hp-list"></div>
+  </div>
+
+  <!-- ===== Agent modal ===== -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-title" id="modal-title">DEPLOY NEW AGENT</div>
+      <label>CALLSIGN</label>
+      <input id="f-name" placeholder="e.g. QA-UNIT-01" />
+      <div class="row">
+        <div class="col">
+          <label>MODEL</label>
+          <select id="f-model">
+            <option value="claude-sonnet-5">Sonnet 5 — balanced</option>
+            <option value="claude-opus-4-8">Opus 4.8 — powerful</option>
+            <option value="claude-haiku-4-5-20251001">Haiku 4.5 — fast</option>
+            <option value="claude-fable-5">Fable 5 — frontier</option>
+          </select>
+        </div>
+        <div class="col">
+          <label>ROLE</label>
+          <select id="f-role">
+            <option value="custom">Custom</option>
+            <option value="prompt">Prompt Engineer</option>
+            <option value="senior">Senior Engineer</option>
+            <option value="reviewer">Reviewer</option>
+          </select>
+        </div>
+        <div class="col">
+          <label>PERMISSIONS</label>
+          <select id="f-perm">
+            <option value="acceptEdits">Accept edits</option>
+            <option value="default">Ask (default)</option>
+            <option value="plan">Plan only</option>
+            <option value="bypassPermissions">Bypass all</option>
+          </select>
+        </div>
+      </div>
+      <label>WORKING DIRECTORY</label>
+      <div class="row">
+        <input id="f-cwd" placeholder="C:\Users\you\project" style="flex:1" />
+        <button id="f-browse" class="btn">BROWSE</button>
+      </div>
+      <label>ADDITIONAL DIRECTORIES <span class="hint">(comma-separated — extra context for monorepos, like /add-dir)</span></label>
+      <input id="f-dirs" placeholder="C:\repo\shared-lib, C:\repo\api" />
+      <label class="plan-toggle" title="Load only the project CLAUDE.md into the agent's system prompt — skips your global config and skills inventory (big token saving). Turn off if the agent needs your user-level skills">
+        <input type="checkbox" id="f-lean" /> LEAN CONTEXT <span class="hint">(skip user-global CLAUDE.md &amp; skills — saves tokens)</span>
+      </label>
+      <label>CUSTOM RULES <span class="hint">(injected into the agent's system prompt)</span></label>
+      <textarea id="f-rules" rows="6"></textarea>
+      <div class="modal-actions">
+        <button id="f-cancel" class="btn">CANCEL</button>
+        <button id="f-save" class="btn btn-launch">DEPLOY</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Settings modal — MCP, skills, skill creator ===== -->
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-card settings-card">
+      <div class="modal-title">SETTINGS</div>
+      <div class="set-meta" id="set-meta">Claude Code — checking version...</div>
+
+      <div class="set-tabs">
+        <button class="set-tab active" data-set="mcp">MCP SERVERS</button>
+        <button class="set-tab" data-set="skills">SKILLS</button>
+        <button class="set-tab" data-set="creator">SKILL CREATOR</button>
+      </div>
+
+      <div id="set-mcp" class="set-pane">
+        <div class="set-hint">Servers from <b>~/.claude.json</b> and the project's <b>.mcp.json</b> — the same config the Claude Code CLI and agents in this app use. Manage them with <b>claude mcp add / remove</b> in the terminal.</div>
+        <div id="mcp-list" class="set-list"></div>
+      </div>
+
+      <div id="set-skills" class="set-pane hidden">
+        <div class="set-hint">Skills from <b>~/.claude/skills</b> (user) and <b>.claude/skills</b> (project). Click a skill to open it in the editor — improve it by hand or with an agent. <b>✕</b> deletes a user skill.</div>
+        <div id="skills-list" class="set-list"></div>
+      </div>
+
+      <div id="set-creator" class="set-pane hidden">
+        <div class="set-hint">Creates <b>~/.claude/skills/&lt;name&gt;/SKILL.md</b> — available to every agent on this account immediately.</div>
+        <label>SKILL NAME</label>
+        <input id="sk-name" placeholder="e.g. deploy-checklist" />
+        <label>DESCRIPTION <span class="hint">(one line — the model uses this to decide when the skill applies)</span></label>
+        <input id="sk-desc" placeholder="e.g. Run through the release checklist before any production deploy" />
+        <label>INSTRUCTIONS <span class="hint">(markdown — the steps the agent follows when invoked)</span></label>
+        <textarea id="sk-body" rows="9" placeholder="## Steps&#10;1. ...&#10;2. ..."></textarea>
+        <div class="set-actions">
+          <span id="sk-status" class="set-status"></span>
+          <button id="sk-create" class="btn btn-launch">＋ CREATE SKILL</button>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button id="set-refresh" class="btn">↻ REFRESH</button>
+        <button id="set-close" class="btn">CLOSE</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Skill editor — full page: SKILL.md left, GPT-style chat right ===== -->
+  <div id="skill-page" class="skill-page hidden">
+    <header class="skp-head">
+      <button id="ske-back" class="git-badge head-ico" title="Back">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+      </button>
+      <div class="skp-title-wrap">
+        <div class="skp-title" id="ske-title">/skill</div>
+        <div class="skp-path" id="ske-path"></div>
+      </div>
+      <span id="ske-status" class="set-status"></span>
+      <button id="ske-save" class="btn btn-launch">💾 SAVE</button>
+    </header>
+
+    <div class="skp-body">
+      <section class="skp-editor">
+        <div class="skp-sec-label">SKILL.MD <span class="hint">— edit by hand, or ask the agent →</span></div>
+        <textarea id="ske-content" spellcheck="false"></textarea>
+      </section>
+
+      <section class="skp-chat">
+        <div id="ske-msgs" class="skp-msgs">
+          <div class="skp-empty" id="ske-empty">
+            <div class="skp-empty-mark"></div>
+            <div>Ask the agent to improve this skill — tighten steps, add checks, restructure...</div>
+          </div>
+        </div>
+        <div class="skp-composer">
+          <select id="ske-model" title="Model">
+            <option value="claude-sonnet-5">Sonnet 5</option>
+            <option value="claude-opus-4-8">Opus 4.8</option>
+            <option value="claude-fable-5">Fable 5</option>
+            <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+          </select>
+          <textarea id="ske-chat" rows="1" placeholder="Message the skill agent... (Enter to send)"></textarea>
+          <button id="ske-send" class="skp-sendbtn" title="Send">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          </button>
+          <button id="ske-stop" class="skp-sendbtn stop hidden" title="Stop">■</button>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ===== Themed alert / confirm (replaces the native dialog) ===== -->
+  <div id="alert-modal" class="modal hidden">
+    <div class="modal-card alert-card">
+      <div class="alert-row">
+        <div class="alert-mark" id="alert-ico"></div>
+        <div class="alert-body">
+          <div class="alert-title" id="alert-title">NOTICE</div>
+          <div class="alert-msg" id="alert-msg"></div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="alert-cancel" class="btn">CANCEL</button>
+        <button id="alert-ok" class="btn btn-launch">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Plan review modal (prompt engineer output gate) ===== -->
+  <div id="plan-modal" class="modal hidden">
+    <div class="modal-card plan-card">
+      <div id="plan-review">
+        <div class="pr-head">
+          <div class="pr-title">🧠 PLAN REVIEW — PROMPT ENGINEER OUTPUT</div>
+          <div class="pr-actions">
+            <button id="pr-close" class="btn" title="Close — the plan stays pending in the console">✕ CLOSE</button>
+            <button id="pr-discard" class="btn btn-danger">✕ DISCARD</button>
+            <button id="pr-approve" class="btn btn-launch">✔ PASS TO ENGINEERS</button>
+          </div>
+        </div>
+        <div id="pr-summary" class="pr-summary"></div>
+        <div id="pr-tabs"></div>
+        <pre id="pr-content"></pre>
+        <div class="pr-revise">
+          <textarea id="pr-revision" placeholder="Ask a follow-up or request revisions to the plan... only the affected parts will be rewritten. (Ctrl+Enter)"></textarea>
+          <button id="pr-revise-btn" class="btn">⟲ REVISE PLAN</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Follow-up chat modal ===== -->
+  <div id="chat-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-title" id="cm-title">FOLLOW-UP</div>
+      <div class="cm-status" id="cm-status"></div>
+      <label>MESSAGE <span class="hint">(continues the shared LoveAi session — context intact)</span></label>
+      <textarea id="cm-input" rows="6" placeholder="Ask a question, give a follow-up instruction... Drop images/files here. (Ctrl+Enter)"></textarea>
+      <div id="cm-attach" class="attach-chips"></div>
+      <div class="modal-actions">
+        <button id="cm-attach-btn" class="btn" title="Attach files or images">📎</button>
+        <button id="cm-close" class="btn">CLOSE</button>
+        <button id="cm-send" class="btn btn-launch">SEND ⟢</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Account modal ===== -->
+  <div id="acct-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-title">ACCOUNT &amp; USAGE</div>
+
+      <div class="acct-grid" id="acct-grid">
+        <div class="acct-cell"><label>STATUS</label><div id="ac-status">—</div></div>
+        <div class="acct-cell"><label>EMAIL</label><div id="ac-email">—</div></div>
+        <div class="acct-cell"><label>PLAN</label><div id="ac-plan">—</div></div>
+        <div class="acct-cell"><label>AUTH METHOD</label><div id="ac-method">—</div></div>
+        <div class="acct-cell wide"><label>ORGANIZATION</label><div id="ac-org">—</div></div>
+      </div>
+
+      <label style="margin-top:18px">PLAN USAGE LIMITS <span class="hint" id="pu-updated"></span></label>
+      <div id="plan-usage" class="plan-usage"><div class="pu-loading">loading...</div></div>
+
+      <label style="margin-top:18px">LOVEAI USAGE — TODAY <span class="hint">(this app's sessions; plan limits reset on rolling 5-hour + weekly windows)</span></label>
+      <div class="acct-grid">
+        <div class="acct-cell"><label>RUNS</label><div id="u-runs">0</div></div>
+        <div class="acct-cell"><label>TOKENS IN</label><div id="u-in">0</div></div>
+        <div class="acct-cell"><label>TOKENS OUT</label><div id="u-out">0</div></div>
+        <div class="acct-cell"><label>API-EQUIV COST</label><div id="u-cost">$0.00</div></div>
+      </div>
+      <div class="acct-note">On your subscription these tokens draw from plan limits — the $ figure is what it would cost on API billing, not a charge.</div>
+
+      <div class="modal-actions" style="justify-content:space-between">
+        <button id="ac-reset" class="btn">RESET STATS</button>
+        <div style="display:flex;gap:10px">
+          <button id="ac-refresh" class="btn">↻ REFRESH</button>
+          <button id="ac-logout" class="btn btn-danger">LOGOUT</button>
+          <button id="ac-login" class="btn btn-launch hidden">LOGIN</button>
+          <button id="ac-close" class="btn">CLOSE</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
+  <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="../node_modules/@xterm/addon-web-links/lib/addon-web-links.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
