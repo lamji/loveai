@@ -74,7 +74,10 @@ async function gitRefresh() {
   renderGitModal(sel.st);
   buildExStatus(valid);
   decorateExplorer();
+  statusGit = sel.st;                       // expose for the status bar
+  if (window.renderStatusBar) renderStatusBar();
 }
+let statusGit = null;
 
 function gitFileRow(f, statusChar, staged) {
   const parts = f.replace(/"/g, '').split('/');
@@ -394,9 +397,7 @@ document.getElementById('git-refresh').onclick = gitRefresh;
 document.getElementById('git-bash').onclick = () => {
   gitPanel.classList.add('hidden');
   const repo = gitRepo || projectDir || '';
-  termView.classList.remove('hidden');
-  consoleFeed.classList.add('hidden');
-  viewer.classList.add('hidden');
+  openTerminal();                       // opens the bottom panel on the terminal
   const existing = termTabs.find(t => !t.dead && t.cwd === repo);
   if (existing) activateTerm(existing.id);
   else newTerm('bash', repo);

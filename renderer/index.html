@@ -57,6 +57,9 @@
     <div class="brand">
       <div class="brand-mark"></div>
       <div class="brand-text">LOVE<b>AI</b><span>MISSION CONTROL</span></div>
+      <div style="flex:1"></div>
+      <button id="side-collapse" class="side-collapse-btn"
+              title="Collapse sidebar (Ctrl+B)">⇤</button>
     </div>
 
     <!-- Sidebar tabs -->
@@ -145,12 +148,31 @@
       <div class="console-title">◈ CENTRAL CONSOLE</div>
       <div id="console-chips" class="console-chips hidden"></div>
       <div class="head-spacer"></div>
-      <div class="account-bar" id="account-bar" title="Account & usage">
-        <div class="acct-dot" id="acct-dot"></div>
+      <div class="account-bar" id="account-bar" title="Your LoveAi account">
+        <div class="acct-avatar" id="acct-avatar"><span id="acct-initial">·</span></div>
         <div class="acct-info">
-          <div class="acct-email" id="acct-email">checking account...</div>
-          <div class="acct-plan" id="acct-plan">—</div>
+          <div class="acct-name" id="acct-name">…</div>
+          <div class="acct-plan" id="acct-plan">LoveAi</div>
         </div>
+        <svg class="acct-caret" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </div>
+
+      <!-- LoveAi profile dropdown -->
+      <div id="profile-menu" class="profile-menu hidden">
+        <div class="pm-head">
+          <div class="acct-avatar lg" id="pm-avatar"><span id="pm-initial">·</span></div>
+          <div class="pm-id">
+            <div class="pm-name" id="pm-name">—</div>
+            <div class="pm-email" id="pm-email">—</div>
+          </div>
+        </div>
+        <div class="pm-row"><span>Plan</span><b id="pm-plan">free</b></div>
+        <button class="pm-upgrade" id="pm-upgrade">✦ Upgrade plan</button>
+        <div class="pm-sep"></div>
+        <div class="cm-usage-head">CLAUDE USAGE <span id="pm-usage-upd"></span></div>
+        <div class="cm-usage" id="pm-usage"><div class="pu-loading">loading…</div></div>
+        <div class="pm-sep"></div>
+        <button class="pm-item danger" id="pm-signout">⏻ Sign out of LoveAi</button>
       </div>
       <button id="btn-theme" class="git-badge head-ico" title="Toggle light / dark">
         <svg id="theme-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
@@ -252,11 +274,15 @@
     <!-- Live activity strip — what the agents are doing right now -->
     <div id="activity" class="activity hidden"></div>
 
+    <!-- ===== Workbench: editor area (top) + dockable panel (bottom) ===== -->
+    <div id="workbench">
+    <div id="editor-area">
+
     <!-- Code editor (explorer) — highlighted layer with a transparent textarea on top -->
     <div id="viewer" class="hidden">
       <div class="vw-bar">
         <div class="vw-tabs" id="vw-tabs"></div>
-        <button id="vw-close" class="icon-btn" title="Back to console">✕</button>
+        <button id="vw-split" class="icon-btn" title="Split — console beside editor">⫿</button>
       </div>
       <div id="vw-body" class="vw-body">
         <div id="vw-gutter" class="vw-gutter"></div>
@@ -302,16 +328,65 @@
       </div>
     </div>
 
-    <!-- Tabbed interactive terminal (takes over the console area) -->
-    <div id="term-view" class="hidden">
-      <div class="tv-bar">
-        <div id="tv-tabs" class="tv-tabs"></div>
-        <button id="tv-new-bash" class="mini-btn" title="New Git Bash tab">＋ BASH</button>
-        <button id="tv-new-ps" class="mini-btn" title="New PowerShell tab">＋ PS</button>
-        <button id="tv-close" class="icon-btn" title="Back to console">✕</button>
+    </div><!-- /#editor-area -->
+
+    <!-- draggable divider between editor area and the bottom panel -->
+    <div id="panel-splitter" class="hidden"></div>
+
+    <!-- ===== Dockable bottom panel (Terminal / Problems) ===== -->
+    <div id="panel" class="hidden">
+      <div class="panel-bar">
+        <div class="panel-tabs">
+          <button class="panel-tab active" data-panel="terminal">⌨ TERMINAL</button>
+          <button class="panel-tab" data-panel="problems">⊘ PROBLEMS <span id="panel-prob-n" class="panel-badge hidden">0</span></button>
+        </div>
+        <div class="panel-bar-actions">
+          <span id="panel-term-actions">
+            <button id="tv-new-bash" class="mini-btn" title="New Git Bash tab">＋ BASH</button>
+            <button id="tv-new-ps" class="mini-btn" title="New PowerShell tab">＋ PS</button>
+          </span>
+          <button id="panel-min" class="icon-btn" title="Minimize panel">▁</button>
+          <button id="panel-fullscreen" class="icon-btn" title="Full screen (terminal only)">⛶</button>
+          <button id="panel-close" class="icon-btn" title="Close panel (Ctrl+`)">✕</button>
+        </div>
       </div>
-      <div id="tv-body" class="tv-body"></div>
+
+      <!-- Tabbed interactive terminal (instances listed on the right, VS Code style) -->
+      <div id="term-view" class="panel-page">
+        <div id="tv-body" class="tv-body"></div>
+        <div id="tv-tabs" class="tv-tabs"></div>
+      </div>
+
+      <!-- Problems list (populated in Phase 4) -->
+      <div id="problems-view" class="panel-page hidden">
+        <div id="problems-list" class="problems-list">
+          <div class="problems-empty">No problems detected.</div>
+        </div>
+      </div>
     </div>
+
+    </div><!-- /#workbench -->
+
+    <!-- ===== Status bar (VS Code style) ===== -->
+    <footer id="statusbar" class="statusbar">
+      <div class="sb-left">
+        <button class="sb-item" id="sb-branch" title="Source control"><span class="sb-ico">⎇</span><span id="sb-branch-name">—</span><span id="sb-sync"></span></button>
+        <button class="sb-item" id="sb-project" title="Recent projects"><span id="sb-project-name"></span></button>
+        <button class="sb-item hidden" id="sb-problems" title="Problems"><span class="sb-ico">⊘</span><span id="sb-problems-n">0</span></button>
+      </div>
+      <div class="sb-right">
+        <span class="sb-work hidden" id="sb-work" title="Work in progress">
+          <span class="sb-spin"></span>
+          <span class="sb-work-txt" id="sb-work-txt"></span>
+          <button class="sb-work-stop" id="sb-work-stop" title="Stop / abort">■ STOP</button>
+        </span>
+        <button class="sb-item hidden" id="sb-agent" title="Active agent"></button>
+        <button class="sb-item" id="sb-claude" title="Claude account"><span class="sb-dot" id="sb-claude-dot"></span><span id="sb-claude-txt">Claude</span></button>
+        <button class="sb-item hidden" id="sb-lang" title="Language"></button>
+        <button class="sb-item hidden" id="sb-indent" title="Indentation"></button>
+        <button class="sb-item hidden" id="sb-lncol" title="Go to line (Ctrl+G)">Ln 1, Col 1</button>
+      </div>
+    </footer>
   </main>
 
   <!-- ===== Session history drawer ===== -->
@@ -804,6 +879,10 @@
   <script src="src/settings.js"></script>
   <script src="src/explorer.js"></script>
   <script src="src/editor.js"></script>
+  <script src="src/layout.js"></script>
+  <script src="src/statusbar.js"></script>
+  <script src="src/palette.js"></script>
+  <script src="src/profile.js"></script>
   <script src="src/onboarding.js"></script>
 </body>
 </html>

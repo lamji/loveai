@@ -618,7 +618,46 @@ ipcMain.handle('symbol-watch', async (_e, cwd) => {
   } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
 });
 
-app.on('before-quit', () => { for (const k of Object.keys(symbolWatchers)) { try { symbolWatchers[k].watcher.close(); } catch {} } });
+app.on('before-quit', () => {
+  for (const k of Object.keys(symbolWatchers)) { try { symbolWatchers[k].watcher.close(); } catch {} }
+});
+
+// ===== Open-file watcher — notify the renderer when a file it has OPEN in the
+// editor changes on disk (e.g. an agent edits it). Distinct from the symbol
+// watcher: no indexable-only filter, keyed to the exact set of open paths. =====
+const openWatch = { watcher: null, root: null, files: new Set(), timer: null, pending: new Set() };
+
+function stopOpenWatch() {
+  if (openWatch.watcher) { try { openWatch.watcher.close(); } catch {} }
+  openWatch.watcher = null; openWatch.root = null;
+  clearTimeout(openWatch.timer); openWatch.pending.clear();
+}
+
+ipcMain.handle('watch-files', (_e, { root, files }) => {
+  openWatch.files = new Set((files || []).map(f => path.resolve(f)));
+  if (!root || !openWatch.files.size) { stopOpenWatch(); return { ok: true, watching: 0 }; }
+  // (re)create the recursive watcher only when the root changes
+  if (openWatch.root !== root) {
+    stopOpenWatch();
+    openWatch.root = root;
+    try {
+      openWatch.watcher = fs.watch(root, { recursive: true }, (_evt, filename) => {
+        if (!filename) return;
+        const abs = path.resolve(root, filename);
+        if (!openWatch.files.has(abs)) return;      // only files the editor has open
+        openWatch.pending.add(abs);
+        clearTimeout(openWatch.timer);
+        openWatch.timer = setTimeout(() => {
+          const hits = [...openWatch.pending]; openWatch.pending.clear();
+          for (const p of hits) send('file-disk-change', { path: p });
+        }, 300);
+      });
+    } catch (e) {
+      return { ok: false, error: 'watch unsupported: ' + String(e && e.message || e) };
+    }
+  }
+  return { ok: true, watching: openWatch.files.size };
+});
 
 // return the top-ranked files for an issue (builds the index lazily if missing).
 // withContent = N → also read and attach the content of the top N files, so the
@@ -638,6 +677,31 @@ ipcMain.handle('retrieve-context', async (_e, { cwd, query, k, withContent }) =>
     }
     return { ok: true, files, repoMap: repoMapFromIndex(idx) };
   } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e), files: [] }; }
+});
+
+// flat list of all project files (for Ctrl+P quick-open). Skips heavy dirs,
+// capped so huge repos stay responsive. Returns relative POSIX paths.
+ipcMain.handle('list-files', async (_e, root) => {
+  const out = [];
+  const CAP = 20000;
+  async function walk(dir) {
+    if (out.length >= CAP) return;
+    let entries;
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (out.length >= CAP) return;
+      if (e.name.startsWith('.') && e.name !== '.github') continue;
+      const abs = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (INDEX_SKIP_DIRS.has(e.name)) continue;
+        await walk(abs);
+      } else if (e.isFile()) {
+        out.push(path.relative(root, abs).replace(/\\/g, '/'));
+      }
+    }
+  }
+  try { await walk(root); return { ok: true, files: out }; }
+  catch (e) { return { ok: false, error: String(e && e.message || e), files: [] }; }
 });
 
 // ===== File explorer (read-only — browse and copy project code) =====
@@ -732,6 +796,85 @@ ipcMain.handle('fs-write', (_e, { root, file, content }) => {
   } catch (e) {
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }
+});
+
+// ===== Project knowledge memory — per-topic, retrievable, staleness-tracked =====
+// Each topic lives in .loveai/memory/topics/<slug>.md and starts with a tiny
+// header: "# <title>", "keywords: ...", "files: <exact paths this topic covers>".
+// index.json stores a fingerprint (size:mtime) per covered file so we can tell a
+// topic is STALE when its code changed — the PE then refreshes only those files.
+function memParseTopic(md) {
+  const idx = md.indexOf('\n\n');
+  const head = idx >= 0 ? md.slice(0, idx) : md;
+  const body = idx >= 0 ? md.slice(idx + 2).trim() : '';
+  let title = '', keywords = '', files = [];
+  for (const l of head.split(/\r?\n/)) {
+    if (/^#\s+/.test(l) && !title) title = l.replace(/^#\s+/, '').trim();
+    const mk = /^keywords:\s*(.*)$/i.exec(l); if (mk) keywords = mk[1].trim();
+    const mf = /^files:\s*(.*)$/i.exec(l);
+    if (mf) files = mf[1].split(',').map(s => s.trim()).filter(Boolean);
+  }
+  return { title, keywords, files, body };
+}
+function memFileSig(cwd, rel) {
+  try { const st = fs.statSync(path.join(cwd, rel)); return st.size + ':' + Math.round(st.mtimeMs); }
+  catch { return 'missing'; }
+}
+function memReadIndex(cwd) {
+  try { return JSON.parse(fs.readFileSync(path.join(cwd, '.loveai', 'memory', 'index.json'), 'utf8')) || {}; }
+  catch { return {}; }
+}
+
+// list topics with their body + a staleness flag (which covered files changed)
+ipcMain.handle('memory-list', (_e, { cwd }) => {
+  try {
+    if (!cwd) return { ok: false };
+    const dir = path.join(cwd, '.loveai', 'memory', 'topics');
+    if (!fs.existsSync(dir)) return { ok: true, topics: [] };
+    const idx = memReadIndex(cwd);
+    const topics = [];
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.md')) continue;
+      const slug = f.replace(/\.md$/, '');
+      const t = memParseTopic(fs.readFileSync(path.join(dir, f), 'utf8'));
+      const stored = (idx[slug] && idx[slug].files) || {};
+      const changed = t.files.filter(rel => memFileSig(cwd, rel) !== stored[rel]);
+      topics.push({
+        slug, title: t.title || slug, keywords: t.keywords, files: t.files,
+        body: t.body, updated: (idx[slug] && idx[slug].updated) || null,
+        stale: changed.length > 0, changed
+      });
+    }
+    return { ok: true, topics };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+
+// after the PE writes/updates topics, capture fingerprints of their covered
+// files so future runs can detect staleness. Cheap; runs off the main path.
+ipcMain.handle('memory-reindex', (_e, { cwd }) => {
+  try {
+    if (!cwd) return { ok: false };
+    const dir = path.join(cwd, '.loveai', 'memory', 'topics');
+    if (!fs.existsSync(dir)) return { ok: true, count: 0 };
+    const prev = memReadIndex(cwd);
+    const now = new Date().toISOString();
+    const idx = {};
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.md')) continue;
+      const slug = f.replace(/\.md$/, '');
+      const t = memParseTopic(fs.readFileSync(path.join(dir, f), 'utf8'));
+      const files = {}; let changed = false;
+      for (const rel of t.files) {
+        const sig = memFileSig(cwd, rel);
+        files[rel] = sig;
+        if (!prev[slug] || !prev[slug].files || prev[slug].files[rel] !== sig) changed = true;
+      }
+      idx[slug] = { files, updated: (changed || !prev[slug]) ? now : prev[slug].updated };
+    }
+    fs.writeFileSync(path.join(cwd, '.loveai', 'memory', 'index.json'),
+      JSON.stringify(idx, null, 2), 'utf8');
+    return { ok: true, count: Object.keys(idx).length };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
 });
 
 // create a new file or folder (VS Code-style). `rel` may include subfolders,

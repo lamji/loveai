@@ -8,7 +8,10 @@ const termTabs = [];        // { id, shell, title, xterm, fit, pane, dead }
 let termActive = null;      // id
 let termSeq = 0;
 
-function termOpen() { return !termView.classList.contains('hidden'); }
+function termOpen() {
+  return typeof panelOpen === 'function' && panelOpen()
+    && !termView.classList.contains('hidden');   // terminal page active in the panel
+}
 function tabOf(id) { return termTabs.find(t => t.id === id); }
 
 // one dispatcher for every tab's PTY output
@@ -20,6 +23,7 @@ window.deck.onTermData(p => {
 });
 
 function renderTermTabs() {
+  tvTabs.style.display = termTabs.length ? '' : 'none';   // hide the list when empty
   tvTabs.innerHTML = '';
   for (const t of termTabs) {
     const el = document.createElement('div');
@@ -101,7 +105,7 @@ Do not explore the project unless strictly necessary. Max 10 lines total.
 
 === TERMINAL OUTPUT ===
 ${text.slice(0, 6000)}`;
-  closeTerminalView();   // bring the console forward so the answer is visible
+  showSurface('console');   // bring the console forward so the answer is visible
   plog('info', `✨ analyzing highlighted terminal output on ${agent.name}…`);
   runAgent(agent.id, prompt, false, false, { fresh: true, model: 'claude-sonnet-5' });
 };
@@ -199,6 +203,10 @@ async function newTerm(shell, cwd) {
     t.title = '✕ ' + t.title;
     t.dead = true;
     xt.writeln('\x1b[31m' + (r.error || 'failed to start shell') + '\x1b[0m');
+  } else {
+    // start clean at the top — clears git-bash's login banner / prompt spacing.
+    // leading space keeps it out of shell history (HISTCONTROL=ignorespace).
+    setTimeout(() => { try { window.deck.termInput(id, ' clear\r'); } catch {} }, 350);
   }
   renderTermTabs();
 }
@@ -218,10 +226,10 @@ function closeTerm(id) {
   renderTermTabs();
 }
 
+// terminal now lives in the dockable bottom panel — it COEXISTS with the editor
+// / console above it (no longer swaps the center surface). See src/layout.js.
 function openTerminal() {
-  termView.classList.remove('hidden');
-  consoleFeed.classList.add('hidden');
-  viewer.classList.add('hidden');
+  panelShow('terminal');
   if (!termTabs.length) newTerm('bash');
   else activateTerm(termActive || termTabs[0].id);
   setTermIconActive(true);
@@ -229,40 +237,39 @@ function openTerminal() {
 }
 
 function closeTerminalView() {
-  // tabs keep their PTYs alive in the background — this only swaps the pane
-  termView.classList.add('hidden');
-  consoleFeed.classList.remove('hidden');
+  // tabs keep their PTYs alive in the background — this only hides the panel
+  panelHide();
   setTermIconActive(false);
-  syncPane();
   renderConsoleChips();
+}
+
+// fit the visible terminal to the panel (called on resize / panel show)
+function fitActiveTerm() {
+  const t = tabOf(termActive);
+  if (t) { try { t.fit.fit(); t.xterm.scrollToBottom(); } catch {} }
 }
 
 // #2 — reflect terminal-open in the top-right icon
 function setTermIconActive(on) { document.getElementById('btn-term').classList.toggle('ico-active', on); }
 
 // ===== Surface chips beside CENTRAL CONSOLE =====
-// The main area shows ONE surface at a time (no split). When more than one is
-// active — Console + Terminal + Explorer — chips let you switch and close each.
+// The editor AREA shows Console or Editor (they swap); the terminal is a
+// separate bottom panel now, so it's no longer a chip here.
 const SURFACE_META = {
   console: { icon: '◈', label: 'Console', closable: false },
-  editor: { icon: '📄', label: 'Explorer', closable: true },
-  terminal: { icon: '⌨', label: 'Terminal', closable: true }
+  editor: { icon: '📄', label: 'Explorer', closable: true }
 };
 function activeSurfaces() {
   const arr = ['console'];
   if (openFiles.length) arr.push('editor');
-  if (termTabs.length) arr.push('terminal');
   return arr;
 }
 function currentSurface() {
-  if (termOpen()) return 'terminal';
   if (!viewer.classList.contains('hidden')) return 'editor';
   return 'console';
 }
 function showSurface(name) {
   if (name === 'terminal') { openTerminal(); return; }
-  termView.classList.add('hidden');
-  setTermIconActive(false);
   if (name === 'editor' && openFiles.length) {
     paneOverride = 'editor';
     viewer.classList.remove('hidden');
@@ -275,10 +282,7 @@ function showSurface(name) {
   renderConsoleChips();
 }
 async function closeSurface(name) {
-  if (name === 'terminal') {
-    for (const t of [...termTabs]) closeTerm(t.id);
-    closeTerminalView();
-  } else if (name === 'editor') {
+  if (name === 'editor') {
     for (const f of [...openFiles]) await closeFile(f.path);
     showSurface('console');
   }
@@ -305,7 +309,6 @@ function renderConsoleChips() {
 }
 
 document.getElementById('btn-term').onclick = () => (termOpen() ? closeTerminalView() : openTerminal());
-document.getElementById('tv-close').onclick = closeTerminalView;
 document.getElementById('tv-new-bash').onclick = () => newTerm('bash');
 document.getElementById('tv-new-ps').onclick = () => newTerm('powershell');
 document.getElementById('git-stage-all').onclick = () => gitDo('stage', '*');

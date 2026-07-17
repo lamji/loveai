@@ -59,14 +59,15 @@ async function openFile(path) {
       value: r.content,            // what's in the buffer
       html: shikiInner(r.html),
       indent: detectIndent(r.content),
-      dirty: false
+      dirty: false,
+      diskChanged: false
     });
+    syncWatchedFiles();
   }
   activeFile = path;
   paneOverride = 'editor';
   viewer.classList.remove('hidden');
-  setTermIconActive(false);
-  termView.classList.add('hidden');
+  consoleFeed.classList.add('hidden');   // editor takes the editor-area (panel unaffected)
   renderViewer();
   renderConsoleChips();
   vwInput.focus();
@@ -87,9 +88,62 @@ async function closeFile(path) {
   }
   const i = openFiles.indexOf(f);
   openFiles.splice(i, 1);
+  syncWatchedFiles();
   if (activeFile === path) activeFile = openFiles.length ? openFiles[Math.max(0, i - 1)].path : null;
   if (!activeFile) { paneOverride = null; viewer.classList.add('hidden'); renderTabs(); markOpenRows(); return; }
   renderViewer();
+}
+
+// ===== Watch open files on disk — reload / warn when they change externally
+// (an agent editing the file, a git checkout, an external editor). =====
+function syncWatchedFiles() {
+  window.deck.watchFiles(projectDir, openFiles.map(f => f.path)).catch(() => {});
+}
+
+async function reloadFromDisk(f) {
+  const r = await window.deck.fsRead(projectDir, f.path, shikiTheme());
+  if (!r.ok) { feedRaw('EDITOR', 'err', `reload failed — ${baseName(f.path)}: ${r.error}`, '🔄'); return; }
+  f.content = r.content;
+  f.value = r.content;
+  f.html = shikiInner(r.html);
+  f.dirty = false;
+  f.diskChanged = false;
+  if (activeFile === f.path) { vwInput.value = f.value; renderViewer(); }
+  renderTabs();
+  updateDiskBanner();
+}
+
+window.deck.onFileDiskChange(({ path }) => {
+  const f = openFiles.find(x => x.path === path);
+  if (!f) return;
+  if (!f.dirty) { reloadFromDisk(f); return; }   // clean buffer → silent refresh
+  // dirty buffer → don't clobber the user's edits; flag + surface a banner
+  f.diskChanged = true;
+  renderTabs();
+  if (activeFile === f.path) updateDiskBanner();
+});
+
+// non-destructive banner over the editor when the active dirty file changed on disk
+const diskBanner = document.createElement('div');
+diskBanner.id = 'vw-diskbanner';
+diskBanner.className = 'hidden';
+diskBanner.innerHTML = `
+  <span>⚠ This file changed on disk while you had unsaved edits.</span>
+  <button id="vwd-reload" class="vwd-btn">Reload from disk</button>
+  <button id="vwd-keep" class="vwd-btn ghost">Keep my edits</button>`;
+
+function mountDiskBanner() {
+  if (diskBanner.parentNode) return;
+  viewer.insertBefore(diskBanner, document.getElementById('vw-body'));
+  document.getElementById('vwd-reload').onclick = () => { const f = activeF(); if (f) reloadFromDisk(f); };
+  document.getElementById('vwd-keep').onclick = () => {
+    const f = activeF(); if (f) { f.diskChanged = false; renderTabs(); updateDiskBanner(); }
+  };
+}
+function updateDiskBanner() {
+  mountDiskBanner();
+  const f = activeF();
+  diskBanner.classList.toggle('hidden', !(f && f.diskChanged));
 }
 
 function renderTabs() {
@@ -97,8 +151,10 @@ function renderTabs() {
   tabs.innerHTML = '';
   for (const f of openFiles) {
     const t = document.createElement('div');
-    t.className = 'vw-tab' + (f.path === activeFile ? ' active' : '') + (f.dirty ? ' dirty' : '');
-    t.title = f.path + (f.dirty ? ' — unsaved (Ctrl+S)' : '');
+    t.className = 'vw-tab' + (f.path === activeFile ? ' active' : '')
+      + (f.dirty ? ' dirty' : '') + (f.diskChanged ? ' disk-changed' : '');
+    t.title = f.path + (f.dirty ? ' — unsaved (Ctrl+S)' : '')
+      + (f.diskChanged ? ' — changed on disk' : '');
     t.innerHTML = '<span></span><b></b>';
     t.querySelector('span').textContent = baseName(f.path);
     // unsaved files show a dot instead of the ✕, like VS Code
@@ -143,6 +199,7 @@ function renderViewer() {
   renderGutter(f.value);
   document.getElementById('vw-body').scrollTop = 0;
   markOpenRows();
+  updateDiskBanner();
 }
 
 // re-colouring costs an IPC round-trip, so it waits for a pause in typing;
@@ -179,6 +236,21 @@ vwInput.addEventListener('scroll', () => { vwInput.scrollTop = 0; vwInput.scroll
 
 async function saveFile(f) {
   if (!f || !f.dirty) return;
+  // the file changed underneath us and the user chose to keep editing — confirm
+  // before the save overwrites whatever landed on disk (e.g. an agent's edit)
+  if (f.diskChanged) {
+    const overwrite = await showAlert({
+      title: 'FILE CHANGED ON DISK',
+      message: `${baseName(f.path)} was modified on disk after you started editing. `
+        + `Saving now overwrites those changes with your version.`,
+      okText: 'OVERWRITE',
+      cancelText: 'CANCEL',
+      kind: 'danger'
+    });
+    if (!overwrite) return;
+    f.diskChanged = false;
+    updateDiskBanner();
+  }
   const r = await window.deck.fsWrite(projectDir, f.path, f.value);
   if (!r.ok) { feedRaw('EDITOR', 'err', `save failed — ${baseName(f.path)}: ${r.error}`, '💾'); return; }
   f.content = f.value;
@@ -228,11 +300,136 @@ document.addEventListener('keydown', e => {
   }
 });
 
-document.getElementById('vw-close').onclick = () => {
+// (the editor's own ✕ was removed — closing is done via the Console/Explorer
+// chips at the top and each tab's ✕)
+const _vwClose = document.getElementById('vw-close');
+if (_vwClose) _vwClose.onclick = () => {
   paneOverride = 'console';
   viewer.classList.add('hidden');
   markOpenRows();
 };
+
+// ============================================================
+// EDITOR FONT ZOOM — Ctrl+= / Ctrl+- to grow/shrink, Ctrl+0 to reset.
+// Persists across sessions. Line-height tracks the font size (~1.36x).
+// ============================================================
+const EDITOR_ZOOM_KEY = 'editorFontSize';
+const EDITOR_FONT_MIN = 8;
+const EDITOR_FONT_MAX = 40;
+const EDITOR_FONT_DEFAULT = 14;
+
+function applyEditorFont(px) {
+  const size = Math.max(EDITOR_FONT_MIN, Math.min(EDITOR_FONT_MAX, px));
+  const line = Math.round(size * 1.36);
+  document.documentElement.style.setProperty('--editor-font-size', size + 'px');
+  document.documentElement.style.setProperty('--editor-line-height', line + 'px');
+  localStorage.setItem(EDITOR_ZOOM_KEY, String(size));
+  return size;
+}
+
+function currentEditorFont() {
+  return parseInt(localStorage.getItem(EDITOR_ZOOM_KEY), 10) || EDITOR_FONT_DEFAULT;
+}
+
+// restore the saved size on load
+applyEditorFont(currentEditorFont());
+
+function zoomEditor(delta) {
+  const size = applyEditorFont(currentEditorFont() + delta);
+  if (window.toast) toast(`Editor font: ${size}px`, true);
+}
+
+// Ctrl/Cmd + = / - / 0 — only while the editor pane is visible
+document.addEventListener('keydown', e => {
+  if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+  if (viewer.classList.contains('hidden')) return;
+  if (e.key === '=' || e.key === '+') { e.preventDefault(); zoomEditor(1); }
+  else if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomEditor(-1); }
+  else if (e.key === '0') { e.preventDefault(); applyEditorFont(EDITOR_FONT_DEFAULT); }
+});
+
+// Ctrl + mouse wheel over the editor also zooms, like VS Code
+document.getElementById('vw-body').addEventListener('wheel', e => {
+  if (!(e.ctrlKey || e.metaKey)) return;
+  e.preventDefault();
+  zoomEditor(e.deltaY < 0 ? 1 : -1);
+}, { passive: false });
+
+// ============================================================
+// SEND SELECTION TO AI — highlight code in the editor and a floating
+// button appears; clicking attaches the selection to the main chatbox
+// as a context chip (never dumped into the textarea, so the UI holds).
+// ============================================================
+const sendAiBtn = document.createElement('button');
+sendAiBtn.id = 'code-send-ai';
+sendAiBtn.className = 'code-send-btn hidden';
+sendAiBtn.innerHTML = '✦ Send to AI';
+document.body.appendChild(sendAiBtn);
+
+function hideSendAi() { sendAiBtn.classList.add('hidden'); }
+
+function selectionLineRange(f, start, end) {
+  const before = f.value.slice(0, start);
+  const startLine = before.split('\n').length;
+  const endLine = startLine + f.value.slice(start, end).split('\n').length - 1;
+  return { startLine, endLine };
+}
+
+// show the button just above the mouse-up point, clamped to the viewport
+function showSendAiAt(x, y) {
+  sendAiBtn.classList.remove('hidden');
+  const w = sendAiBtn.offsetWidth || 110;
+  const left = Math.max(8, Math.min(x, window.innerWidth - w - 8));
+  const top = Math.max(8, y - 40);
+  sendAiBtn.style.left = left + 'px';
+  sendAiBtn.style.top = top + 'px';
+}
+
+function maybeShowSendAi(e) {
+  const f = activeF();
+  if (!f) { hideSendAi(); return; }
+  const sel = vwInput.value.slice(vwInput.selectionStart, vwInput.selectionEnd);
+  if (!sel.trim()) { hideSendAi(); return; }
+  showSendAiAt(e.clientX, e.clientY);
+}
+
+vwInput.addEventListener('mouseup', e => setTimeout(() => maybeShowSendAi(e), 0));
+// selecting with the keyboard (Shift+arrows) hides it — it needs a pointer anchor
+vwInput.addEventListener('keyup', () => {
+  const sel = vwInput.value.slice(vwInput.selectionStart, vwInput.selectionEnd);
+  if (!sel.trim()) hideSendAi();
+});
+vwInput.addEventListener('scroll', hideSendAi);
+document.addEventListener('mousedown', e => {
+  if (e.target !== sendAiBtn) hideSendAi();
+});
+
+sendAiBtn.addEventListener('mousedown', e => e.preventDefault());  // keep selection
+sendAiBtn.addEventListener('click', () => {
+  const f = activeF();
+  if (!f) return;
+  const start = vwInput.selectionStart, end = vwInput.selectionEnd;
+  const code = f.value.slice(start, end);
+  if (!code.trim()) { hideSendAi(); return; }
+  const { startLine, endLine } = selectionLineRange(f, start, end);
+  if (window.addSnippetAttachment) {
+    window.addSnippetAttachment({
+      file: relPath(f.path), lang: f.lang, code, start: startLine, end: endLine
+    });
+  }
+  hideSendAi();
+  // surface the chip: make sure the AGENT tab (with the composer) is showing
+  const agentTab = document.querySelector('.side-tab[data-tab="agent"]');
+  if (agentTab && document.getElementById('tab-agent').classList.contains('hidden')) {
+    agentTab.click();
+  }
+  if (window.toggleSidebar && document.getElementById('sidebar').classList.contains('collapsed')) {
+    window.toggleSidebar();
+  }
+  const ci = document.getElementById('chat-input');
+  if (ci) ci.focus();
+  if (window.toast) toast('Selection attached as context', true);
+});
 
 // ============================================================
 // FIND IN FILE — Ctrl+F, VS Code style. Enter = next,

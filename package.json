@@ -31,6 +31,8 @@
     "files": [
       "main.js",
       "preload.js",
+      "auth.js",
+      "config.js",
       "renderer/**/*",
       "node_modules/**/*"
     ],

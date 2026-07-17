@@ -11,13 +11,25 @@ CONTEXT DISCIPLINE (binding):
 - No speculative web searches. Don't paste back full file contents or dump large code blocks.
 - CODE STYLE: keep lines SHORT and readable — no long lines (aim <= ~100 chars). Break long statements across lines, pull complex expressions into named variables, and extract helpers instead of writing one giant line/function. Match the file's existing formatting.
 - DO THE WORK YOURSELF. Never delegate via the Task/Agent tool and never invoke the project's own subagents (its .claude/agents) — you ARE the engineer for this pipeline.
-- Keep the reply focused, but ALWAYS explain your reasoning and decisions clearly — state what you did, what you found, and WHY. The operator reads this reply; never go silent or reply with just a status word.`;
+- Keep the reply focused, but ALWAYS explain your reasoning and decisions clearly — state what you did, what you found, and WHY. The operator reads this reply; never go silent or reply with just a status word.
+- TOPIC MEMORY (shared brain at .loveai/memory/topics/<topic>.md, one file per feature): relevant topic(s) are inlined in your prompt. Trust fresh memory; for a [STALE] topic re-read ONLY its listed changed files. AFTER your work, if you touched or learned a feature's flow, create/update its topic file — Line1 "# <topic>", Line2 "keywords: ...", Line3 "files: <exact project-relative paths the feature depends on>", blank line, then a dot-by-dot flow (entry points, paths, key functions, steps, gotchas). Keep it ONE feature, <= ~150 lines, deduped; update the files: list when you change what the feature spans. This is how the whole team avoids re-exploring next time.`;
 
 const RULES = {
   prompt: `You are the PROMPT ENGINEER of a pipeline (you -> Senior Engineer(s) -> Reviewer). Operator gives an ISSUE; you never code fixes.
 
+TOPIC MEMORY (.loveai/memory/topics/<topic>.md) — your long-term brain, split by feature (login, booking, payments, ...):
+- The topic(s) relevant to THIS issue are inlined below (with a MEMORY INDEX of all topics). TRUST fresh memory as your first source of truth — do NOT re-explore what it records; go straight to the few files it points to.
+- If a topic is marked [STALE], the listed files changed since it was written: re-read ONLY those files, then refresh that topic. Do not re-read the rest.
+- AFTER you finish: create or update the topic file for this feature. Format EXACTLY:
+  Line 1: "# <topic>"  (e.g. "# login")
+  Line 2: "keywords: <comma-separated terms an operator might use — login, sign in, auth, session, token>"
+  Line 3: "files: <comma-separated EXACT project-relative paths this feature depends on>"
+  Line 4: blank
+  Then a dot-by-dot explanation: entry points, exact paths, key functions/symbols, the step-by-step flow, data shapes, and gotchas — enough that next time you need zero exploration.
+- Keep each topic ONE feature and <= ~150 lines. Extend an existing topic instead of duplicating. The "files:" line is what powers staleness — list every file the feature truly depends on.
+
 JOB:
-1. Locate the exact files/functions/root cause (map-first, minimal reads).
+1. Locate the exact files/functions/root cause (memory-first, then map, minimal reads).
 2. Write executable task file(s) to .loveai/pipeline/task-<NN>-<slug>.md (create folder if missing). Each MUST start with exactly:
 COMPLEXITY: low | medium | high
 MODEL: claude-haiku-4-5-20251001 (low) | claude-sonnet-5 (medium) | claude-opus-4-8 (high)
@@ -144,7 +156,10 @@ const runEventSinks = {};     // runId -> per-event sink (streams a run into a m
 const modal = document.getElementById('modal');
 const consoleFeed = document.getElementById('console-feed');
 
-function save() { localStorage.setItem('agents', JSON.stringify(agents)); }
+function save() {
+  localStorage.setItem('agents',
+    JSON.stringify(agents.filter(a => !a.ephemeral)));
+}
 function uid() { return Math.random().toString(36).slice(2, 10); }
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 function R(id) { return rt[id] || (rt[id] = { running: false, sessionId: null, status: 'standing by' }); }
@@ -195,6 +210,7 @@ function renderRoster() {
   const roster = document.getElementById('roster');
   roster.innerHTML = '';
   for (const a of agents) {
+    if (a.ephemeral) continue;
     const el = document.createElement('div');
     el.className = 'roster-card' + (R(a.id).running ? ' running' : '');
     const running = R(a.id).running;
@@ -233,14 +249,169 @@ function renderTargets() {
   const current = sel.value;
   sel.innerHTML = '<option value="__pipeline__">⟢ AUTO PIPELINE</option>';
   for (const a of agents) {
+    if (a.ephemeral) continue;
     const opt = document.createElement('option');
     opt.value = a.id;
     opt.textContent = `${ROLE_ICON[a.role] || ROLE_ICON.custom} ${a.name}`;
     sel.appendChild(opt);
   }
+  // bare Claude models — run against a model directly, no agent persona
+  const grp = document.createElement('optgroup');
+  grp.label = 'MODELS';
+  for (const [id, label] of Object.entries(MODEL_LABELS)) {
+    const opt = document.createElement('option');
+    opt.value = 'model:' + id;
+    opt.textContent = `✦ ${label}`;
+    grp.appendChild(opt);
+  }
+  sel.appendChild(grp);
   if ([...sel.options].some(o => o.value === current)) sel.value = current;
+  if (window.refreshTargetMenu) window.refreshTargetMenu();
 }
 
+// an on-demand, hidden agent that just runs a chosen model (no persona/roster
+// entry). Reused across sends so it doesn't spawn duplicates.
+function ensureModelAgent(model) {
+  const id = 'eph-model-' + model;
+  let a = agents.find(x => x.id === id);
+  if (!a) {
+    a = {
+      id, name: MODEL_LABELS[model] || model, role: 'custom', model,
+      cwd: projectDir || '', perm: 'bypassPermissions', lean: true,
+      rules: '', ephemeral: true
+    };
+    agents.push(a);
+  } else {
+    a.cwd = projectDir || a.cwd;
+  }
+  return id;
+}
+
+// ============================================================
+// Themed target dropdown — overlays the native <select> (kept as the
+// value source) so the popup follows the app theme, and groups agents
+// vs. bare models. Native OS dropdowns can't be styled; this can.
+// ============================================================
+(function buildTargetDropdown() {
+  const sel = document.getElementById('chat-target');
+  if (!sel) return;
+  sel.classList.add('ctgt-native');   // visually hidden, still the source of truth
+
+  const wrap = document.createElement('div');
+  wrap.className = 'ctgt';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ctgt-btn composer-target';
+  btn.innerHTML = '<span class="ctgt-label"></span><span class="ctgt-caret">⌄</span>';
+  const menu = document.createElement('div');
+  menu.className = 'ctgt-menu hidden';
+  sel.after(wrap);
+  wrap.appendChild(btn);
+  wrap.appendChild(menu);
+
+  function labelFor(value) {
+    const o = [...sel.options].find(o => o.value === value);
+    return o ? o.textContent : '';
+  }
+  function syncLabel() { btn.querySelector('.ctgt-label').textContent = labelFor(sel.value); }
+
+  function buildMenu() {
+    menu.innerHTML = '';
+    for (const node of sel.children) {
+      if (node.tagName === 'OPTGROUP') {
+        const head = document.createElement('div');
+        head.className = 'ctgt-group';
+        head.textContent = node.label;
+        menu.appendChild(head);
+        for (const opt of node.children) addItem(opt);
+      } else {
+        addItem(node);
+      }
+    }
+  }
+  function addItem(opt) {
+    const it = document.createElement('div');
+    it.className = 'ctgt-item' + (opt.value === sel.value ? ' active' : '');
+    it.textContent = opt.textContent;
+    it.onclick = () => {
+      sel.value = opt.value;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      syncLabel();
+      close();
+    };
+    menu.appendChild(it);
+  }
+  function open() { buildMenu(); menu.classList.remove('hidden'); btn.classList.add('open'); }
+  function close() { menu.classList.add('hidden'); btn.classList.remove('open'); }
+
+  btn.onclick = () => { menu.classList.contains('hidden') ? open() : close(); };
+  document.addEventListener('mousedown', e => { if (!wrap.contains(e.target)) close(); });
+
+  // expose so renderTargets() can refresh label/menu after repopulating options
+  window.refreshTargetMenu = () => { syncLabel(); if (!menu.classList.contains('hidden')) buildMenu(); };
+  syncLabel();
+})();
+
+
+// ============================================================
+// Minimal, safe Markdown → HTML for agent responses (no external lib).
+// Everything is HTML-escaped first, then a small block/inline pass runs, so
+// the feed shows headings/lists/code cleanly instead of raw # and *.
+// ============================================================
+function mdInline(s) {
+  s = esc(s);                                            // escape <>&" first
+  s = s.replace(/`([^`]+)`/g, (_m, c) => `<code>${c}</code>`);
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
+    '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  return s;
+}
+function renderMarkdown(src) {
+  const lines = String(src || '').replace(/\r\n/g, '\n').split('\n');
+  const out = [];
+  let i = 0;
+  const isSpecial = l => /^(#{1,6})\s/.test(l) || /^```/.test(l)
+    || /^\s*[-*+]\s+/.test(l) || /^\s*\d+\.\s+/.test(l) || /^\s*>\s?/.test(l);
+  while (i < lines.length) {
+    const line = lines[i];
+    const fence = /^```(\w*)/.exec(line);
+    if (fence) {
+      i++; const code = [];
+      while (i < lines.length && !/^```/.test(lines[i])) { code.push(lines[i]); i++; }
+      i++;
+      out.push(`<pre class="md-pre"><code>${esc(code.join('\n'))}</code></pre>`);
+      continue;
+    }
+    const h = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (h) { const n = h[1].length; out.push(`<div class="md-h md-h${n}">${mdInline(h[2])}</div>`); i++; continue; }
+    if (/^\s*([-*_])\1\1+\s*$/.test(line)) { out.push('<hr class="md-hr">'); i++; continue; }
+    if (/^\s*>\s?/.test(line)) {
+      const q = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { q.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+      out.push(`<blockquote class="md-quote">${renderMarkdown(q.join('\n'))}</blockquote>`);
+      continue;
+    }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) { items.push(lines[i].replace(/^\s*[-*+]\s+/, '')); i++; }
+      out.push('<ul class="md-ul">' + items.map(it => `<li>${mdInline(it)}</li>`).join('') + '</ul>');
+      continue;
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) { items.push(lines[i].replace(/^\s*\d+\.\s+/, '')); i++; }
+      out.push('<ol class="md-ol">' + items.map(it => `<li>${mdInline(it)}</li>`).join('') + '</ol>');
+      continue;
+    }
+    if (/^\s*$/.test(line)) { i++; continue; }
+    const para = [];
+    while (i < lines.length && !/^\s*$/.test(lines[i]) && !isSpecial(lines[i])) { para.push(lines[i]); i++; }
+    out.push(`<div class="md-p">${mdInline(para.join(' '))}</div>`);
+  }
+  return out.join('');
+}
 
 // ============================================================
 // Console feed
@@ -264,13 +435,107 @@ function feed(agentId, cls, text, ico, sameLine = false) {
     el.querySelector('.body').textContent = text;
     if (feedFilter && feedFilter !== agentId) el.style.display = 'none';
     consoleFeed.appendChild(el);
-    if (sameLine) streamEls[agentId] = el;
+    if (sameLine) { streamEls[agentId] = el; el.classList.add('streaming'); }
     else delete streamEls[agentId];
   }
   consoleFeed.scrollTop = consoleFeed.scrollHeight;
 }
 
-function endStream(agentId) { delete streamEls[agentId]; }
+function endStream(agentId) {
+  const s = streamEls[agentId];
+  if (s) s.classList.remove('streaming');   // drop the live typing caret
+  delete streamEls[agentId];
+}
+
+// THINKING MODE — a live animated row at the bottom of the feed shown whenever
+// an agent is running but not currently streaming text (between tool calls,
+// before first output). Reuses one element per agent and floats to the bottom.
+const thinkEls = {};
+function showThinking(agentId, label) {
+  hideFeedEmpty();
+  let el = thinkEls[agentId];
+  if (!el || !el.isConnected) {
+    const a = agents.find(x => x.id === agentId);
+    el = document.createElement('div');
+    el.className = 'ev thinking-row';
+    el.dataset.agent = agentId;
+    el.innerHTML =
+      `<span class="tag">${esc(a ? a.name : '?')}</span>` +
+      `<span class="ico think-dots"><i></i><i></i><i></i></span>` +
+      `<span class="body think-label"></span>`;
+    if (feedFilter && feedFilter !== agentId) el.style.display = 'none';
+    thinkEls[agentId] = el;
+  }
+  el.querySelector('.think-label').textContent = label || 'thinking…';
+  consoleFeed.appendChild(el);                 // keep it as the last (current) line
+  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+}
+function hideThinking(agentId) {
+  const el = thinkEls[agentId];
+  if (el && el.parentNode) el.parentNode.removeChild(el);
+  delete thinkEls[agentId];
+}
+
+// line-level diff: trim the shared head/tail, mark the rest removed/added.
+// Good enough to read an edit at a glance without a full LCS.
+function diffLines(oldStr, newStr) {
+  const o = (oldStr || '').split('\n');
+  const n = (newStr || '').split('\n');
+  let s = 0;
+  while (s < o.length && s < n.length && o[s] === n[s]) s++;
+  let eo = o.length - 1, en = n.length - 1;
+  while (eo >= s && en >= s && o[eo] === n[en]) { eo--; en--; }
+  const rows = [];
+  for (let i = 0; i < s; i++) rows.push(['ctx', o[i]]);
+  for (let i = s; i <= eo; i++) rows.push(['del', o[i]]);
+  for (let i = s; i <= en; i++) rows.push(['add', n[i]]);
+  for (let i = eo + 1; i < o.length; i++) rows.push(['ctx', o[i]]);
+  return rows;
+}
+
+// collapsible diff card in the console feed for an edit tool call
+function feedDiff(agentId, tool, inp) {
+  hideFeedEmpty();
+  const a = agents.find(x => x.id === agentId);
+  const file = inp.file_path || inp.path || '';
+  const name = file ? file.split(/[\\/]/).pop() : tool;
+  let rows = [];
+  if (tool === 'Write') rows = diffLines('', inp.content || '');
+  else if (tool === 'MultiEdit' && Array.isArray(inp.edits)) {
+    inp.edits.forEach((e, i) => {
+      if (i) rows.push(['sep', '']);
+      rows.push(...diffLines(e.old_string, e.new_string));
+    });
+  } else rows = diffLines(inp.old_string, inp.new_string);
+
+  const adds = rows.filter(r => r[0] === 'add').length;
+  const dels = rows.filter(r => r[0] === 'del').length;
+  const prefix = k => (k === 'add' ? '+' : k === 'del' ? '-' : k === 'sep' ? '' : ' ');
+
+  const card = document.createElement('div');
+  card.className = 'ev ev-diff';
+  card.dataset.agent = agentId;
+  card.innerHTML =
+    `<span class="tag">${esc(a ? a.name : '?')}</span>` +
+    `<div class="diff-card">` +
+      `<button class="diff-head">` +
+        `<span class="diff-caret">▸</span><span class="diff-ico">✏</span>` +
+        `<span class="diff-file"></span>` +
+        `<span class="diff-stat"><b class="add">+${adds}</b> <b class="del">-${dels}</b></span>` +
+      `</button>` +
+      `<div class="diff-body">` +
+        rows.map(([k]) => `<div class="dl dl-${k}"><i>${prefix(k)}</i><span></span></div>`).join('') +
+      `</div>` +
+    `</div>`;
+  card.querySelector('.diff-file').textContent = name + (tool === 'Write' ? '  (new file)' : '');
+  const spans = card.querySelectorAll('.dl > span');
+  rows.forEach((r, i) => { spans[i].textContent = r[1]; });
+  const inner = card.querySelector('.diff-card');
+  card.querySelector('.diff-head').onclick = () => inner.classList.toggle('open');
+  if (feedFilter && feedFilter !== agentId) card.style.display = 'none';
+  consoleFeed.appendChild(card);
+  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+}
 
 // After a plan-mode run finishes, drop an inline action card into the console.
 // Primary action DELEGATES the plan to a Senior Engineer (the planner stays a
@@ -391,35 +656,30 @@ function elapsedText(since) {
 }
 
 function renderActivity() {
-  const running = agents.filter(a => R(a.id).running);
-  const stage = pipe.active ? STAGE_LABEL[pipe.stage] : null;
-  if (!running.length && !stage) {
-    activityEl.classList.add('hidden');
-    activityEl.innerHTML = '';
-    syncPane();
-    return;
-  }
-  activityEl.classList.remove('hidden');
+  // the top strip AND the floating pill are both retired — the single source of
+  // "what's happening" is now the status bar (see statusbar.js renderWork()).
+  activityEl.classList.add('hidden');
   activityEl.innerHTML = '';
-  if (stage) {
-    const s = document.createElement('div');
-    s.className = 'act-stage';
-    s.textContent = stage;
-    activityEl.appendChild(s);
-  }
-  for (const a of running) {
-    const r = R(a.id);
-    const row = document.createElement('div');
-    row.className = 'act-row';
-    row.innerHTML = `<span class="act-name"></span><span class="act-spin"></span><span class="act-status"></span><span class="act-elapsed"></span><button class="act-stop" title="Abort this agent">■ STOP</button>`;
-    row.querySelector('.act-name').textContent = a.name;
-    row.querySelector('.act-status').textContent = r.status || 'working...';
-    row.querySelector('.act-elapsed').textContent = r.startedAt ? elapsedText(r.startedAt) : '';
-    row.querySelector('.act-stop').onclick = () => { stopAgent(a.id); feed(a.id, 'sys', 'stop requested — aborting…', '■'); };
-    activityEl.appendChild(row);
-  }
+  // composer stop button: visible whenever anything is actually running
+  const stopBtn = document.getElementById('btn-pipeline-stop');
+  if (stopBtn) stopBtn.classList.toggle('hidden', !anyBusy());
+  if (window.renderStatusBar) window.renderStatusBar();
   syncPane();
 }
+
+// one place to stop whatever is running — used by the status-bar stop button.
+// Aborts the pipeline (covers paused "awaiting review") AND any loose agents.
+function stopEverything() {
+  if (pipe.active && typeof abortPipeline === 'function') {
+    abortPipeline('pipeline aborted by operator.');
+  }
+  agents.filter(a => R(a.id).running).forEach(x => {
+    stopAgent(x.id); feed(x.id, 'sys', 'stop requested — aborting…', '■');
+  });
+  if (window.renderStatusBar) window.renderStatusBar();
+}
+window.stopEverything = stopEverything;
+window.pipeState = () => ({ active: pipe.active, stage: pipe.stage, label: STAGE_LABEL[pipe.stage] });
 
 // keep the elapsed counters moving so the console never looks frozen
 setInterval(() => { if (!activityEl.classList.contains('hidden')) renderActivity(); }, 1000);
@@ -434,12 +694,23 @@ let lastBusy = null;
 function anyBusy() { return pipe.active || agents.some(a => R(a.id).running); }
 
 function syncPane() {
-  // the terminal view owns the pane while it's open
-  if (!document.getElementById('term-view').classList.contains('hidden')) return;
+  // terminal now lives in the bottom panel and no longer owns the center —
+  // console/editor swap independently of whether the panel is open
+  // split mode: editor and console are shown side by side, so don't hide either
+  if (document.getElementById('editor-area').classList.contains('split') && activeFile) {
+    viewer.classList.remove('hidden');
+    consoleFeed.classList.remove('hidden');
+    renderConsoleChips();
+    return;
+  }
   const busy = anyBusy();
-  if (busy !== lastBusy) { paneOverride = null; lastBusy = busy; }
+  // during a run → show the console; when it finishes → STAY on the console so
+  // the result is visible (don't auto-flip back to the editor / explorer).
+  if (busy !== lastBusy) { paneOverride = busy ? null : 'console'; lastBusy = busy; }
   const want = paneOverride || (busy ? 'console' : 'editor');
-  viewer.classList.toggle('hidden', !(want === 'editor' && activeFile));
+  const showEditor = want === 'editor' && activeFile;
+  viewer.classList.toggle('hidden', !showEditor);
+  consoleFeed.classList.toggle('hidden', showEditor);   // the other pane owns the area
   renderConsoleChips();
 }
 
@@ -466,6 +737,43 @@ async function hasProjectMap(cwd) {
     mapHintSeen.set(cwd, !!st.exists);
   }
   return mapHintSeen.get(cwd);
+}
+
+// TOPIC MEMORY retrieval — instead of front-loading one giant knowledge file
+// (token-heavy), pull ONLY the 1-2 topic memories relevant to this issue, plus a
+// one-line index of all topics. Each matched topic is flagged STALE when its
+// covered files changed, so the PE refreshes just those files.
+async function memoryInject(cwd, query) {
+  try {
+    const r = await window.deck.memoryList(cwd);
+    if (!r.ok || !r.topics || !r.topics.length) return '';
+    const q = String(query || '').toLowerCase();
+    const qtokens = q.split(/[^a-z0-9]+/).filter(w => w.length > 2);
+    const score = t => {
+      const hay = `${t.title} ${t.keywords} ${t.files.join(' ')}`.toLowerCase();
+      let s = 0;
+      for (const w of qtokens) if (hay.includes(w)) s++;
+      for (const kw of (t.keywords || '').toLowerCase().split(',')) {
+        const k = kw.trim(); if (k && q.includes(k)) s += 2;   // phrase match boost
+      }
+      return s;
+    };
+    const ranked = r.topics.map(t => ({ t, s: score(t) }))
+      .filter(x => x.s > 0).sort((a, b) => b.s - a.s).slice(0, 2);
+    const titles = r.topics.map(t => t.title || t.slug).join(', ');
+    let out = `\n\nMEMORY INDEX (feature topics already on file — extend these, don't duplicate): ${titles}`;
+    for (const { t } of ranked) {
+      out += `\n\n=== MEMORY: ${t.title} ===`;
+      if (t.stale) {
+        out += `\n[STALE — these covered files changed since this memory was written: ${t.changed.join(', ')}. Re-read ONLY these, then refresh this topic before trusting the rest.]`;
+      }
+      out += `\n${t.body}`;
+    }
+    if (!ranked.length) {
+      out += `\n(No topic matches this issue — after you solve it, create .loveai/memory/topics/<topic>.md for this feature.)`;
+    }
+    return out;
+  } catch { return ''; }
 }
 
 async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) {
@@ -496,6 +804,13 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   let fullPrompt = prompt;
   if (a.role !== 'indexer' && await hasProjectMap(cwd)) {
     fullPrompt += '\n\nOrientation: read .loveai/index/PROJECT-MAP.md first and open only the files relevant to this task — do not survey the repo.';
+  }
+  // TOPIC MEMORY — front-load only the feature memory relevant to this run so
+  // the agent already knows the flow (paths, functions, step-by-step) without
+  // re-exploring. Light by design: at most 1-2 topics, not the whole codebase.
+  // Every role reads it and (per DISCIPLINE) every role maintains it.
+  if (a.role !== 'indexer' && cwd) {
+    fullPrompt += await memoryInject(cwd, prompt);
   }
   // LEXICAL RETRIEVAL: pre-rank the files most likely involved (symbol + BM25)
   // and hand them to the Prompt Engineer so it reads a few instead of grepping
@@ -582,6 +897,7 @@ window.deck.onAgentEvent(ev => {
       r.sessionId = ev.sessionId;
       feed(ev.agentId, 'sys', `session ${ev.sessionId.slice(0, 8)} · ${ev.model}`, '⚡');
       ticker(ev.agentId, 'thinking...');
+      showThinking(ev.agentId, 'thinking…');
       break;
     case 'session-invalid':
       // the resumed session no longer exists on disk — forget it so it isn't
@@ -594,27 +910,49 @@ window.deck.onAgentEvent(ev => {
     case 'text-delta':
       // a delta with no open stream element starts a fresh assistant message —
       // keep only the latest one, it's the agent's closing summary
+      hideThinking(ev.agentId);                 // text is arriving — stop "thinking"
       if (!streamEls[ev.agentId]) { r.lastText = ''; ticker(ev.agentId, 'writing response...'); }
       r.lastText = (r.lastText || '') + ev.text;
       feed(ev.agentId, 'txt', ev.text, '', true);
       break;
-    case 'text-end':
+    case 'text-end': {
+      // the message is complete — swap the raw streamed text for rendered
+      // markdown so headings/lists/code read cleanly instead of # and *.
+      const sEl = streamEls[ev.agentId];
+      const bodyEl = sEl && sEl.querySelector('.body');
+      if (bodyEl) {
+        bodyEl.innerHTML = renderMarkdown(bodyEl.textContent);
+        bodyEl.classList.add('md-body');
+      }
       endStream(ev.agentId);
+      showThinking(ev.agentId, 'thinking…');     // may still call more tools
       break;
+    }
     case 'tool': {
       endStream(ev.agentId);
+      hideThinking(ev.agentId);
       const ico = TOOL_ICON[ev.tool] || '⚙';
+      let inp = null;
+      try { inp = JSON.parse(ev.input); } catch {}
+      // edits get a collapsible diff card instead of a bare log line
+      if (inp && /^(Edit|MultiEdit|Write)$/.test(ev.tool)) {
+        feedDiff(ev.agentId, ev.tool, inp);
+        const fn = (inp.file_path || inp.path || '').split(/[\\/]/).pop();
+        ticker(ev.agentId, `${ev.tool} ▸ ${fn}`);
+        showThinking(ev.agentId, `${ev.tool} ▸ ${fn}`);
+        break;
+      }
       let detail = '';
-      try {
-        const inp = JSON.parse(ev.input);
-        detail = inp.file_path || inp.path || inp.command || inp.pattern || inp.query || inp.prompt || '';
-      } catch { detail = ev.input; }
+      if (inp) detail = inp.file_path || inp.path || inp.command || inp.pattern || inp.query || inp.prompt || '';
+      else detail = ev.input;
       detail = String(detail).slice(0, 120);
       feed(ev.agentId, 'tool', `${ev.tool} ${detail}`, ico);
       ticker(ev.agentId, `${ev.tool} ▸ ${detail}`);
+      showThinking(ev.agentId, `${ev.tool} ▸ ${detail}`);
       break;
     }
     case 'result': {
+      hideThinking(ev.agentId);
       r.sessionId = ev.sessionId || r.sessionId;
       if (ev.sessionId && !r.noShare) setSession(ev.sessionId);
       r.lastResult = ev.subtype;
@@ -640,16 +978,26 @@ window.deck.onAgentEvent(ev => {
       break;
     }
     case 'aborted':
+      hideThinking(ev.agentId);
       r.lastResult = 'aborted';
       feed(ev.agentId, 'err', 'aborted by operator.', '■');
       break;
     case 'error':
+      hideThinking(ev.agentId);
       r.lastResult = 'error';
       feed(ev.agentId, 'err', 'ERROR: ' + ev.error, '⚠');
       break;
-    case 'done':
+    case 'done': {
       r.running = false;
       endStream(ev.agentId);
+      hideThinking(ev.agentId);
+      // any agent may have written/updated topic memories — capture fingerprints
+      // of their covered files so staleness detection works next time.
+      const finishedAgent = agents.find(x => x.id === ev.agentId);
+      const memCwd = (finishedAgent && finishedAgent.cwd) || projectDir;
+      if (finishedAgent && finishedAgent.role !== 'indexer' && memCwd) {
+        window.deck.memoryReindex(memCwd).catch(() => {});
+      }
       if (r.planMode && r.lastResult === 'success') {
         feed(ev.agentId, 'sys', 'plan complete — nothing was written yet.', '🗺');
         feedImplementCard(ev.agentId, r.sessionId);
@@ -673,6 +1021,7 @@ window.deck.onAgentEvent(ev => {
       onPipelineAgentDone(ev.agentId, r.lastResult)
         .then(() => { if (!pipe.active) cleanupSeniors(); });
       break;
+    }
   }
 });
 
@@ -806,7 +1155,9 @@ function feedPlanCard(summary, count) {
   el.className = 'plan-result';
   el.innerHTML = `<div class="pl-head">🧠 PLAN READY <span class="pl-open">CLICK FOR FULL RESULT ▸</span></div>
     <div class="pl-summary"></div><div class="pl-meta"></div>`;
-  el.querySelector('.pl-summary').textContent = summary;
+  const sum = el.querySelector('.pl-summary');
+  sum.innerHTML = renderMarkdown(summary);
+  sum.classList.add('md-body');
   el.querySelector('.pl-meta').textContent = `${count} task file(s) · awaiting your review`;
   el.onclick = openPlanModal;
   consoleFeed.appendChild(el);
@@ -1156,7 +1507,7 @@ async function onPipelineAgentDone(agentId, result) {
   }
 }
 
-document.getElementById('btn-pipeline-stop').onclick = () => abortPipeline('pipeline aborted by operator.');
+document.getElementById('btn-pipeline-stop').onclick = () => stopEverything();
 
 // ============================================================
 // Chatbox — routes to pipeline or a single agent
@@ -1176,6 +1527,10 @@ function feedRaw(tag, cls, text, ico) {
 let attachments = [];
 const IMG_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
 
+// an attachment is either a file path (string) or a code snippet object:
+//   { kind: 'snippet', file, lang, code, start, end }
+function isSnippet(a) { return a && typeof a === 'object' && a.kind === 'snippet'; }
+
 function renderAttach() {
   for (const boxId of ['attach-chips', 'cm-attach', 'cx-attach', 'ad-attach']) {
     const box = document.getElementById(boxId);
@@ -1184,14 +1539,29 @@ function renderAttach() {
     attachments.forEach((p, i) => {
       const chip = document.createElement('span');
       chip.className = 'attach-chip';
-      chip.title = p;
-      chip.innerHTML = `${IMG_RE.test(p) ? '🖼' : '📄'} <span></span> <b title="Remove">✕</b>`;
-      chip.querySelector('span').textContent = p.split(/[\\/]/).pop();
+      if (isSnippet(p)) {
+        const name = p.file ? p.file.split(/[\\/]/).pop() : 'selection';
+        const label = `${name}:${p.start}-${p.end}`;
+        chip.title = `${label}\n\n${p.code}`;
+        chip.innerHTML = `✦ <span></span> <b title="Remove">✕</b>`;
+        chip.querySelector('span').textContent = label;
+      } else {
+        chip.title = p;
+        chip.innerHTML = `${IMG_RE.test(p) ? '🖼' : '📄'} <span></span> <b title="Remove">✕</b>`;
+        chip.querySelector('span').textContent = p.split(/[\\/]/).pop();
+      }
       chip.querySelector('b').onclick = () => { attachments.splice(i, 1); renderAttach(); };
       box.appendChild(chip);
     });
   }
 }
+
+// attach a highlighted code selection as context (a chip, never text in the box)
+function addSnippetAttachment(snip) {
+  attachments.push({ kind: 'snippet', ...snip });
+  renderAttach();
+}
+window.addSnippetAttachment = addSnippetAttachment;
 
 function addDroppedFiles(fileList) {
   for (const f of fileList) {
@@ -1204,7 +1574,17 @@ function addDroppedFiles(fileList) {
 // consume attachments into a prompt suffix — Claude Code reads images/files from disk
 function attachBlock() {
   if (!attachments.length) return '';
-  const block = '\n\nAttached files (open and view/read them from disk):\n' + attachments.map(p => '- ' + p).join('\n');
+  const files = attachments.filter(a => !isSnippet(a));
+  const snippets = attachments.filter(isSnippet);
+  let block = '';
+  if (files.length) {
+    block += '\n\nAttached files (open and view/read them from disk):\n'
+      + files.map(p => '- ' + p).join('\n');
+  }
+  for (const s of snippets) {
+    const loc = s.file ? `${s.file} (lines ${s.start}-${s.end})` : 'selection';
+    block += `\n\nSelected code from ${loc}:\n\`\`\`${s.lang || ''}\n${s.code}\n\`\`\``;
+  }
   attachments = [];
   renderAttach();
   return block;
@@ -1326,6 +1706,10 @@ async function sendChat() {
   if (target === '__pipeline__') {
     if (pipe.active) { plog('err', 'pipeline already running — abort it first.'); return; }
     launchPipeline(full);
+  } else if (target.startsWith('model:')) {
+    // run a bare Claude model, no agent persona
+    const id = ensureModelAgent(target.slice('model:'.length));
+    runAgent(id, full, false, plan);
   } else {
     // background learner: manual UI/UX sends grow the UI vocabulary; a quick
     // corrective follow-up counts against the model of the previous run
@@ -1871,9 +2255,8 @@ function renderUsage() {
 async function refreshAuth() {
   auth = await window.deck.authStatus();
   const on = !!auth.loggedIn;
-  document.getElementById('acct-dot').className = 'acct-dot ' + (on ? 'on' : 'off');
-  document.getElementById('acct-email').textContent = on ? (auth.email || 'logged in') : 'NOT LOGGED IN — click to sign in';
-  document.getElementById('acct-plan').textContent = on ? (auth.subscriptionType || auth.authMethod || '') + ' plan' : 'offline';
+  // Claude account now lives in the status bar; the header shows the LoveAi profile
+  if (window.renderStatusBar) window.renderStatusBar();
   document.getElementById('ac-status').textContent = on ? 'LOGGED IN ●' : 'LOGGED OUT ○';
   document.getElementById('ac-status').style.color = on ? 'var(--green)' : 'var(--red)';
   document.getElementById('ac-email').textContent = auth.email || '—';
