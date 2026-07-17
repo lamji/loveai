@@ -8,8 +8,9 @@ const DISCIPLINE = `
 CONTEXT DISCIPLINE (binding):
 - Grep/Glob first; Read only files you must change or verify, with offset/limit for big files. Never re-read an unchanged file; never survey the repo.
 - If .loveai/index/PROJECT-MAP.md exists, trust it for orientation instead of exploring.
-- No speculative web searches. No re-stating file contents back in chat.
-- FINAL REPLY ≤ 8 lines: what changed/was found + any required format lines. No plans-restated, no code dumps.`;
+- No speculative web searches. Don't paste back full file contents or dump large code blocks.
+- DO THE WORK YOURSELF. Never delegate via the Task/Agent tool and never invoke the project's own subagents (its .claude/agents) — you ARE the engineer for this pipeline.
+- Keep the reply focused, but ALWAYS explain your reasoning and decisions clearly — state what you did, what you found, and WHY. The operator reads this reply; never go silent or reply with just a status word.`;
 
 const RULES = {
   prompt: `You are the PROMPT ENGINEER of a pipeline (you -> Senior Engineer(s) -> Reviewer). Operator gives an ISSUE; you never code fixes.
@@ -66,7 +67,9 @@ JOB:
 1. Read .loveai/pipeline/review-brief.md + changes-log.md. Write your validation plan to .loveai/pipeline/validation-plan.md first.
 2. Review ONLY changed files + their direct callers for: correctness bugs/regressions (edge cases, null handling, async races, broken contracts), MVVM violations (views: no logic; viewmodels: no UI; models pure), dead code/unused imports, oversized additions (fn >~50 lines / file >~300), and scope compliance (out-of-SCOPE change = automatic finding).
 3. Write .loveai/pipeline/review-findings.md — FIRST LINE exactly "VERDICT: REJECTED" or "VERDICT: APPROVED". REJECTED: each finding as file, line, problem, required fix, owning task file. APPROVED: one short validation summary.
-4. Never fix code yourself. You may run builds/tests to validate.${DISCIPLINE}`
+   - HONOR JUSTIFICATIONS: if changes-log.md justifies a prior finding as a FALSE POSITIVE, verify it against the code — if the justification is correct, ACCEPT it and do NOT re-raise that finding. Only keep REJECTED for findings that are REAL and still unaddressed. Do not loop on issues that are fixed or legitimately dismissed.
+4. Never fix code yourself. You may run builds/tests to validate.
+5. IN YOUR CHAT REPLY (not only the file): narrate what you validated (files/checks/tests run), then state the VERDICT. If REJECTED, list each finding with a one-line reason WHY it fails — the operator must understand the decision from your reply alone, without opening the file. Never reply with just "REJECTED"/"APPROVED".${DISCIPLINE}`
 };
 
 // perm defaults to bypassPermissions: this GUI has no permission-prompt UI, and
@@ -493,12 +496,27 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   if (a.role !== 'indexer' && await hasProjectMap(cwd)) {
     fullPrompt += '\n\nOrientation: read .loveai/index/PROJECT-MAP.md first and open only the files relevant to this task — do not survey the repo.';
   }
+  // LEXICAL RETRIEVAL: pre-rank the files most likely involved (symbol + BM25)
+  // and hand them to the Prompt Engineer so it reads a few instead of grepping
+  // the whole repo. Cheap local call, no LLM, big latency win.
+  if ((a.role === 'prompt' || a.role === 'custom') && cwd) {
+    try {
+      const r = await window.deck.retrieveContext(cwd, prompt, 10);
+      if (r.ok && r.files && r.files.length) {
+        const lines = r.files.map(f => `- ${f.rel}${f.symbols && f.symbols.length ? ' — ' + f.symbols.slice(0, 8).join(', ') : ''}`).join('\n');
+        fullPrompt += `\n\nPRE-RANKED RELEVANT FILES (lexical match on the issue — START HERE, open the top few, verify, and only widen if they don't cover it. Do NOT grep the whole repo):\n${lines}`;
+      }
+    } catch {}
+  }
 
   await window.deck.runAgent({
     runId: r.runId, agentId, prompt: fullPrompt,
     model, cwd, rules: effectiveRules(a),
     permissionMode: plan ? 'plan' : a.perm,
     leanContext: !!a.lean,
+    // pipeline agents must do the work THEMSELVES — never delegate to the
+    // project's own .claude/agents subagents (that loops and ignores our roster)
+    noSubagents: ['prompt', 'senior', 'uiux', 'reviewer', 'indexer'].includes(a.role),
     maxTurns: learnedMaxTurns(a.role),
     addDirs: (a.dirs || '').split(',').map(s => s.trim()).filter(Boolean),
     // token-lean default: every run starts FRESH. Context only carries over on
@@ -623,6 +641,12 @@ window.deck.onAgentEvent(ev => {
       }
       delete runEventSinks[ev.runId];
       if (typeof gitRefresh === 'function' && gitRepo) gitRefresh();
+      // a MANUAL Prompt Engineer run (outside the pipeline) that produced task
+      // files → offer to deploy engineers, so the work doesn't just stop
+      if (!pipe.active && r.lastResult === 'success') {
+        const da = agents.find(x => x.id === ev.agentId);
+        if (da && da.role === 'prompt' && da.cwd) maybeOfferDeploy(da.cwd);
+      }
       onPipelineAgentDone(ev.agentId, r.lastResult)
         .then(() => { if (!pipe.active) cleanupSeniors(); });
       break;
@@ -633,7 +657,7 @@ window.deck.onAgentEvent(ev => {
 // AUTO PIPELINE ORCHESTRATOR
 // prompt -> PLAN REVIEW (operator gate) -> build -> review -> loop
 // ============================================================
-const pipe = { active: false, stage: null, cwd: '', iteration: 0, maxIter: 3, pending: new Set(), taskAssign: new Map(), planTasks: [], taskModels: new Map(), reviewModel: null };
+const pipe = { active: false, stage: null, cwd: '', iteration: 0, maxIter: 5, pending: new Set(), taskAssign: new Map(), planTasks: [], taskModels: new Map(), reviewModel: null };
 
 // "MODEL: <id>" line written by the Prompt Engineer — routes each task to the
 // cheapest model that fits its complexity
@@ -807,14 +831,13 @@ async function showPlanReview() {
 document.getElementById('pr-close').onclick = hidePlanReview;
 planModal.addEventListener('click', e => { if (e.target === planModal) hidePlanReview(); });
 
-document.getElementById('pr-approve').onclick = async () => {
-  if (!pipe.active || pipe.stage !== 'plan') return;
-  hidePlanReview();
-  closePlanCard('approved — passed to engineers');
-  // pull the complexity-based model routing out of the plan files
+// Read the task files in .loveai/pipeline/, route each to an agent, and start the
+// BUILD → REVIEW stages. Used both by the plan-approval gate AND when a manual
+// (non-pipeline) Prompt Engineer run leaves task files that need executing.
+async function deployEngineersFromDir() {
   pipe.taskModels.clear();
   pipe.reviewModel = null;
-  const uiTasks = new Set();   // task files whose content is UI work → UI/UX engineer
+  const uiTasks = new Set();
   const files = await window.deck.pipelineRead(pipe.cwd);
   for (const f of files) {
     if (/^task-\d+.*\.md$/i.test(f.name)) {
@@ -825,18 +848,15 @@ document.getElementById('pr-approve').onclick = async () => {
       pipe.reviewModel = parseModelLine(f.content, 'REVIEW-MODEL');
     }
   }
-  // UI tasks route to the UI/UX engineer; the rest spread across seniors
   const tasks = pipe.planTasks.slice(0, 4);
   const ui = uiuxAgent();
   const uiAssigned = ui ? tasks.filter(t => uiTasks.has(t)) : [];
   const genTasks = tasks.filter(t => !uiAssigned.includes(t));
   const n = Math.min(Math.max(genTasks.length, 1), 4);
-  plog('ok', `plan approved by operator. Deploying ${genTasks.length ? n + ' senior(s)' : 'engineers'}${uiAssigned.length ? ' + UI/UX engineer' : ''}...`);
+  plog('ok', `deploying ${genTasks.length ? n + ' senior(s)' : 'engineers'}${uiAssigned.length ? ' + UI/UX engineer' : ''}...`);
   const seniors = genTasks.length ? ensureSeniors(Math.min(genTasks.length, 4)) : [];
   pipe.taskAssign.clear();
   genTasks.forEach((t, i) => pipe.taskAssign.set(seniors[i % seniors.length].id, t));
-  // NOTE: one UI/UX agent takes UI tasks sequentially is fine — assign the first;
-  // extra UI tasks fall back to seniors so nothing is dropped
   uiAssigned.forEach((t, i) => {
     if (i === 0) { if (!ui.cwd) { ui.cwd = pipe.cwd; save(); } pipe.taskAssign.set(ui.id, t); plog('info', `${t} ▸ routed to ${ui.name} (UI task)`); }
     else if (seniors.length) pipe.taskAssign.set(seniors[i % seniors.length].id, t);
@@ -844,7 +864,44 @@ document.getElementById('pr-approve').onclick = async () => {
   });
   plog('info', 'Stage 3: BUILD — engineers executing in parallel...');
   startBuild('execute');
+}
+
+document.getElementById('pr-approve').onclick = async () => {
+  if (!pipe.active || pipe.stage !== 'plan') return;
+  hidePlanReview();
+  closePlanCard('approved — passed to engineers');
+  await deployEngineersFromDir();
 };
+
+// A manual Prompt Engineer run left task files but there's no live pipeline to run
+// them — offer a one-click deploy so the work doesn't just stop.
+async function maybeOfferDeploy(cwd) {
+  if (pipe.active) return;
+  let scan; try { scan = await window.deck.pipelineScan(cwd); } catch { return; }
+  if (!scan || !scan.tasks || !scan.tasks.length) return;
+  feedDeployCard(cwd, scan.tasks);
+}
+
+function feedDeployCard(cwd, taskNames) {
+  hideFeedEmpty();
+  const el = document.createElement('button');
+  el.className = 'plan-result';
+  el.innerHTML = `<div class="pl-head">🚀 TASK FILES READY <span class="pl-open">▶ DEPLOY ENGINEERS</span></div>
+    <div class="pl-summary"></div><div class="pl-meta"></div>`;
+  el.querySelector('.pl-summary').textContent = taskNames.join(', ');
+  el.querySelector('.pl-meta').textContent = `${taskNames.length} task file(s) — click to build + review with your roster`;
+  el.onclick = async () => {
+    if (pipe.active) { plog('err', 'a pipeline is already running.'); return; }
+    el.classList.add('done');
+    el.querySelector('.pl-meta').textContent = 'deploying…';
+    pipe.active = true; pipe.cwd = cwd; pipe.iteration = 0;
+    document.getElementById('btn-pipeline-stop').classList.remove('hidden');
+    pipe.planTasks = taskNames;
+    await deployEngineersFromDir();
+  };
+  consoleFeed.appendChild(el);
+  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+}
 
 document.getElementById('pr-discard').onclick = () => {
   if (!pipe.active) { hidePlanReview(); return; }
@@ -916,6 +973,65 @@ function startBuild(taskCmd) {
   }
 }
 
+// FIX ROUND — on a rejection, assign ALL findings to a SINGLE owner so nothing
+// falls through the "not my task file" gap. UI findings go to the UI/UX engineer;
+// everything else to a senior. The fixer must fix every finding or justify false
+// positives in changes-log.md for the Reviewer to verify — no silent "not mine".
+// short capability line per role — helps the AI router pick the right engineer
+const ROLE_CAP = {
+  senior: 'backend, APIs, database, server logic, general full-stack implementation',
+  uiux: 'front-end UI/UX: components, styling, layout, typography, React/Vue/Angular, design systems, accessibility',
+  custom: 'free-form general engineering across the stack',
+  prompt: 'planning/analysis (last resort as an implementer)'
+};
+
+// DYNAMIC ROUTING: an AI (cheap Haiku) reads the findings and the actual roster,
+// then names the best engineer to implement the fixes. No brittle keyword regex —
+// it reasons about the work, and adapts to whatever agents are on the roster.
+async function pickFixerByAI(findings) {
+  const candidates = agents.filter(a => ['senior', 'uiux', 'custom'].includes(a.role));
+  if (candidates.length <= 1) return candidates[0] || byRole('senior')[0] || uiuxAgent();
+  const roster = candidates.map(a => `- ${a.name} [${a.role}]: ${ROLE_CAP[a.role] || 'general engineering'}`).join('\n');
+  const prompt = `Route this code-review rejection to the SINGLE best engineer to IMPLEMENT the fixes. Judge by what the findings actually require (front-end vs backend vs mixed).
+
+ENGINEERS:
+${roster}
+
+REVIEW FINDINGS:
+${String(findings).slice(0, 7000)}
+
+Reply with ONLY the exact engineer name from the list above — one line, nothing else.`;
+  try {
+    const r = await window.deck.aiGenerate(prompt, 'claude-haiku-4-5-20251001', pipe.cwd);
+    if (r.ok && r.text) {
+      const name = r.text.trim().split('\n')[0].replace(/["'`.*_]/g, '').trim().toLowerCase();
+      const hit = candidates.find(a => a.name.toLowerCase() === name)
+        || candidates.find(a => name.includes(a.name.toLowerCase()))
+        || candidates.find(a => name.includes(a.role));
+      if (hit) return hit;
+    }
+  } catch {}
+  return byRole('senior')[0] || candidates[0] || uiuxAgent();   // safe fallback
+}
+
+async function startFixRound() {
+  setStage('build');
+  const files = await window.deck.pipelineRead(pipe.cwd);
+  const findings = (files.find(f => f.name === 'review-findings.md') || {}).content || '';
+  const fixer = await pickFixerByAI(findings);
+  if (!fixer) { abortPipeline('no engineer available to fix findings — halted.'); return; }
+  if (!fixer.cwd) { fixer.cwd = pipe.cwd; save(); }
+  pipe.pending = new Set([fixer.id]);
+  pipe.taskAssign = new Map([[fixer.id, 'review-findings.md']]);   // so onDone counts it
+  plog('err', `REJECTED — fix round ${pipe.iteration}: AI routed ALL findings to ${fixer.name} (${ROLE_LABEL[fixer.role] || fixer.role}).`);
+  const prompt = `The Reviewer REJECTED this work. Read .loveai/pipeline/review-findings.md AND the original task file(s) in .loveai/pipeline/, then COMPLETE the feature so every finding is resolved and every acceptance criterion is met. You own ALL findings this round — do NOT skip any because it "belongs to another task".
+
+IMPORTANT: findings that say a file is "untouched", a component/prop/filter/badge is "missing", or a criterion "doesn't exist" mean that work was NEVER DONE — you must IMPLEMENT it now (edit the real component/source files named in the findings; create code where it's missing). Do not just tweak what already changed.
+
+For each finding: implement the fix in the actual files, OR — only if you are certain it is a FALSE POSITIVE — leave it and write an evidence-backed justification in changes-log.md. Then append everything you did to .loveai/pipeline/changes-log.md. Verify against the acceptance criteria before finishing.`;
+  runAgent(fixer.id, prompt, false, false, { fresh: true });
+}
+
 function startReview() {
   setStage('review');
   const rv = byRole('reviewer')[0];
@@ -977,8 +1093,7 @@ async function onPipelineAgentDone(agentId, result) {
       } else {
         // learner: a rejection counts against the model that produced each task
         for (const [, taskFile] of pipe.taskAssign) learnMark(pipe.taskModels.get(taskFile), true);
-        plog('err', `REJECTED — sending findings back to senior engineer(s) (fix round ${pipe.iteration})...`);
-        startBuild('fix');
+        await startFixRound();   // reassign ALL findings to the right agent (UI/UX for UI)
       }
     } else {
       abortPipeline('reviewer produced no VERDICT — halted (check review-findings.md).');
@@ -1007,7 +1122,7 @@ let attachments = [];
 const IMG_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
 
 function renderAttach() {
-  for (const boxId of ['attach-chips', 'cm-attach']) {
+  for (const boxId of ['attach-chips', 'cm-attach', 'cx-attach', 'ad-attach']) {
     const box = document.getElementById(boxId);
     if (!box) continue;
     box.innerHTML = '';
@@ -1057,12 +1172,9 @@ document.getElementById('btn-attach').onclick = () => fileIn.click();
 document.getElementById('cm-attach-btn').onclick = () => fileIn.click();
 fileIn.onchange = () => { addDroppedFiles(fileIn.files); fileIn.value = ''; };
 
-// ===== Slash menu — /skills and /commands, CLI style =====
+// ===== Slash menu — /skills and /commands, CLI style (reusable per textarea) =====
 const chatInput = document.getElementById('chat-input');
-const slashMenu = document.getElementById('slash-menu');
 let slashItems = [];      // { name, description, type, scope, path }
-let slashMatches = [];
-let slashSel = 0;
 
 async function loadSlashItems() {
   const [skills, cmds] = await Promise.all([
@@ -1077,66 +1189,55 @@ async function loadSlashItems() {
    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-// the query is only live while the caret sits in a leading "/word"
-function slashQuery() {
-  const v = chatInput.value;
-  const m = /^\/([\w-]*)$/.exec(v.slice(0, chatInput.selectionStart));
-  return v.startsWith('/') && m ? m[1] : null;
-}
-
-function hideSlash() { slashMenu.classList.add('hidden'); slashMatches = []; }
-
-function renderSlash() {
-  const q = slashQuery();
-  if (q === null || !slashItems.length) { hideSlash(); return; }
-  slashMatches = slashItems.filter(i => i.name.toLowerCase().includes(q.toLowerCase())).slice(0, 12);
-  if (!slashMatches.length) { hideSlash(); return; }
-  slashSel = Math.min(slashSel, slashMatches.length - 1);
-
-  slashMenu.innerHTML = '';
-  slashMatches.forEach((it, i) => {
-    const row = document.createElement('div');
-    row.className = 'slash-item' + (i === slashSel ? ' sel' : '');
-    row.innerHTML = '<span class="slash-name"></span><span class="slash-desc"></span><span class="slash-kind"></span>';
-    row.querySelector('.slash-name').textContent = '/' + it.name;
-    row.querySelector('.slash-desc').textContent = it.description || '';
-    row.querySelector('.slash-kind').textContent = it.type === 'skill' ? 'SKILL·' + it.scope : 'CMD·' + it.scope;
-    row.onmousedown = e => { e.preventDefault(); pickSlash(i); };
-    row.onmouseenter = () => { slashSel = i; renderSlash(); };
-    slashMenu.appendChild(row);
+function setupSlash(textarea, menu) {
+  let matches = [], sel = 0;
+  const query = () => {
+    const v = textarea.value;
+    const m = /^\/([\w-]*)$/.exec(v.slice(0, textarea.selectionStart));
+    return v.startsWith('/') && m ? m[1] : null;
+  };
+  const hide = () => { menu.classList.add('hidden'); matches = []; };
+  function render() {
+    const q = query();
+    if (q === null || !slashItems.length) { hide(); return; }
+    matches = slashItems.filter(i => i.name.toLowerCase().includes(q.toLowerCase())).slice(0, 12);
+    if (!matches.length) { hide(); return; }
+    sel = Math.min(sel, matches.length - 1);
+    menu.innerHTML = '';
+    matches.forEach((it, i) => {
+      const row = document.createElement('div');
+      row.className = 'slash-item' + (i === sel ? ' sel' : '');
+      row.innerHTML = '<span class="slash-name"></span><span class="slash-desc"></span><span class="slash-kind"></span>';
+      row.querySelector('.slash-name').textContent = '/' + it.name;
+      row.querySelector('.slash-desc').textContent = it.description || '';
+      row.querySelector('.slash-kind').textContent = it.type === 'skill' ? 'SKILL·' + it.scope : 'CMD·' + it.scope;
+      row.onmousedown = e => { e.preventDefault(); pick(i); };
+      row.onmouseenter = () => { sel = i; render(); };
+      menu.appendChild(row);
+    });
+    const foot = document.createElement('div');
+    foot.className = 'slash-foot'; foot.textContent = '↑↓ navigate · Tab/Enter select · Esc close';
+    menu.appendChild(foot);
+    menu.classList.remove('hidden');
+    anchorMenu(menu, textarea);
+    const s = menu.querySelector('.slash-item.sel'); if (s) s.scrollIntoView({ block: 'nearest' });
+  }
+  function pick(i) {
+    const it = matches[i]; if (!it) return;
+    textarea.value = '/' + it.name + ' ' + textarea.value.replace(/^\/[\w-]*\s*/, '');
+    const pos = it.name.length + 2; textarea.setSelectionRange(pos, pos); hide(); textarea.focus();
+  }
+  textarea.addEventListener('input', () => { sel = 0; render(); });
+  textarea.addEventListener('blur', () => setTimeout(hide, 150));
+  textarea.addEventListener('keydown', e => {
+    if (menu.classList.contains('hidden')) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); sel = (sel + 1) % matches.length; render(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); sel = (sel - 1 + matches.length) % matches.length; render(); }
+    else if (e.key === 'Tab' || (e.key === 'Enter' && !e.ctrlKey)) { e.preventDefault(); pick(sel); }
+    else if (e.key === 'Escape') { e.stopPropagation(); hide(); }
   });
-  const foot = document.createElement('div');
-  foot.className = 'slash-foot';
-  foot.textContent = '↑↓ navigate · Tab/Enter select · Esc close';
-  slashMenu.appendChild(foot);
-
-  // sit right above the input, inside the chatbox
-  const box = chatInput.closest('.chatbox');
-  slashMenu.style.bottom = (box.clientHeight - chatInput.offsetTop + 6) + 'px';
-  slashMenu.classList.remove('hidden');
-  const sel = slashMenu.querySelector('.slash-item.sel');
-  if (sel) sel.scrollIntoView({ block: 'nearest' });
 }
-
-function pickSlash(i) {
-  const it = slashMatches[i];
-  if (!it) return;
-  chatInput.value = '/' + it.name + ' ' + chatInput.value.replace(/^\/[\w-]*\s*/, '');
-  const pos = it.name.length + 2;
-  chatInput.setSelectionRange(pos, pos);
-  hideSlash();
-  chatInput.focus();
-}
-
-chatInput.addEventListener('input', () => { slashSel = 0; renderSlash(); });
-chatInput.addEventListener('blur', () => setTimeout(hideSlash, 150));
-chatInput.addEventListener('keydown', e => {
-  if (slashMenu.classList.contains('hidden')) return;
-  if (e.key === 'ArrowDown') { e.preventDefault(); slashSel = (slashSel + 1) % slashMatches.length; renderSlash(); }
-  else if (e.key === 'ArrowUp') { e.preventDefault(); slashSel = (slashSel - 1 + slashMatches.length) % slashMatches.length; renderSlash(); }
-  else if (e.key === 'Tab' || (e.key === 'Enter' && !e.ctrlKey)) { e.preventDefault(); pickSlash(slashSel); }
-  else if (e.key === 'Escape') { e.stopPropagation(); hideSlash(); }
-});
+setupSlash(chatInput, document.getElementById('slash-menu'));
 
 // a leading /name becomes an explicit directive so the Prompt Engineer (or the
 // single agent) loads that skill/command and builds its output around it
@@ -1189,6 +1290,161 @@ document.getElementById('chat-input').addEventListener('keydown', e => {
   if (e.ctrlKey && e.key === 'Enter') sendChat();
 });
 
+// ===== @ file navigator — browse folders → files, arrow keys + Enter =====
+// Attaches to a textarea + a menu element. The path lives in the "@token" text,
+// so typing filters and Enter descends folders until you pick a file.
+// place a dropdown relative to a textarea: for a SHORT input, above it; for a
+// TALL textarea, overlay just under its top edge growing down (so it never spills
+// off the top of the container, which is what made it cramped in the wide modal).
+function anchorMenu(menu, textarea) {
+  const box = menu.offsetParent || textarea.parentElement;
+  if (!box || !box.contains(textarea)) return;
+  if (textarea.offsetHeight > 160) {
+    menu.style.top = (textarea.offsetTop + 4) + 'px';
+    menu.style.bottom = 'auto';
+    menu.style.maxHeight = Math.min(300, textarea.offsetHeight - 20) + 'px';
+  } else {
+    menu.style.bottom = (box.clientHeight - textarea.offsetTop + 6) + 'px';
+    menu.style.top = 'auto';
+    menu.style.maxHeight = '';
+  }
+}
+
+function setupMention(textarea, menu) {
+  let items = [], sel = 0, tokenStart = -1, open = false;
+
+  function tokenBeforeCaret() {
+    const before = textarea.value.slice(0, textarea.selectionStart);
+    const m = /(^|\s)@([^\s@]*)$/.exec(before);   // @ then non-space path
+    return m ? { start: textarea.selectionStart - m[2].length - 1, rel: m[2] } : null;
+  }
+  function hide() { open = false; menu.classList.add('hidden'); }
+  function positionMenu() { anchorMenu(menu, textarea); }
+
+  async function refresh() {
+    const tok = tokenBeforeCaret();
+    if (!tok) { hide(); return; }
+    const root = projectDir || gitRepo;
+    if (!root) {
+      menu.innerHTML = '<div class="mention-head">import a project first (AGENT tab → ⇩ IMPORT)</div>';
+      open = true; menu.classList.remove('hidden'); positionMenu();
+      return;
+    }
+    const slash = tok.rel.lastIndexOf('/');
+    const dirRel = slash >= 0 ? tok.rel.slice(0, slash) : '';
+    const query = (slash >= 0 ? tok.rel.slice(slash + 1) : tok.rel).toLowerCase();
+    const dir = dirRel ? joinPath(root, dirRel) : root;
+    const r = await window.deck.fsList(root, dir);
+    if (!r.ok) { menu.innerHTML = `<div class="mention-head">${esc(r.error || 'cannot list folder')}</div>`; open = true; menu.classList.remove('hidden'); positionMenu(); return; }
+    let list = r.items.filter(i => i.name !== 'node_modules' && !(i.name.startsWith('.') && i.name !== '.github'));
+    if (query) list = list.filter(i => i.name.toLowerCase().includes(query));
+    list.sort((a, b) => (a.dir !== b.dir ? (a.dir ? -1 : 1) : a.name.localeCompare(b.name)));
+    items = [];
+    if (dirRel) items.push({ up: true, name: '.. (up)', dir: true });
+    items.push(...list.slice(0, 80));
+    tokenStart = tok.start; sel = 0; open = true;
+    render(dirRel);
+  }
+
+  function render(dirRel) {
+    if (!items.length) { hide(); return; }
+    menu.innerHTML = '';
+    const head = document.createElement('div');
+    head.className = 'mention-head';
+    head.textContent = '📂 ' + (dirRel ? '/' + dirRel : '(project root)');
+    menu.appendChild(head);
+    items.forEach((it, i) => {
+      const row = document.createElement('div');
+      row.className = 'mention-item' + (i === sel ? ' sel' : '');
+      row.innerHTML = `<span class="mi-ico">${it.up ? '↑' : it.dir ? '📁' : '📄'}</span><span class="mi-name"></span>${it.dir && !it.up ? '<span class="mi-arrow">›</span>' : ''}`;
+      row.querySelector('.mi-name').textContent = it.name;
+      row.onmousedown = (e) => { e.preventDefault(); sel = i; activate(dirRel); };
+      row.onmouseenter = () => { sel = i; [...menu.querySelectorAll('.mention-item')].forEach((r2, j) => r2.classList.toggle('sel', j === sel)); };
+      menu.appendChild(row);
+    });
+    const foot = document.createElement('div');
+    foot.className = 'mention-foot';
+    foot.textContent = '↑↓ move · Enter open/pick · Esc close';
+    menu.appendChild(foot);
+    menu.classList.remove('hidden');
+    positionMenu();
+    const s = menu.querySelector('.mention-item.sel'); if (s) s.scrollIntoView({ block: 'nearest' });
+  }
+
+  function setToken(newRel, close) {
+    const v = textarea.value;
+    const after = v.slice(textarea.selectionStart);
+    textarea.value = v.slice(0, tokenStart) + '@' + newRel + (close ? ' ' : '') + after;
+    const caret = tokenStart + 1 + newRel.length + (close ? 1 : 0);
+    textarea.setSelectionRange(caret, caret);
+    textarea.focus();
+    if (close) hide(); else refresh();
+  }
+  function activate(dirRel) {
+    const it = items[sel]; if (!it) return;
+    const base = dirRel ? dirRel + '/' : '';
+    if (it.up) { const parent = dirRel.split('/').slice(0, -1).join('/'); setToken(parent ? parent + '/' : '', false); }
+    else if (it.dir) setToken(base + it.name + '/', false);
+    else setToken(base + it.name, true);
+  }
+
+  textarea.addEventListener('input', refresh);
+  textarea.addEventListener('keydown', (e) => {
+    if (!open) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); sel = (sel + 1) % items.length; render(currentDirRel()); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); sel = (sel - 1 + items.length) % items.length; render(currentDirRel()); }
+    else if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); activate(currentDirRel()); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); hide(); }
+  }, true);
+  textarea.addEventListener('blur', () => setTimeout(hide, 150));
+  function currentDirRel() {
+    const tok = tokenBeforeCaret(); if (!tok) return '';
+    const slash = tok.rel.lastIndexOf('/'); return slash >= 0 ? tok.rel.slice(0, slash) : '';
+  }
+}
+setupMention(document.getElementById('chat-input'), document.getElementById('chat-mention'));
+
+// ===== Wide chat composer: same input, roomier view =====
+const chatExpandModal = document.getElementById('chat-expand-modal');
+const cxInput = document.getElementById('cx-input');
+setupMention(cxInput, document.getElementById('cx-mention'));
+setupSlash(cxInput, document.getElementById('cx-slash'));
+enableDrop(cxInput);
+document.getElementById('cx-attach-btn').onclick = () => fileIn.click();
+function openChatExpand() {
+  // mirror target options + current values into the modal
+  const tgt = document.getElementById('chat-target');
+  const cxt = document.getElementById('cx-target');
+  cxt.innerHTML = tgt.innerHTML;
+  cxt.value = tgt.value;
+  document.getElementById('cx-plan').checked = document.getElementById('chat-plan').checked;
+  cxInput.value = chatInput.value;
+  chatExpandModal.classList.remove('hidden');
+  renderAttach();   // show any pending attachments in the modal too
+  cxInput.focus();
+  cxInput.setSelectionRange(cxInput.value.length, cxInput.value.length);
+}
+function closeChatExpand() {
+  chatInput.value = cxInput.value;   // keep the small box in sync on close
+  chatExpandModal.classList.add('hidden');
+}
+document.getElementById('btn-chat-expand').onclick = openChatExpand;
+document.getElementById('cx-close').onclick = closeChatExpand;
+chatExpandModal.addEventListener('click', e => { if (e.target === chatExpandModal) closeChatExpand(); });
+document.getElementById('cx-send').onclick = () => {
+  // push the modal's values into the real controls, then reuse sendChat()
+  document.getElementById('chat-target').value = document.getElementById('cx-target').value;
+  document.getElementById('chat-plan').checked = document.getElementById('cx-plan').checked;
+  chatInput.value = cxInput.value;
+  chatExpandModal.classList.add('hidden');
+  sendChat();
+  cxInput.value = '';
+};
+cxInput.addEventListener('keydown', e => {
+  if (e.ctrlKey && e.key === 'Enter') document.getElementById('cx-send').click();
+  else if (e.key === 'Escape' && document.getElementById('cx-mention').classList.contains('hidden') && document.getElementById('cx-slash').classList.contains('hidden')) closeChatExpand();
+});
+
 document.getElementById('btn-new-session').onclick = () => {
   if (Object.values(rt).some(r => r.running)) { plog('err', 'stop all agents before resetting the session.'); return; }
   clearSession();
@@ -1198,56 +1454,79 @@ document.getElementById('btn-new-session').onclick = () => {
 // ============================================================
 // Follow-up chat modal (per agent, shared session context)
 // ============================================================
-const chatModal = document.getElementById('chat-modal');
-let chatAgentId = null;
+// ===== Per-agent isolated view (GPT-style dock) — replaces the follow-up modal =====
+// Clicking an agent filters the console to that agent's log and docks a composer
+// at the bottom. Watch it work, or follow up right here — no popup.
+const agentDock = document.getElementById('agent-dock');
+const adInput = document.getElementById('ad-input');
+let chatAgentId = null;   // the focused agent (kept name for existing callers)
 
-function openChat(agentId) {
+function openChat(agentId) {   // called by the roster card click
   const a = agents.find(x => x.id === agentId);
   if (!a) return;
   chatAgentId = agentId;
-  document.getElementById('cm-title').textContent = `${ROLE_ICON[a.role] || ROLE_ICON.custom} ${a.name} — FOLLOW-UP`;
-  updateChatModal();
-  // focus the console feed on this agent so its reply is easy to follow
   feedFilter = agentId;
   applyFilter();
-  chatModal.classList.remove('hidden');
-  document.getElementById('cm-input').focus();
+  document.getElementById('ad-avatar').textContent = ROLE_ICON[a.role] || ROLE_ICON.custom;
+  document.getElementById('ad-name').textContent = a.name;
+  agentDock.classList.remove('hidden');
+  document.getElementById('console-feed').classList.add('has-dock');
+  updateChatModal();
+  renderAttach();
+  adInput.focus();
+  // ensure the console surface is what's visible (not editor/terminal)
+  if (typeof showSurface === 'function') showSurface('console');
+}
+function closeAgentView() {
+  chatAgentId = null;
+  feedFilter = null;
+  applyFilter();
+  agentDock.classList.add('hidden');
+  document.getElementById('console-feed').classList.remove('has-dock');
 }
 
+// kept name — called from setRunningUI/ticker/events to refresh the dock header
 function updateChatModal() {
-  if (!chatAgentId) return;
+  if (!chatAgentId || agentDock.classList.contains('hidden')) return;
   const a = agents.find(x => x.id === chatAgentId);
   if (!a) return;
   const r = R(chatAgentId);
   const sess = getSession();
-  document.getElementById('cm-status').innerHTML =
-    `<span class="${r.running ? 'run' : ''}">${r.running ? '● RUNNING — ' + esc(r.status) : '○ IDLE'}</span>` +
-    ` · ${MODEL_LABELS[a.model] || a.model} · session ${sess ? esc(sess.slice(0, 8)) : '(new)'}`;
-  document.getElementById('cm-send').disabled = r.running;
+  document.getElementById('ad-status').innerHTML =
+    `<span class="${r.running ? 'run' : ''}">${r.running ? '● ' + esc(r.status || 'running') : '○ idle'}</span>` +
+    ` · ${MODEL_LABELS[a.model] || a.model} · ${sess ? 'session ' + esc(sess.slice(0, 8)) : 'new session'}`;
+  document.getElementById('ad-send').disabled = r.running;
+  document.getElementById('ad-stop').classList.toggle('hidden', !r.running);
 }
 
-function sendChatModal() {
-  const input = document.getElementById('cm-input');
-  const text = input.value.trim();
+function sendAgentFollowup() {
+  const text = adInput.value.trim();
   if (!text || !chatAgentId || R(chatAgentId).running) return;
-  input.value = '';
-  chatModal.classList.add('hidden');
-  // background learner: follow-ups are the strongest signal — corrections count
-  // against the previous run's model, UI/UX phrasing grows the UI vocabulary
+  // "!" shell like the main box
+  if (text.startsWith('!')) {
+    const cmd = text.slice(1).trim(); if (!cmd) return;
+    adInput.value = '';
+    feedRaw('OPERATOR', 'tool', '$ ' + cmd, '⌨');
+    window.deck.exec(cmd, projectDir || '').then(r => feedRaw('SHELL', r.ok ? 'txt' : 'err', (r.out || '').trim() || '(no output)'));
+    return;
+  }
+  const full = text + attachBlock() + slashDirective(text);
+  adInput.value = '';
   const fa = agents.find(x => x.id === chatAgentId);
   if (fa && fa.role === 'uiux') learnUiWords(text);
   learnMaybeCorrection(chatAgentId, text);
-  // the follow-up modal's whole purpose is continuity — resume the shared
-  // session in place (no fork: forking re-replays the transcript from scratch)
-  runAgent(chatAgentId, text + attachBlock(), false, false, { cont: true });
+  // continuity: resume the shared session in place (no fork)
+  runAgent(chatAgentId, full, false, false, { cont: true });
 }
 
-document.getElementById('cm-send').onclick = sendChatModal;
-document.getElementById('cm-close').onclick = () => chatModal.classList.add('hidden');
-document.getElementById('cm-input').addEventListener('keydown', e => {
-  if (e.ctrlKey && e.key === 'Enter') sendChatModal();
-});
-chatModal.addEventListener('click', e => { if (e.target === chatModal) chatModal.classList.add('hidden'); });
+document.getElementById('ad-send').onclick = sendAgentFollowup;
+document.getElementById('ad-all').onclick = closeAgentView;
+document.getElementById('ad-stop').onclick = () => { if (chatAgentId) stopAgent(chatAgentId); };
+document.getElementById('ad-attach-btn').onclick = () => fileIn.click();
+adInput.addEventListener('keydown', e => { if (e.ctrlKey && e.key === 'Enter') sendAgentFollowup(); });
+setupSlash(adInput, document.getElementById('ad-slash'));
+setupMention(adInput, document.getElementById('ad-mention'));
+enableDrop(adInput);
 
 // ============================================================
 // Modal
@@ -1453,6 +1732,10 @@ document.getElementById('btn-import').onclick = async () => {
   exReset();
   loadSlashItems();   // project skills/commands may differ per project
   plog('info', 'project imported: all agents now work in ' + dir);
+  // build the lexical index in the background so the PE gets pre-ranked files fast
+  window.deck.symbolBuild(dir).then(r => {
+    if (r && r.ok) plog('info', `lexical index built: ${r.files} files ranked for fast Prompt Engineer retrieval.`);
+  }).catch(() => {});
 };
 
 // ============================================================
@@ -1857,20 +2140,24 @@ function parseConflicts(text) {
   return segs;
 }
 
-async function openConflictResolver(relFile) {
+async function openConflictResolver(relFile, opts = {}) {
   const rel = relFile.replace(/"/g, '');
   const abs = joinPath(gitRepo, rel);
   const r = await window.deck.fsRead(gitRepo, abs, shikiTheme());
   if (!r.ok) { toast('✗ cannot read ' + rel + ': ' + r.error, false); return; }
   const segments = parseConflicts(r.content);
   if (!segments.some(s => s.type === 'conflict')) {
+    // no markers — treat as already resolved; advance a PR flow if present
+    if (opts.after) { opts.after(); return; }
     toast('no conflict markers found — opening the file instead', false);
     openFile(abs);
     return;
   }
-  cf = { rel, abs, segments, choices: new Map() };
+  // opts.after: called after this file is saved+staged (PR conflict chaining)
+  // opts.aiRule: extra guidance appended to the AI analyzer prompt
+  cf = { rel, abs, segments, choices: new Map(), after: opts.after || null, aiRule: opts.aiRule || '' };
   document.getElementById('cf-title').textContent = 'RESOLVE CONFLICTS · ' + rel.split('/').pop();
-  document.getElementById('cf-status').textContent = '';
+  document.getElementById('cf-status').textContent = opts.progress || '';
   gitPanel.classList.add('hidden');
   renderConflicts();
   conflictModal.classList.remove('hidden');
@@ -1948,13 +2235,24 @@ document.getElementById('cf-save').onclick = async () => {
   await window.deck.gitCmd(gitRepo, 'resolve', cf.rel);
   btn.textContent = prev;
   toast(`✓ ${cf.rel.split('/').pop()} resolved & staged`);
+  const after = cf.after;
   conflictModal.classList.add('hidden');
   cf = null;
   gitRefresh(); refreshWorkspace();
+  if (after) after();   // PR conflict chain: open the next file / finish
 };
 
-document.getElementById('cf-cancel').onclick = () => { conflictModal.classList.add('hidden'); cf = null; };
-conflictModal.addEventListener('click', e => { if (e.target === conflictModal) { conflictModal.classList.add('hidden'); cf = null; } });
+async function cfCancel() {
+  conflictModal.classList.add('hidden'); cf = null;
+  if (prConflictCtx) {   // abort the merge we started for the PR flow
+    prConflictCtx = null;
+    await window.deck.prAbortMerge(gitRepo);
+    toast('merge aborted — PR not created.', false);
+    gitRefresh(); refreshWorkspace();
+  }
+}
+document.getElementById('cf-cancel').onclick = cfCancel;
+conflictModal.addEventListener('click', e => { if (e.target === conflictModal) cfCancel(); });
 
 // AI pass: an agent reads every conflict and recommends a side per conflict
 document.getElementById('cf-ai').onclick = async () => {
@@ -1967,21 +2265,30 @@ document.getElementById('cf-ai').onclick = async () => {
     `CONFLICT ${i}\n<<< CURRENT (${s.curLabel})\n${s.current.join('\n')}\n=== INCOMING (${s.incLabel})\n${s.incoming.join('\n')}\n>>>`).join('\n\n');
   const status = document.getElementById('cf-status');
   status.textContent = '🤖 analyzing…';
+  const rule = cf.aiRule
+    ? cf.aiRule
+    : 'Pick the side that preserves correct, complete behavior; use BOTH when the two changes are independent and both needed.';
   const prompt = `Merge conflicts in ${cf.rel}. For EACH conflict decide which side to accept. Do not use tools.
+
+DECISION RULE: ${rule}
 
 Output EXACTLY one line per conflict, nothing else:
 CONFLICT <n>: CURRENT | INCOMING | BOTH — <reason, max 12 words>
 
 ${blocks.slice(0, 40000)}`;
+  const applyAuto = !!cf.aiRule;   // PR flow: auto-apply the AI's picks so you can just Save
   runAgent(agent.id, prompt, false, false, {
     fresh: true, model: 'claude-sonnet-5',
     onDone: (result, text) => {
+      if (!cf) return;
       if (result !== 'success') { status.textContent = 'analysis ' + result; return; }
       cf.reco = {};
       for (const m of text.matchAll(/CONFLICT\s+(\d+)\s*:\s*(CURRENT|INCOMING|BOTH)\s*(?:—|-)?\s*(.*)/gi)) {
-        cf.reco[+m[1]] = { pick: m[2].toUpperCase(), why: (m[3] || '').trim().slice(0, 80) };
+        const idx = +m[1], pick = m[2].toUpperCase();
+        cf.reco[idx] = { pick, why: (m[3] || '').trim().slice(0, 80) };
+        if (applyAuto) cf.choices.set(idx, pick === 'CURRENT' ? 'current' : pick === 'INCOMING' ? 'incoming' : 'both');
       }
-      status.textContent = Object.keys(cf.reco).length ? '🤖 recommendations ready' : 'no recommendations parsed';
+      status.textContent = Object.keys(cf.reco).length ? (applyAuto ? '🤖 applied — review & Save' : '🤖 recommendations ready') : 'no recommendations parsed';
       renderConflicts();
     }
   });
@@ -2515,7 +2822,7 @@ function ghprOpenDetail(pr) {
 
 async function ghprLoadDetail(pr) {
   // diff
-  window.deck.prDiff(gitRepo, pr.number).then(d => {
+  window.deck.prDiff(gitRepo, pr.number, pr.baseRefName, pr.headRefName).then(d => {
     const box = document.getElementById('ghpr-dt-diff');
     if (!d.ok) { box.innerHTML = `<div class="git-none">${esc(d.error)}</div>`; return; }
     renderDiff(box, d.diff);
@@ -2717,7 +3024,7 @@ document.getElementById('ai-start').onclick = async () => {
   if (!a) return;
   if (R(agentId).running) { await showAlert({ title: 'AGENT BUSY', message: `${a.name} is already running.`, okText: 'OK' }); return; }
   const pr = aiState.pr;
-  const d = await window.deck.prDiff(gitRepo, pr.number);
+  const d = await window.deck.prDiff(gitRepo, pr.number, pr.baseRefName, pr.headRefName);
   if (!d.ok || !d.diff.trim()) { await showAlert({ title: 'NO DIFF', message: d.error || 'this PR has no diff.', okText: 'OK' }); return; }
 
   aiSaveChoice();   // remember this agent+model for next time (consistency)
@@ -2871,26 +3178,126 @@ const ghprModal = document.getElementById('ghpr-modal');
 document.getElementById('ghpr-close').onclick = () => ghprModal.classList.add('hidden');
 ghprModal.addEventListener('click', e => { if (e.target === ghprModal) ghprModal.classList.add('hidden'); });
 document.getElementById('ghpr-refresh').onclick = (e) => { e.stopPropagation(); ghprRefresh(); };
+// searchable head-branch picker for the New PR dialog
+let ghprHead = '';   // chosen source branch
+let ghprBranchList = [];   // all branch short-names (local + remote, deduped)
+const ghprHeadMenu = document.getElementById('ghpr-head-menu');
+function ghprRenderHeadList(q) {
+  const list = document.getElementById('ghpr-head-list');
+  list.innerHTML = '';
+  const ql = (q || '').toLowerCase();
+  const hits = ghprBranchList.filter(b => !ql || b.toLowerCase().includes(ql));
+  if (!hits.length) { list.innerHTML = '<div class="git-none">no match</div>'; return; }
+  for (const b of hits.slice(0, 100)) {
+    const row = document.createElement('div');
+    row.className = 'sbranch-item' + (b === ghprHead ? ' sel' : '');
+    row.textContent = b;
+    row.onclick = () => {
+      ghprHead = b;
+      document.getElementById('ghpr-head-btn').textContent = '⎇ ' + b;
+      ghprHeadMenu.classList.add('hidden');
+    };
+    list.appendChild(row);
+  }
+}
+document.getElementById('ghpr-head-btn').onclick = (e) => {
+  e.stopPropagation();
+  const open = ghprHeadMenu.classList.toggle('hidden');
+  if (!open) { const s = document.getElementById('ghpr-head-search'); s.value = ''; ghprRenderHeadList(''); s.focus(); }
+};
+document.getElementById('ghpr-head-search').oninput = (e) => ghprRenderHeadList(e.target.value);
+document.getElementById('ghpr-head-search').onclick = (e) => e.stopPropagation();
+document.addEventListener('click', (e) => { if (!ghprHeadMenu.classList.contains('hidden') && !e.target.closest('.sbranch')) ghprHeadMenu.classList.add('hidden'); });
+
 document.getElementById('ghpr-new').onclick = async (e) => {
   e.stopPropagation();
   const st = await window.deck.gitStatus(gitRepo);
-  document.getElementById('ghpr-branch-note').textContent = st.ok ? `from ${st.branch}` : '';
+  const cur = st.ok ? st.branch : '';
+  // gather every branch (local + remote short names, deduped), current first
+  const b = await window.deck.gitBranches(gitRepo);
+  const seen = new Set(); ghprBranchList = [];
+  const add = n => { if (n && !seen.has(n)) { seen.add(n); ghprBranchList.push(n); } };
+  if (cur) add(cur);
+  for (const l of (b.ok ? b.local : [])) add(l.name);
+  for (const rb of (b.ok ? b.remote : [])) if (!/\/HEAD$|->/.test(rb)) add(rb.replace(/^[^/]+\//, ''));
+  ghprHead = cur;
+  document.getElementById('ghpr-head-btn').textContent = cur ? '⎇ ' + cur : 'select branch…';
+  // base options (everything except the head), default main/master/qa
+  const sel = document.getElementById('ghpr-base-sel');
+  sel.innerHTML = '';
+  for (const name of ghprBranchList.filter(x => x !== cur)) { const o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o); }
+  const def = ghprBranchList.find(x => x === 'main') || ghprBranchList.find(x => x === 'master') || ghprBranchList.find(x => x === 'qa') || sel.options[0]?.value;
+  if (def) sel.value = def;
   document.getElementById('ghpr-title').value = '';
   document.getElementById('ghpr-body').value = '';
-  document.getElementById('ghpr-base').value = '';
+  ghprHeadMenu.classList.add('hidden');
   ghprModal.classList.remove('hidden');
   document.getElementById('ghpr-title').focus();
 };
+// ---- PR conflict resolve flow: merge base→head, resolve, commit+push, create ----
+let prConflictCtx = null;   // { base, head, title, body, files: [] }
+
+function openNextPrConflict() {
+  if (!prConflictCtx) return;
+  if (!prConflictCtx.files.length) { finishPrConflict(); return; }
+  const rel = prConflictCtx.files[0];
+  const n = prConflictCtx.total - prConflictCtx.files.length + 1;
+  openConflictResolver(rel, {
+    progress: `PR conflict ${n}/${prConflictCtx.total} · ${prConflictCtx.head} ← ${prConflictCtx.base}`,
+    aiRule: `This is a MERGE of "${prConflictCtx.base}" (INCOMING/theirs) into "${prConflictCtx.head}" (CURRENT/ours). For each conflict: if it touches OUR intended change on ${prConflictCtx.head}, keep CURRENT (ours win). If it is unrelated to our change (only their base update), take INCOMING (theirs). If both changes are needed and independent, take BOTH.`,
+    after: () => { prConflictCtx.files.shift(); openNextPrConflict(); }
+  });
+}
+
+async function finishPrConflict() {
+  const ctx = prConflictCtx; prConflictCtx = null;
+  toast('conflicts resolved — committing merge & pushing…');
+  const c = await window.deck.gitCmd(gitRepo, 'commit', `Merge ${ctx.base} into ${ctx.head} (resolve conflicts)`);
+  if (!c.ok) { await showAlert({ title: 'MERGE COMMIT FAILED', message: c.out, okText: 'OK' }); return; }
+  const p = await pushOrPublish();
+  if (!p.ok) { await showAlert({ title: 'PUSH FAILED', message: p.out, okText: 'OK' }); return; }
+  const r = await window.deck.prCreate(gitRepo, { title: ctx.title, body: ctx.body, base: ctx.base, head: ctx.head });
+  if (!r.ok) { await showAlert({ title: 'CREATE FAILED', message: r.error || r.out, okText: 'OK' }); return; }
+  toast(`✓ resolved + pushed + PR created: ${ctx.head} → ${ctx.base}`);
+  gitRefresh(); ghprRefresh(); refreshWorkspace();
+}
+
 document.getElementById('ghpr-create-btn').onclick = async () => {
   const title = document.getElementById('ghpr-title').value.trim();
+  if (!ghprHead) { await showAlert({ title: 'PICK A BRANCH', message: 'Choose the source branch to open the PR from.', okText: 'OK' }); return; }
   if (!title) { document.getElementById('ghpr-title').focus(); return; }
   const body = document.getElementById('ghpr-body').value;
-  const base = document.getElementById('ghpr-base').value.trim();
+  const base = document.getElementById('ghpr-base-sel').value;
   const btn = document.getElementById('ghpr-create-btn');
-  btn.disabled = true; btn.textContent = 'creating…';
-  const r = await window.deck.prCreate(gitRepo, { title, body, base });
+  btn.disabled = true; btn.textContent = 'checking conflicts…';
+  const chk = await window.deck.prConflictCheck(gitRepo, base, ghprHead);
+  if (chk.ok && chk.conflict) {
+    btn.disabled = false; btn.textContent = 'Create PR';
+    const proceed = await showAlert({
+      title: 'MERGE CONFLICTS',
+      message: `This PR (${ghprHead} → ${base}) has merge conflicts in ${chk.files.length} file(s). Merge ${base} into ${ghprHead} now so you can resolve them (AI or manual), then it auto-commits, pushes, and creates the PR.`,
+      okText: 'RESOLVE NOW', cancelText: 'CANCEL', kind: 'warn',
+      work: () => window.deck.prStartMerge(gitRepo, base, ghprHead)
+    });
+    if (proceed === false) return;
+    if (!proceed || !proceed.ok) { toast('✗ ' + ((proceed && proceed.error) || 'could not start the merge'), false); return; }
+    ghprModal.classList.add('hidden');
+    if (!proceed.conflict) {   // merged clean unexpectedly — just commit/push/create
+      prConflictCtx = { base, head: ghprHead, title, body, files: [], total: 0 };
+      finishPrConflict();
+    } else {
+      prConflictCtx = { base, head: ghprHead, title, body, files: proceed.files.slice(), total: proceed.files.length };
+      plog('info', `PR conflicts: ${proceed.files.length} file(s) to resolve, then commit + push + create.`);
+      openNextPrConflict();
+    }
+    return;
+  }
+  // no conflict → create directly
+  btn.textContent = 'creating…';
+  const r = await window.deck.prCreate(gitRepo, { title, body, base, head: ghprHead });
   btn.disabled = false; btn.textContent = 'Create PR';
   if (!r.ok) { await showAlert({ title: 'CREATE FAILED', message: r.error || r.out, okText: 'OK' }); return; }
+  toast(`✓ PR created: ${ghprHead} → ${base}`);
   ghprModal.classList.add('hidden');
   ghprRefresh();
 };
@@ -3216,6 +3623,35 @@ function cmtStepMark(step, cls) {
   if (el) el.className = 'cmt-step ' + (cls || '');
 }
 
+// pull a diff to feed the message/PR generators (staged first, else all changes)
+async function cmtChangeDiff() {
+  let d = await window.deck.gitDiff(gitRepo, { staged: true });
+  if (d.ok && d.diff && d.diff.trim()) return d.diff;
+  d = await window.deck.gitDiff(gitRepo, {});
+  return (d.ok && d.diff) ? d.diff : '';
+}
+
+// ✨ generate a concise commit message from the diff (Haiku)
+async function cmtGenMessage() {
+  const btn = cmtEl('cmt-gen-msg');
+  const overlay = cmtEl('cmt-gen-overlay');
+  const prev = btn.textContent; btn.disabled = true; btn.textContent = '⏳';
+  overlay.classList.remove('hidden');            // spinner over the input
+  cmtEl('cmt-msg').classList.add('generating');
+  const end = () => { btn.disabled = false; btn.textContent = prev; overlay.classList.add('hidden'); cmtEl('cmt-msg').classList.remove('generating'); };
+  const diff = await cmtChangeDiff();
+  if (!diff.trim()) { end(); cmtEl('cmt-summary').textContent = 'no changes to summarize'; return; }
+  const prompt = `Write a git commit message for this diff. One imperative subject line (<72 chars). If the change is non-trivial, add a blank line then 1-3 short bullet lines. Output ONLY the commit message — no quotes, no preamble.
+
+=== DIFF ===
+${diff.slice(0, 30000)}`;
+  const r = await window.deck.aiGenerate(prompt, 'claude-haiku-4-5-20251001', gitRepo);
+  end();
+  if (r.ok && r.text) cmtEl('cmt-msg').value = r.text.replace(/^["'`]|["'`]$/g, '').trim();
+  else cmtEl('cmt-summary').textContent = '✗ generate failed: ' + (r.error || 'no text');
+}
+document.getElementById('cmt-gen-msg').onclick = cmtGenMessage;
+
 async function openCommitModal(kind) {
   cmt.kind = kind; cmt.running = false; cmt.lastError = ''; cmt.gitEl = null;
   cmt.autoPush = (kind === 'push' || kind === 'sync');
@@ -3226,7 +3662,7 @@ async function openCommitModal(kind) {
   cmtEl('cmt-title').textContent = 'COMMIT · ' + (st.branch || '');
   cmtEl('cmt-summary').textContent = `${fileCount} file(s)${cmt.willStageAll ? ' — will stage all first' : ' staged'}`;
   cmtEl('cmt-msg').value = cmtEl('git-msg').value.trim();
-  cmtEl('cmt-msg').classList.remove('hidden');
+  cmtEl('cmt-msg-block').classList.remove('hidden');
   cmtEl('cmt-pr-row').classList.add('hidden');
   cmtEl('cmt-error-wrap').classList.add('hidden');
   cmtEl('cmt-live-wrap').classList.add('hidden');
@@ -3235,6 +3671,8 @@ async function openCommitModal(kind) {
   cmtSetState('compose');
   cmtModal.classList.remove('hidden');
   cmtEl('cmt-msg').focus();
+  // auto-generate the commit message from the changes when none was typed
+  if (!cmtEl('cmt-msg').value.trim() && kind !== 'amend') cmtGenMessage();
 }
 
 // visible buttons per state
@@ -3361,10 +3799,11 @@ cmtEl('cmt-push').onclick = async () => {
   await cmtPreparePR();
 };
 
-// ===== STEP 3: CREATE PR (pick base branch) =====
+// ===== STEP 3: CREATE PR (pick base branch, AI-written description) =====
 async function cmtPreparePR() {
-  cmtEl('cmt-msg').classList.add('hidden');
-  cmtEl('cmt-pr-title').value = (cmtEl('cmt-msg').value || '').split('\n')[0] || cmt.branch;
+  cmtEl('cmt-msg-block').classList.add('hidden');
+  const msg = cmtEl('cmt-msg').value || '';
+  cmtEl('cmt-pr-title').value = msg.split('\n')[0] || cmt.branch;
   cmtEl('cmt-pr-head').textContent = cmt.branch;
   const sel = cmtEl('cmt-pr-base-sel');
   sel.innerHTML = '<option>loading…</option>';
@@ -3384,11 +3823,50 @@ async function cmtPreparePR() {
   // default base: main → master → qa → first
   const def = bases.find(x => x === 'main') || bases.find(x => x === 'master') || bases.find(x => x === 'qa') || bases[0];
   if (def) sel.value = def;
+  // auto-write the PR description from the branch's changes (editable)
+  cmtGenPRDesc();
 }
+
+// ✨ AI-write the PR description (Haiku). Bug → "Issue:/Fix:", feature → explain.
+async function cmtGenPRDesc() {
+  const status = cmtEl('cmt-desc-status');
+  const box = cmtEl('cmt-pr-desc');
+  // lock the PR inputs + show a spinner overlay while the AI writes
+  const locked = ['cmt-pr-desc', 'cmt-pr-title', 'cmt-pr-base-sel', 'cmt-gen-desc', 'cmt-pr'];
+  const setLocked = on => locked.forEach(id => { const e = cmtEl(id); if (e) e.disabled = on; });
+  setLocked(true);
+  cmtEl('cmt-desc-overlay').classList.remove('hidden');
+  box.classList.add('generating');
+  status.textContent = '';
+  const done = () => { setLocked(false); cmtEl('cmt-desc-overlay').classList.add('hidden'); box.classList.remove('generating'); };
+  const base = cmtEl('cmt-pr-base-sel').value || 'main';
+  // diff of this branch vs the base gives the reviewer-facing change set
+  let d = await window.deck.gitDiff(gitRepo, { commit: `${base}...HEAD` });
+  let diff = (d.ok && d.diff) ? d.diff : '';
+  if (!diff.trim()) diff = await cmtChangeDiff();
+  const prompt = `Write a pull-request description for these changes.
+
+Decide the type from the diff and branch name "${cmt.branch}":
+- If it is a BUG FIX, use EXACTLY this format:
+Issue: <what was broken, 1-2 lines>
+Fix: <what you changed to fix it, 1-2 lines>
+- If it is a FEATURE, do NOT use that format — just explain the feature clearly in 2-4 lines (what it does, how to use it).
+
+Keep it concise. Output ONLY the description, no title, no preamble, no markdown headers.
+
+=== DIFF (${cmt.branch} vs ${base}) ===
+${diff.slice(0, 30000)}`;
+  const r = await window.deck.aiGenerate(prompt, 'claude-haiku-4-5-20251001', gitRepo);
+  done();
+  if (r.ok && r.text) { box.value = r.text.trim(); status.textContent = '✓ AI draft — edit freely'; }
+  else { status.textContent = '✗ ' + (r.error || 'generation failed'); }
+}
+document.getElementById('cmt-gen-desc').onclick = cmtGenPRDesc;
 
 cmtEl('cmt-pr').onclick = async () => {
   if (cmt.running) return;
   const title = cmtEl('cmt-pr-title').value.trim() || cmt.branch;
+  const bodyDesc = cmtEl('cmt-pr-desc').value.trim();
   const base = cmtEl('cmt-pr-base-sel').value;
   if (!base) { cmtLive('✗ pick a base branch', 'err'); return; }
   cmt.running = true;
@@ -3398,7 +3876,7 @@ cmtEl('cmt-pr').onclick = async () => {
   cmt.thinkEl = document.createElement('div'); cmt.thinkEl.className = 'ai-line ai-thinking'; cmt.thinkEl.textContent = '⏳ creating PR';
   cmtEl('cmt-live').appendChild(cmt.thinkEl);
   cmtLive(`$ gh pr create --base ${base} --head ${cmt.branch}`, 'sys');
-  const r = await window.deck.prCreate(gitRepo, { title, body: '', base });
+  const r = await window.deck.prCreate(gitRepo, { title, body: bodyDesc, base });
   if (cmt.thinkEl) { cmt.thinkEl.remove(); cmt.thinkEl = null; }
   cmt.running = false;
   if (!r.ok) {

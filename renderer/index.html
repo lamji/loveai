@@ -39,12 +39,19 @@
 
     <!-- Chatbox (bottom) -->
     <section class="side-block chatbox">
-      <div class="side-title">◈ COMMAND <button id="btn-new-session" class="mini-btn" title="Start a fresh shared session (clears context for all agents)">↺ NEW SESSION</button></div>
+      <div class="side-title">
+        <span class="side-mark">◈</span>
+        <span class="side-actions">
+          <button id="btn-chat-expand" class="mini-btn icon-only" title="Open in a wider view">⛶</button>
+          <button id="btn-new-session" class="mini-btn icon-only" title="Start a fresh shared session (clears context for all agents)">↺</button>
+        </span>
+      </div>
       <select id="chat-target">
         <option value="__pipeline__">⟢ AUTO PIPELINE</option>
       </select>
       <div id="slash-menu" class="slash-menu hidden"></div>
-      <textarea id="chat-input" placeholder="Describe the issue or task... / for skills &amp; commands, ! for shell. Drop images/files here. (Ctrl+Enter)"></textarea>
+      <div id="chat-mention" class="mention-menu hidden"></div>
+      <textarea id="chat-input" placeholder="Describe the issue or task... @ for files, / for skills, ! for shell. Drop images/files here. (Ctrl+Enter)"></textarea>
       <div id="attach-chips" class="attach-chips"></div>
       <label class="plan-toggle" title="Agent reads and plans only — no files are written until you approve with a follow-up">
         <input type="checkbox" id="chat-plan" /> PLAN MODE
@@ -206,6 +213,29 @@
         <div class="empty-ring"></div>
         <div class="empty-title">SYSTEMS NOMINAL</div>
         <div class="empty-sub">Send a command from the panel on the left — the pipeline or a single agent.</div>
+      </div>
+    </div>
+
+    <!-- Docked per-agent composer (GPT-style): the console above shows only this
+         agent's log; follow up right here. No modal. -->
+    <div id="agent-dock" class="agent-dock hidden">
+      <div class="ad-head">
+        <span class="ad-avatar" id="ad-avatar"></span>
+        <span class="ad-name" id="ad-name"></span>
+        <span class="ad-status" id="ad-status"></span>
+        <button id="ad-stop" class="mini-btn hidden" title="Stop">■</button>
+        <button id="ad-all" class="mini-btn" title="Back to all agents">✕ ALL</button>
+      </div>
+      <div class="ad-composer">
+        <div id="ad-slash" class="slash-menu hidden"></div>
+        <div id="ad-mention" class="mention-menu hidden"></div>
+        <textarea id="ad-input" placeholder="Follow up with this agent…  @ files · / skills · ! shell · (Ctrl+Enter)" spellcheck="false"></textarea>
+        <div id="ad-attach" class="attach-chips"></div>
+        <div class="ad-actions">
+          <button id="ad-attach-btn" class="btn" title="Attach files or images">📎</button>
+          <div style="flex:1"></div>
+          <button id="ad-send" class="btn btn-launch">⟢ SEND</button>
+        </div>
       </div>
     </div>
 
@@ -483,10 +513,26 @@
   <!-- Create pull request -->
   <div id="ghpr-modal" class="modal hidden">
     <div class="modal-card">
-      <div class="modal-title">NEW PULL REQUEST <span id="ghpr-branch-note" class="ghpr-note"></span></div>
+      <div class="modal-title">NEW PULL REQUEST</div>
+      <div class="ghpr-branch-row">
+        <div class="ghpr-bf">
+          <label>From (source)</label>
+          <div class="sbranch">
+            <button type="button" class="sbranch-btn" id="ghpr-head-btn">select branch…</button>
+            <div class="sbranch-menu hidden" id="ghpr-head-menu">
+              <input class="branch-search" id="ghpr-head-search" placeholder="🔎 search branch…" spellcheck="false" />
+              <div class="sbranch-list" id="ghpr-head-list"></div>
+            </div>
+          </div>
+        </div>
+        <span class="ghpr-into">→</span>
+        <div class="ghpr-bf">
+          <label>Into (base)</label>
+          <select id="ghpr-base-sel"></select>
+        </div>
+      </div>
       <input id="ghpr-title" class="ask-input" placeholder="Title" spellcheck="false" />
       <textarea id="ghpr-body" class="ghpr-body" placeholder="Description (optional)"></textarea>
-      <input id="ghpr-base" class="ask-input" placeholder="base branch (default: main)" spellcheck="false" />
       <div class="modal-actions">
         <button id="ghpr-close" class="btn">CANCEL</button>
         <button id="ghpr-create-btn" class="btn btn-launch">Create PR</button>
@@ -556,6 +602,27 @@
     </div>
   </div>
 
+  <!-- Wide chat composer -->
+  <div id="chat-expand-modal" class="modal hidden">
+    <div class="modal-card cx-card">
+      <div class="modal-title">◈ COMMAND</div>
+      <div class="cx-row">
+        <select id="cx-target"></select>
+        <label class="plan-toggle"><input type="checkbox" id="cx-plan" /> PLAN MODE</label>
+      </div>
+      <div id="cx-slash" class="slash-menu hidden"></div>
+      <div id="cx-mention" class="mention-menu hidden"></div>
+      <textarea id="cx-input" class="cx-input" placeholder="Describe the issue or task…  @ to reference a file, / for skills, ! for shell. (Ctrl+Enter to send)" spellcheck="false"></textarea>
+      <div id="cx-attach" class="attach-chips"></div>
+      <div class="modal-actions">
+        <button id="cx-attach-btn" class="btn" title="Attach files or images">📎</button>
+        <div style="flex:1"></div>
+        <button id="cx-close" class="btn">CLOSE</button>
+        <button id="cx-send" class="btn btn-launch">⟢ SEND</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Commit → Push → Create PR pipeline (live git process, AI fix on hook fail) -->
   <div id="cmt-modal" class="modal hidden">
     <div class="modal-card cmt-card">
@@ -568,9 +635,24 @@
         <span class="cmt-step" data-step="pr">③ Create PR</span>
       </div>
       <div id="cmt-summary" class="cmt-summary"></div>
-      <textarea id="cmt-msg" placeholder="Commit message" spellcheck="false"></textarea>
+      <div class="cmt-msg-row" id="cmt-msg-block">
+        <div class="cmt-msg-wrap">
+          <textarea id="cmt-msg" placeholder="Commit message" spellcheck="false"></textarea>
+          <div id="cmt-gen-overlay" class="cmt-gen-overlay hidden"><span class="spinner"></span> ✨ AI is writing a commit message…</div>
+        </div>
+        <button id="cmt-gen-msg" class="btn cmt-gen" title="Generate commit message with AI (Haiku)">✨ AI</button>
+      </div>
       <div id="cmt-pr-row" class="cmt-pr-row hidden">
         <input id="cmt-pr-title" class="ask-input" placeholder="Pull request title" spellcheck="false" />
+        <div class="cmt-pr-desc-head">
+          <span>Description</span>
+          <button id="cmt-gen-desc" class="mini-btn">✨ regenerate</button>
+          <span id="cmt-desc-status" class="cf-status"></span>
+        </div>
+        <div class="cmt-desc-wrap">
+          <textarea id="cmt-pr-desc" class="cmt-pr-desc" placeholder="PR description — auto-generated by AI, editable" spellcheck="false"></textarea>
+          <div id="cmt-desc-overlay" class="cmt-gen-overlay hidden"><span class="spinner"></span> 🤖 AI is writing the PR description…</div>
+        </div>
         <div class="cmt-pr-base">
           <span id="cmt-pr-head" class="cmt-pr-head"></span>
           <span>→</span>

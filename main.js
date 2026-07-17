@@ -257,10 +257,113 @@ ipcMain.handle('index-mark', (_e, cwd) => {
     fs.mkdirSync(dir, { recursive: true });
     const fp = projectFingerprint(cwd);
     fs.writeFileSync(path.join(dir, 'fingerprint.json'), JSON.stringify(fp, null, 2), 'utf8');
+    try { buildSymbolIndex(cwd); } catch {}   // keep the lexical index in step
     return true;
   } catch {
     return false;
   }
+});
+
+// ===== Lexical retrieval — symbol index + BM25 (no embeddings, no Python) =====
+// Gives the Prompt Engineer the files most likely involved in an issue up front,
+// so it reads a handful instead of grepping the whole repo. Pure Node, offline.
+const SYMBOL_MAX_BYTES = 400 * 1024;
+const STOP = new Set(['the', 'and', 'for', 'with', 'this', 'that', 'from', 'into', 'when', 'then', 'not', 'but', 'you', 'are', 'was', 'will', 'add', 'fix', 'use', 'get', 'set', 'new', 'now', 'has', 'have', 'should', 'need', 'want', 'make', 'change', 'update', 'issue', 'bug', 'feature', 'file', 'code', 'function', 'const', 'let', 'var', 'return', 'import', 'export']);
+
+function tokenize(s) {
+  return String(s)
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')   // split camelCase
+    .split(/[^A-Za-z0-9]+/)
+    .map(t => t.toLowerCase())
+    .filter(t => t.length >= 3 && t.length <= 40 && !STOP.has(t));
+}
+function extractSymbols(text) {
+  const syms = new Set();
+  const res = [
+    /(?:function|class|interface|type|enum|struct)\s+([A-Za-z_$][\w$]*)/g,
+    /(?:export\s+(?:default\s+)?(?:async\s+)?function\s+)([A-Za-z_$][\w$]*)/g,
+    /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*[=:]/g,
+    /([A-Za-z_$][\w$]*)\s*[:=]\s*(?:async\s*)?\([^)]*\)\s*=>/g,   // arrow fns/methods
+    /\bdef\s+([A-Za-z_][\w]*)/g,          // python
+    /\bfunc\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)/g   // go
+  ];
+  for (const re of res) { let m; while ((m = re.exec(text)) && syms.size < 400) syms.add(m[1]); }
+  return [...syms];
+}
+function buildSymbolIndex(cwd) {
+  const root = cwd || process.env.USERPROFILE;
+  const files = {};
+  let count = 0;
+  (function walk(dir) {
+    if (count >= INDEX_MAX_FILES) return;
+    let entries; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const d of entries) {
+      if (count >= INDEX_MAX_FILES) return;
+      if (d.isDirectory()) { if (!d.name.startsWith('.') && !INDEX_SKIP_DIRS.has(d.name)) walk(path.join(dir, d.name)); continue; }
+      const ext = path.extname(d.name).slice(1).toLowerCase();
+      if (!INDEX_EXTS.has(ext) || ext === 'json') continue;   // json rarely useful to rank
+      const full = path.join(dir, d.name);
+      try {
+        const stat = fs.statSync(full);
+        if (stat.size > SYMBOL_MAX_BYTES) continue;
+        const text = fs.readFileSync(full, 'utf8');
+        const rel = path.relative(root, full).replace(/\\/g, '/');
+        const symbols = extractSymbols(text);
+        const tf = {};
+        const bump = (s, w) => { for (const t of tokenize(s)) tf[t] = (tf[t] || 0) + w; };
+        for (const s of symbols) bump(s, 4);          // symbol names weigh most
+        bump(rel.replace(/[\/.]/g, ' '), 3);          // path + filename
+        const ids = text.match(/[A-Za-z_$][\w$]{2,}/g) || [];
+        let len = 0;
+        for (const id of ids) { for (const t of tokenize(id)) { tf[t] = (tf[t] || 0) + 1; len++; } }
+        files[rel] = { symbols: symbols.slice(0, 30), tf, len: len || 1 };
+        count++;
+      } catch {}
+    }
+  })(root);
+  const lens = Object.values(files).map(f => f.len);
+  const avgLen = lens.length ? lens.reduce((a, b) => a + b, 0) / lens.length : 1;
+  const idx = { built: Date.now(), avgLen, files };
+  const dir = indexDir(cwd);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'symbols.json'), JSON.stringify(idx), 'utf8');
+  return idx;
+}
+function retrieve(idx, query, k) {
+  const qterms = [...new Set(tokenize(query))];
+  if (!qterms.length) return [];
+  const rels = Object.keys(idx.files);
+  const N = rels.length || 1;
+  const df = {}; for (const t of qterms) df[t] = 0;
+  for (const rel of rels) { const tf = idx.files[rel].tf; for (const t of qterms) if (tf[t]) df[t]++; }
+  const k1 = 1.5, b = 0.75;
+  const out = [];
+  for (const rel of rels) {
+    const f = idx.files[rel];
+    let s = 0;
+    for (const t of qterms) {
+      const freq = f.tf[t]; if (!freq) continue;
+      const idf = Math.log(1 + (N - df[t] + 0.5) / (df[t] + 0.5));
+      s += idf * (freq * (k1 + 1)) / (freq + k1 * (1 - b + b * f.len / idx.avgLen));
+    }
+    if (s > 0) out.push({ rel, score: +s.toFixed(2), symbols: f.symbols });
+  }
+  out.sort((a, b2) => b2.score - a.score);
+  return out.slice(0, k || 8);
+}
+
+ipcMain.handle('symbol-build', (_e, cwd) => {
+  try { const idx = buildSymbolIndex(cwd); return { ok: true, files: Object.keys(idx.files).length }; }
+  catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+
+// return the top-ranked files for an issue (builds the index lazily if missing)
+ipcMain.handle('retrieve-context', (_e, { cwd, query, k }) => {
+  try {
+    let idx = readJson(path.join(indexDir(cwd), 'symbols.json'));
+    if (!idx || !idx.files) idx = buildSymbolIndex(cwd);
+    return { ok: true, files: retrieve(idx, query, k || 8) };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e), files: [] }; }
 });
 
 // ===== File explorer (read-only — browse and copy project code) =====
@@ -868,11 +971,12 @@ ipcMain.handle('pr-list', async (_e, repo) => {
   catch { return { ok: false, error: 'could not parse gh output' }; }
 });
 
-ipcMain.handle('pr-create', async (_e, { repo, title, body, base }) => {
+ipcMain.handle('pr-create', async (_e, { repo, title, body, base, head }) => {
   const args = ['pr', 'create', '--title', title || 'update'];
   const bf = bodyFile(body);
   args.push('--body-file', bf);
   if (base) args.push('--base', base);
+  if (head) args.push('--head', head);   // PR from a chosen branch, not just current
   const r = await ghRun(repo, args);
   try { fs.unlinkSync(bf); } catch {}
   return { ok: r.ok, out: (r.out + r.err).trim(), error: r.ok ? null : ghErr(r) };
@@ -888,9 +992,48 @@ ipcMain.handle('pr-review', async (_e, { repo, number, action, body }) => {
   return { ok: r.ok, out: (r.out + r.err).trim(), error: r.ok ? null : ghErr(r) };
 });
 
-ipcMain.handle('pr-diff', async (_e, { repo, number }) => {
+// Would a PR from head→base conflict? Non-destructive check via merge-tree.
+ipcMain.handle('pr-conflict-check', async (_e, { repo, base, head }) => {
+  await git(repo, ['fetch', 'origin', base, head]);
+  // git 2.38+: `merge-tree --write-tree` exits non-zero on conflict and prints
+  // "CONFLICT" lines / conflicted paths after the tree oid
+  const r = await git(repo, ['merge-tree', '--write-tree', `origin/${base}`, `origin/${head}`]);
+  if (r.ok) return { ok: true, conflict: false, files: [] };
+  const files = [...new Set((r.out.match(/CONFLICT[^\n]*?in (\S+)/g) || []).map(l => l.replace(/.*in /, '').trim()))];
+  return { ok: true, conflict: true, files };
+});
+
+// Start resolving: checkout head, merge base in → leaves conflict markers in the
+// working tree so the resolver (and commit/push) can finish it.
+ipcMain.handle('pr-start-merge', async (_e, { repo, base, head }) => {
+  const dirty = await git(repo, ['status', '--porcelain']);
+  if (dirty.ok && dirty.out.trim()) return { ok: false, error: 'Working tree not clean — commit or stash your changes first.' };
+  await git(repo, ['fetch', 'origin', base, head]);
+  const co = await git(repo, ['checkout', head]);
+  if (!co.ok) return { ok: false, error: 'checkout ' + head + ' failed: ' + co.out };
+  const m = await git(repo, ['merge', '--no-ff', '--no-edit', `origin/${base}`]);
+  if (m.ok) return { ok: true, conflict: false, out: m.out };   // merged clean
+  const st = await git(repo, ['diff', '--name-only', '--diff-filter=U']);
+  const files = st.ok ? st.out.split('\n').filter(Boolean) : [];
+  return { ok: true, conflict: true, files, merging: true };
+});
+ipcMain.handle('pr-abort-merge', (_e, repo) => git(repo, ['merge', '--abort']));
+
+ipcMain.handle('pr-diff', async (_e, { repo, number, base, head }) => {
+  // Prefer a LOCAL git diff (base...head) — no GitHub API, so it survives 503s.
+  if (base && head) {
+    const local = await git(repo, ['diff', '--no-color', `origin/${base}...origin/${head}`]);
+    if (local.ok && local.out.trim()) return { ok: true, diff: local.out };
+    // refs might be stale — fetch once, then retry the local diff
+    await git(repo, ['fetch', 'origin', base, head]);
+    const retry = await git(repo, ['diff', '--no-color', `origin/${base}...origin/${head}`]);
+    if (retry.ok && retry.out.trim()) return { ok: true, diff: retry.out };
+  }
+  // fall back to the API via gh
   const r = await ghRun(repo, ['pr', 'diff', String(number)]);
-  return { ok: r.ok, diff: r.out, error: r.ok ? null : ghErr(r) };
+  if (r.ok) return { ok: true, diff: r.out };
+  const e = ghErr(r);
+  return { ok: false, diff: '', error: /HTTP 5\d\d|service unavailable/i.test(r.err + r.out) ? 'GitHub API is down (503) — and the local branches for this PR aren’t fetched. Fetch, then retry.' : e };
 });
 
 // body + threaded comments + review summaries for one PR
@@ -1008,6 +1151,35 @@ ipcMain.handle('agent-stop', (_e, runId) => {
   return true;
 });
 
+// one-shot text generation (commit messages, PR descriptions) — no tools, no
+// events, returns just the text. Cheap + quiet (defaults to Haiku).
+ipcMain.handle('ai-generate', async (_e, { prompt, model, cwd }) => {
+  await sdkReady;
+  try {
+    const opts = {
+      model: model || 'claude-haiku-4-5-20251001',
+      cwd: cwd || process.env.USERPROFILE,
+      permissionMode: 'bypassPermissions',
+      systemPrompt: { type: 'preset', preset: 'claude_code' },
+      settingSources: [],
+      // pure text-gen: forbid ALL tools so it can't try to explore the repo and
+      // burn turns (that caused "reached maximum number of turns"). One-shot.
+      allowedTools: [],
+      maxTurns: 6
+    };
+    if (CLAUDE_EXE) opts.pathToClaudeCodeExecutable = CLAUDE_EXE;
+    let text = '';
+    for await (const msg of query({ prompt, options: opts })) {
+      if (msg.type === 'assistant') {
+        for (const b of msg.message.content || []) if (b.type === 'text') text += b.text;
+      }
+    }
+    return { ok: true, text: text.trim() };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+});
+
 ipcMain.handle('agent-run', async (_e, cfg) => {
   // cfg: { runId, agentId, prompt, model, cwd, rules, permissionMode, resumeSessionId }
   await sdkReady;
@@ -1031,6 +1203,9 @@ ipcMain.handle('agent-run', async (_e, cfg) => {
   };
   // runaway guard: cap agentic turns per run (renderer sets a per-role ceiling)
   if (cfg.maxTurns > 0) options.maxTurns = cfg.maxTurns;
+  // block the Task tool so pipeline agents can't delegate to the PROJECT's own
+  // .claude/agents subagents — they must do the work with our roster themselves
+  if (cfg.noSubagents) options.disallowedTools = ['Task'];
   // packaged app: spawn the unpacked binary, never the one inside app.asar
   if (CLAUDE_EXE) options.pathToClaudeCodeExecutable = CLAUDE_EXE;
   if (Array.isArray(cfg.addDirs) && cfg.addDirs.length) options.additionalDirectories = cfg.addDirs;

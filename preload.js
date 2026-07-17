@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('deck', {
   runAgent: (cfg) => ipcRenderer.invoke('agent-run', cfg),
+  aiGenerate: (prompt, model, cwd) => ipcRenderer.invoke('ai-generate', { prompt, model, cwd }),
   stopAgent: (runId) => ipcRenderer.invoke('agent-stop', runId),
   pickFolder: () => ipcRenderer.invoke('pick-folder'),
   exec: (command, cwd) => ipcRenderer.invoke('exec', { command, cwd }),
@@ -23,7 +24,10 @@ contextBridge.exposeInMainWorld('deck', {
   prCreate: (repo, data) => ipcRenderer.invoke('pr-create', { repo, ...data }),
   prReview: (repo, number, action, body) => ipcRenderer.invoke('pr-review', { repo, number, action, body }),
   prMerge: (repo, number, method) => ipcRenderer.invoke('pr-merge', { repo, number, method }),
-  prDiff: (repo, number) => ipcRenderer.invoke('pr-diff', { repo, number }),
+  prDiff: (repo, number, base, head) => ipcRenderer.invoke('pr-diff', { repo, number, base, head }),
+  prConflictCheck: (repo, base, head) => ipcRenderer.invoke('pr-conflict-check', { repo, base, head }),
+  prStartMerge: (repo, base, head) => ipcRenderer.invoke('pr-start-merge', { repo, base, head }),
+  prAbortMerge: (repo) => ipcRenderer.invoke('pr-abort-merge', repo),
   prView: (repo, number) => ipcRenderer.invoke('pr-view', { repo, number }),
   prComment: (repo, number, body) => ipcRenderer.invoke('pr-comment', { repo, number, body }),
   termStart: (termId, cwd, cols, rows, shell) => ipcRenderer.invoke('term-start', { termId, cwd, cols, rows, shell }),
@@ -48,6 +52,8 @@ contextBridge.exposeInMainWorld('deck', {
   pipelineReset: (cwd) => ipcRenderer.invoke('pipeline-reset', cwd),
   indexStatus: (cwd) => ipcRenderer.invoke('index-status', cwd),
   indexMark: (cwd) => ipcRenderer.invoke('index-mark', cwd),
+  symbolBuild: (cwd) => ipcRenderer.invoke('symbol-build', cwd),
+  retrieveContext: (cwd, query, k) => ipcRenderer.invoke('retrieve-context', { cwd, query, k }),
   authStatus: () => ipcRenderer.invoke('auth-status'),
   planUsage: () => ipcRenderer.invoke('plan-usage'),
   sessionsList: () => ipcRenderer.invoke('sessions-list'),
