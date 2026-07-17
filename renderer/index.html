@@ -42,25 +42,36 @@
       <div class="side-title">
         <span class="side-mark">◈</span>
         <span class="side-actions">
-          <button id="btn-chat-expand" class="mini-btn icon-only" title="Open in a wider view">⛶</button>
-          <button id="btn-new-session" class="mini-btn icon-only" title="Start a fresh shared session (clears context for all agents)">↺</button>
+          <label id="chat-plan-toggle" class="head-pill" data-tip="Plan mode — the agent reads and plans only; nothing is written until you approve">
+            <input type="checkbox" id="chat-plan" />
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+            <span>PLAN</span>
+          </label>
+          <button id="btn-chat-expand" class="mini-btn icon-only" data-tip="Open in a wider view">⛶</button>
+          <button id="btn-new-session" class="mini-btn icon-only" data-tip="Start a fresh shared session (clears context for all agents)">↺</button>
         </span>
       </div>
-      <select id="chat-target">
-        <option value="__pipeline__">⟢ AUTO PIPELINE</option>
-      </select>
-      <div id="slash-menu" class="slash-menu hidden"></div>
-      <div id="chat-mention" class="mention-menu hidden"></div>
-      <textarea id="chat-input" placeholder="Describe the issue or task... @ for files, / for skills, ! for shell. Drop images/files here. (Ctrl+Enter)"></textarea>
-      <div id="attach-chips" class="attach-chips"></div>
-      <label class="plan-toggle" title="Agent reads and plans only — no files are written until you approve with a follow-up">
-        <input type="checkbox" id="chat-plan" /> PLAN MODE
-      </label>
-      <div class="chat-actions">
-        <button id="btn-attach" class="btn" title="Attach files or images">📎</button>
-        <input type="file" id="file-in" multiple hidden />
-        <button id="btn-send" class="btn btn-launch">⟢ SEND</button>
-        <button id="btn-pipeline-stop" class="btn btn-danger hidden" title="Abort pipeline">■ ABORT</button>
+      <div class="composer">
+        <div id="slash-menu" class="slash-menu hidden"></div>
+        <div id="chat-mention" class="mention-menu hidden"></div>
+        <textarea id="chat-input" placeholder="Describe the issue or task…   @ files · / skills · ! shell · ⌃⏎ send"></textarea>
+        <div id="attach-chips" class="attach-chips"></div>
+        <div class="composer-bar">
+          <select id="chat-target" class="composer-target" title="Target">
+            <option value="__pipeline__">⟢ AUTO PIPELINE</option>
+          </select>
+          <button id="btn-attach" class="composer-icon" title="Attach files or images">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <input type="file" id="file-in" multiple hidden />
+          <div class="composer-spacer"></div>
+          <button id="btn-pipeline-stop" class="composer-icon composer-stop hidden" title="Abort pipeline">
+            <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+          </button>
+          <button id="btn-send" class="composer-send" title="Send  (Ctrl+Enter)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+          </button>
+        </div>
       </div>
     </section>
 
@@ -232,15 +243,18 @@
         <button id="ad-stop" class="mini-btn hidden" title="Stop">■</button>
         <button id="ad-all" class="mini-btn" title="Back to all agents">✕ ALL</button>
       </div>
-      <div class="ad-composer">
+      <div class="ad-composer composer">
         <div id="ad-slash" class="slash-menu hidden"></div>
         <div id="ad-mention" class="mention-menu hidden"></div>
-        <textarea id="ad-input" placeholder="Follow up with this agent…  @ files · / skills · ! shell · (Ctrl+Enter)" spellcheck="false"></textarea>
         <div id="ad-attach" class="attach-chips"></div>
-        <div class="ad-actions">
-          <button id="ad-attach-btn" class="btn" title="Attach files or images">📎</button>
-          <div style="flex:1"></div>
-          <button id="ad-send" class="btn btn-launch">⟢ SEND</button>
+        <div class="composer-row">
+          <button id="ad-attach-btn" class="composer-icon" title="Attach files or images">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <textarea id="ad-input" rows="1" placeholder="Follow up with this agent…   @ files · / skills · ! shell" spellcheck="false"></textarea>
+          <button id="ad-send" class="composer-send" title="Send  (Ctrl+Enter)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+          </button>
         </div>
       </div>
     </div>
@@ -718,5 +732,12 @@
   <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
   <script src="../node_modules/@xterm/addon-web-links/lib/addon-web-links.js"></script>
   <script src="app.js"></script>
+  <script src="src/git.js"></script>
+  <script src="src/terminal.js"></script>
+  <script src="src/commit.js"></script>
+  <script src="src/alert.js"></script>
+  <script src="src/settings.js"></script>
+  <script src="src/explorer.js"></script>
+  <script src="src/editor.js"></script>
 </body>
 </html>
