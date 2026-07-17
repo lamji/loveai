@@ -3336,13 +3336,40 @@ function renderTermTabs() {
   for (const t of termTabs) {
     const el = document.createElement('div');
     el.className = 'tv-tab' + (t.id === termActive ? ' active' : '') + (t.dead ? ' dead' : '');
-    el.innerHTML = '<span></span><b title="Close tab">✕</b>';
-    el.querySelector('span').textContent = t.title;
+    el.title = 'double-click or right-click to rename';
+    el.innerHTML = '<span class="tv-tab-name"></span><b title="Close tab">✕</b>';
+    el.querySelector('.tv-tab-name').textContent = t.title;
     el.onclick = () => activateTerm(t.id);
     el.querySelector('b').onclick = e => { e.stopPropagation(); closeTerm(t.id); };
+    el.ondblclick = e => { e.stopPropagation(); renameTermTab(t, el); };
+    el.oncontextmenu = e => { e.preventDefault(); e.stopPropagation(); renameTermTab(t, el); };
     tvTabs.appendChild(el);
   }
   renderConsoleChips();
+}
+
+// inline-rename a terminal tab (right-click or double-click)
+function renameTermTab(t, el) {
+  const nameEl = el.querySelector('.tv-tab-name');
+  if (!nameEl || el.querySelector('.tv-rename')) return;
+  const inp = document.createElement('input');
+  inp.className = 'tv-rename';
+  inp.value = t.title;
+  inp.spellcheck = false;
+  nameEl.replaceWith(inp);
+  inp.focus(); inp.select();
+  let done = false;
+  const commit = (save) => {
+    if (done) return; done = true;
+    if (save) { const v = inp.value.trim(); if (v) t.title = v; }
+    renderTermTabs();
+  };
+  inp.onclick = e => e.stopPropagation();
+  inp.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+  };
+  inp.onblur = () => commit(true);
 }
 
 function activateTerm(id) {
@@ -4415,15 +4442,20 @@ async function exRenderDir(dir, container) {
     const row = document.createElement('div');
     row.className = 'ex-row ' + (item.dir ? 'is-dir' : 'is-file');
     row.title = item.path;
+    row.dataset.path = item.path;
+    row.dataset.dir = item.dir ? '1' : '';
     row.innerHTML = `<span class="ex-caret">${item.dir ? '▸' : ''}</span><span class="ex-ico">${item.dir ? '🗀' : '📄'}</span><span class="ex-name"></span>`;
     row.querySelector('.ex-name').textContent = item.name;
+    row.oncontextmenu = (e) => { e.preventDefault(); exSelect(row, item); exContextMenu(e, item); };
     container.appendChild(row);
 
     if (item.dir) {
       const kids = document.createElement('div');
       kids.className = 'ex-children hidden';
       container.appendChild(kids);
+      row.dataset.kids = '1';
       row.onclick = async () => {
+        exSelect(row, item);
         const collapsed = kids.classList.toggle('hidden');
         row.querySelector('.ex-caret').textContent = collapsed ? '▸' : '▾';
         row.querySelector('.ex-ico').textContent = collapsed ? '🗀' : '🗁';
@@ -4436,12 +4468,96 @@ async function exRenderDir(dir, container) {
       };
     } else {
       row.dataset.file = item.path;
-      row.onclick = () => openFile(item.path);
+      row.onclick = () => { exSelect(row, item); openFile(item.path); };
     }
   }
   markOpenRows();
   decorateExplorer();
 }
+
+// ----- selection + VS Code-style create/rename/delete -----
+let exSelected = null;   // { path, isDir }
+function exSelect(row, item) {
+  exTree.querySelectorAll('.ex-row.sel').forEach(r => r.classList.remove('sel'));
+  if (row) row.classList.add('sel');
+  exSelected = item ? { path: item.path, isDir: item.dir } : null;
+}
+// the folder new items land in: selected folder, or a file's parent, or root
+function exTargetDir() {
+  if (!exSelected) return projectDir;
+  return exSelected.isDir ? exSelected.path : exSelected.path.replace(/[\\/][^\\/]+$/, '');
+}
+function exStartCreate(isDir) {
+  if (!projectDir) { toast('import a project first', false); return; }
+  const dir = exTargetDir();
+  const rel = dir === projectDir ? 'root' : dir.slice(projectDir.length).replace(/^[\\/]/, '').replace(/\\/g, '/');
+  const wrap = document.createElement('div');
+  wrap.className = 'ex-newrow';
+  wrap.innerHTML = `<span class="ex-ico">${isDir ? '🗀' : '📄'}</span><input class="ex-newinput" spellcheck="false" placeholder="${isDir ? 'new folder' : 'new file'} in ${esc(rel)}/…" />`;
+  exTree.prepend(wrap);
+  const inp = wrap.querySelector('.ex-newinput');
+  inp.focus();
+  let done = false;
+  const close = () => { if (!done) { done = true; wrap.remove(); } };
+  inp.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+      const name = inp.value.trim();
+      if (!name) { close(); return; }
+      done = true; wrap.remove();
+      const res = await window.deck.fsCreate(projectDir, dir, name, isDir);
+      if (!res.ok) { toast('✗ ' + res.error, false); return; }
+      toast(`✓ created ${name}`);
+      await exLoad();
+      if (!isDir) openFile(res.path);
+    } else if (e.key === 'Escape') close();
+  });
+  inp.addEventListener('blur', () => setTimeout(close, 120));
+}
+
+// right-click menu
+let exMenu = null;
+function exContextMenu(e, item) {
+  if (exMenu) exMenu.remove();
+  exMenu = document.createElement('div');
+  exMenu.className = 'ex-ctx';
+  const add = (label, fn) => {
+    const it = document.createElement('div'); it.className = 'ex-ctx-item'; it.textContent = label;
+    it.onclick = () => { exMenu.remove(); exMenu = null; fn(); };
+    exMenu.appendChild(it);
+  };
+  add('🗋 New File', () => exStartCreate(false));
+  add('🗀 New Folder', () => exStartCreate(true));
+  const sep = document.createElement('div'); sep.className = 'ex-ctx-sep'; exMenu.appendChild(sep);
+  add('✎ Rename', () => exRename(item));
+  add('🗑 Delete', () => exDelete(item));
+  document.body.appendChild(exMenu);
+  exMenu.style.left = Math.min(e.clientX, window.innerWidth - 180) + 'px';
+  exMenu.style.top = Math.min(e.clientY, window.innerHeight - exMenu.offsetHeight - 8) + 'px';
+}
+document.addEventListener('click', () => { if (exMenu) { exMenu.remove(); exMenu = null; } });
+
+async function exRename(item) {
+  const cur = item.path.split(/[\\/]/).pop();
+  const out = await askText({ title: 'RENAME', value: cur, placeholder: 'new name' });
+  if (!out || out === cur) return;
+  const to = item.path.replace(/[^\\/]+$/, out);
+  const r = await window.deck.fsRename(projectDir, item.path, to);
+  if (!r.ok) { toast('✗ ' + r.error, false); return; }
+  toast(`✓ renamed to ${out}`);
+  await exLoad();
+}
+async function exDelete(item) {
+  const name = item.path.split(/[\\/]/).pop();
+  const ok = await showAlert({ title: 'DELETE', message: `Delete "${name}"${item.dir ? ' and everything in it' : ''}? This can't be undone.`, okText: 'DELETE', cancelText: 'CANCEL', kind: 'danger' });
+  if (!ok) return;
+  const r = await window.deck.fsDelete(projectDir, item.path);
+  if (!r.ok) { toast('✗ ' + r.error, false); return; }
+  toast(`✓ deleted ${name}`);
+  if (exSelected && exSelected.path === item.path) exSelected = null;
+  await exLoad();
+}
+document.getElementById('ex-new-file').onclick = () => exStartCreate(false);
+document.getElementById('ex-new-folder').onclick = () => exStartCreate(true);
 
 async function exLoad() {
   document.getElementById('ex-root').textContent = projectDir || 'no project imported';

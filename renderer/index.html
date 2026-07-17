@@ -69,7 +69,13 @@
     <!-- ===== EXPLORER tab ===== -->
     <div id="tab-explorer" class="side-pane hidden">
       <section class="side-block">
-        <div class="side-title">◈ EXPLORER <button id="ex-refresh" class="mini-btn" title="Refresh tree">↻</button></div>
+        <div class="side-title">◈ EXPLORER
+          <span class="side-actions">
+            <button id="ex-new-file" class="mini-btn icon-only" title="New File">🗋</button>
+            <button id="ex-new-folder" class="mini-btn icon-only" title="New Folder">🗀</button>
+            <button id="ex-refresh" class="mini-btn icon-only" title="Refresh">↻</button>
+          </span>
+        </div>
         <div id="ex-root" class="project-path">no project imported</div>
         <input id="ex-filter" class="ex-filter" placeholder="Filter files in view..." />
       </section>

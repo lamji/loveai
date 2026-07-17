@@ -460,6 +460,49 @@ ipcMain.handle('fs-write', (_e, { root, file, content }) => {
   }
 });
 
+// create a new file or folder (VS Code-style). `rel` may include subfolders,
+// e.g. "components/Button.tsx" — intermediate dirs are created.
+ipcMain.handle('fs-create', (_e, { root, dir, rel, isDir }) => {
+  try {
+    if (!root || !dir || !insideRoot(root, dir)) return { ok: false, error: 'outside the project root' };
+    const clean = String(rel || '').replace(/^[\\/]+|[\\/]+$/g, '').trim();
+    if (!clean) return { ok: false, error: 'name required' };
+    const target = path.join(dir, clean);
+    if (!insideRoot(root, target)) return { ok: false, error: 'outside the project root' };
+    if (fs.existsSync(target)) return { ok: false, error: 'already exists' };
+    if (isDir) {
+      fs.mkdirSync(target, { recursive: true });
+    } else {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, '', 'utf8');
+    }
+    return { ok: true, path: target };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+});
+
+// rename / move (drag or F2)
+ipcMain.handle('fs-rename', (_e, { root, from, to }) => {
+  try {
+    if (!root || !insideRoot(root, from) || !insideRoot(root, to)) return { ok: false, error: 'outside the project root' };
+    if (!fs.existsSync(from)) return { ok: false, error: 'source no longer exists' };
+    if (fs.existsSync(to)) return { ok: false, error: 'target already exists' };
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.renameSync(from, to);
+    return { ok: true, path: to };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+
+// delete a file or folder (recursive)
+ipcMain.handle('fs-delete', (_e, { root, target }) => {
+  try {
+    if (!root || !insideRoot(root, target) || target === root) return { ok: false, error: 'not allowed' };
+    fs.rmSync(target, { recursive: true, force: true });
+    return { ok: true };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+
 // re-highlight on demand as the user edits
 ipcMain.handle('fs-highlight', async (_e, { content, lang, theme }) => {
   await shikiReady;
