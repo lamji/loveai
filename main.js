@@ -35,10 +35,36 @@ function resolveClaudeExecutable() {
   return null;
 }
 const CLAUDE_EXE = resolveClaudeExecutable();
+const saas = require('./auth');
+const config = require('./config');
 
 let win;
 // runId -> { abortController }
 const runs = new Map();
+
+// ===== SaaS deep link (loveai://) — Google OAuth returns through here =====
+// Dev runs (`electron .`) must register exe + args or Windows launches a bare
+// electron; packaged builds also get the registry key from build.protocols.
+if (process.defaultApp) {
+  app.setAsDefaultProtocolClient(config.PROTOCOL, process.execPath,
+    [path.resolve(process.argv[1])]);
+} else {
+  app.setAsDefaultProtocolClient(config.PROTOCOL);
+}
+
+function deepLinkIn(argv) {
+  return (argv || []).find(a => typeof a === 'string' && a.startsWith(config.PROTOCOL + '://'));
+}
+
+// Windows delivers the URL to a SECOND instance's argv — keep one instance and
+// route the link to it.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) app.quit();
+app.on('second-instance', (_e, argv) => {
+  const url = deepLinkIn(argv);
+  if (url) saas.handleDeepLink(url);
+  if (win) { if (win.isMinimized()) win.restore(); win.focus(); }
+});
 
 function createWindow() {
   win = new BrowserWindow({
@@ -58,8 +84,95 @@ function createWindow() {
   win.loadFile('renderer/index.html');
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  saas.init(send);
+  createWindow();
+  // cold start via the protocol link (app wasn't running): URL is in OUR argv
+  const url = deepLinkIn(process.argv);
+  if (url) saas.handleDeepLink(url);
+});
 app.on('window-all-closed', () => app.quit());
+
+// ===== SaaS IPC — Supabase session + per-user data =====
+ipcMain.handle('saas-session', () => saas.getSession());
+ipcMain.handle('saas-login-start', () => saas.startLogin());
+ipcMain.handle('saas-logout', () => saas.logout());
+ipcMain.handle('saas-profile', () => saas.fetchProfile());
+ipcMain.handle('saas-settings-get', () => saas.fetchSettings());
+ipcMain.handle('saas-settings-set', (_e, s) => saas.saveSettings(s));
+ipcMain.handle('saas-roster-get', () => saas.fetchRoster());
+ipcMain.handle('saas-roster-set', (_e, a) => saas.saveRoster(a));
+
+// ===== Skills sync — ~/.claude/skills/<name>/SKILL.md ↔ user_skills table =====
+function userSkillsDir() {
+  return path.join(process.env.USERPROFILE || os.homedir(), '.claude', 'skills');
+}
+
+function snapshotUserSkills() {
+  const out = {};
+  try {
+    const base = userSkillsDir();
+    for (const dir of fs.readdirSync(base)) {
+      const fp = path.join(base, dir, 'SKILL.md');
+      try { out[dir] = fs.readFileSync(fp, 'utf8'); } catch {}
+    }
+  } catch {}
+  return out;
+}
+
+// disk snapshot → cloud (source of truth for deletes: the whole map is replaced)
+ipcMain.handle('saas-skills-push', () => saas.saveSkills(snapshotUserSkills()));
+
+// cloud → disk. Only writes skills MISSING locally (never clobbers local edits —
+// the local copy is pushed right back after edits anyway). Returns what it added.
+ipcMain.handle('saas-skills-pull', async () => {
+  const r = await saas.fetchSkills();
+  if (!r.ok) return r;
+  const added = [];
+  const local = snapshotUserSkills();
+  const remote = r.skills || {};
+  try {
+    for (const [name, content] of Object.entries(remote)) {
+      if (local[name] !== undefined || typeof content !== 'string') continue;
+      if (!/^[\w][\w-]*$/.test(name)) continue;   // path-safe slugs only
+      const dir = path.join(userSkillsDir(), name);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'SKILL.md'), content, 'utf8');
+      added.push(name);
+    }
+  } catch (e) { return { ok: false, error: String(e.message || e) }; }
+  // first sync from this machine: cloud empty but local has skills → seed cloud
+  const localCount = Object.keys(local).length;
+  if (!Object.keys(remote).length && localCount) await saas.saveSkills(local);
+  return { ok: true, added };
+});
+
+// ===== Claude CLI onboarding check — { installed, hasGlobalCli, version, loggedIn }
+// installed counts the SDK-bundled claude.exe too; hasGlobalCli is the real
+// `claude` on PATH (what the setup terminal installs so login works anywhere).
+ipcMain.handle('claude-setup-check', async () => {
+  const version = await new Promise((resolve) => {
+    execFile('claude', ['--version'], { shell: true, timeout: 15000 }, (err, stdout) => {
+      resolve(err ? null : String(stdout).trim());
+    });
+  });
+  const hasGlobalCli = !!version;
+  const installed = hasGlobalCli || !!resolveClaudeExecutable();
+  let loggedIn = false;
+  try {
+    const credPath = path.join(process.env.USERPROFILE || '', '.claude', '.credentials.json');
+    const creds = JSON.parse(fs.readFileSync(credPath, 'utf8')).claudeAiOauth;
+    loggedIn = !!(creds && creds.accessToken);
+  } catch {}
+  if (!loggedIn && hasGlobalCli) {
+    try {
+      const r = await claudeCli(['auth', 'status']);
+      const j = JSON.parse(r.stdout);
+      loggedIn = !!j.loggedIn;
+    } catch {}
+  }
+  return { installed, hasGlobalCli, version, loggedIn };
+});
 
 function send(channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);

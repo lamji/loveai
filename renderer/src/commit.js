@@ -60,11 +60,28 @@ async function openCommitModal(kind) {
   cmtEl('cmt-live-wrap').classList.add('hidden');
   cmtEl('cmt-live').innerHTML = '';
   for (const s of ['commit', 'push', 'pr']) cmtStepMark(s, '');
+  // RESUME — everything already committed (e.g. modal was closed mid-flow):
+  // skip straight to the push step instead of showing an empty commit form
+  const clean = st.ok && !st.staged.length && !st.unstaged.length &&
+    !st.untracked.length && !(st.conflicts || []).length;
+  if (clean && kind !== 'amend' && (st.ahead > 0 || !st.upstream)) {
+    cmtEl('cmt-title').textContent = 'CONTINUE · ' + (st.branch || '');
+    cmtEl('cmt-summary').textContent = st.ahead > 0
+      ? `${st.ahead} unpushed commit(s) on ${st.branch} — continue: push, then create the PR`
+      : `${st.branch} isn't published yet — continue: push, then create the PR`;
+    cmtStepMark('commit', 'done');
+    cmtSetState('committed');
+    cmtModal.classList.remove('hidden');
+    return;
+  }
+  if (clean && kind !== 'amend') {
+    cmtEl('cmt-summary').textContent = 'nothing to commit — working tree clean and pushed';
+  }
   cmtSetState('compose');
   cmtModal.classList.remove('hidden');
   cmtEl('cmt-msg').focus();
   // auto-generate the commit message from the changes when none was typed
-  if (!cmtEl('cmt-msg').value.trim() && kind !== 'amend') cmtGenMessage();
+  if (!cmtEl('cmt-msg').value.trim() && kind !== 'amend' && !clean) cmtGenMessage();
 }
 
 // visible buttons per state
@@ -73,6 +90,10 @@ function cmtSetState(state) {
   const show = (id, on) => cmtEl(id).classList.toggle('hidden', !on);
   const dis = (id, on) => { cmtEl(id).disabled = on; };
   const busy = ['committing', 'pushing', 'fixing', 'creating'].includes(state);
+  // the message editor only matters while composing/fixing the commit itself —
+  // after that it's dead weight (an empty disabled box), so hide it
+  const composing = ['compose', 'error', 'committing', 'fixing'].includes(state);
+  cmtEl('cmt-msg-block').classList.toggle('hidden', !composing);
   cmtEl('cmt-commit').classList.remove('btn-working');
   show('cmt-commit', state === 'compose' || state === 'error');
   show('cmt-push', state === 'committed');
@@ -169,6 +190,8 @@ cmtEl('cmt-commit').onclick = async () => {
 cmtEl('cmt-push').onclick = async () => {
   if (cmt.running) return;
   cmt.running = true;
+  cmtEl('cmt-error-wrap').classList.add('hidden');   // stale commit-step errors
+  cmtEl('cmt-live').innerHTML = '';
   cmtShowLive('PUSH PROCESS');
   cmtStepMark('push', 'active');
   cmtSetState('pushing');
@@ -177,9 +200,8 @@ cmtEl('cmt-push').onclick = async () => {
   if (!r.ok && /no upstream branch|set-upstream/i.test(r.out)) r = await cmtGitStream('publish', cmt.branch || 'HEAD');
   cmt.running = false;
   if (!r.ok) {
+    // the live panel already streamed the full output — no duplicate error pane
     cmt.lastError = r.out || 'push failed';
-    cmtEl('cmt-error').textContent = cmt.lastError;
-    cmtEl('cmt-error-wrap').classList.remove('hidden');
     cmtStepMark('push', 'fail');
     cmtLive('✗ push failed — fix and press Push again', 'err');
     cmtSetState('committed');   // let them retry Push

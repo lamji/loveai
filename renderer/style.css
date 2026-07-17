@@ -967,6 +967,7 @@ body {
 /* ================= Code viewer ================= */
 #viewer {
   flex: 1; min-height: 0;
+  position: relative;   /* anchors the Ctrl+F find bar */
   display: flex; flex-direction: column;
   background: var(--surface-2);
   border: 1px solid var(--stroke); border-radius: 12px;
@@ -1823,3 +1824,199 @@ textarea.dropping { border-color: var(--accent) !important; background: var(--ac
 .tv-pane.hidden { display: none; }
 .tv-pane .xterm { height: 100%; }
 
+
+/* ============================================================
+   SAAS ONBOARDING — full-window gate (Google login → Claude setup)
+   ============================================================ */
+body.onboarding #sidebar,
+body.onboarding #main { visibility: hidden; }
+
+.onboard {
+  position: fixed; inset: 0; z-index: 10000;
+  background: var(--bg);
+  display: flex; align-items: center; justify-content: center;
+}
+.ob-panel {
+  position: relative; z-index: 1;
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  padding: 40px 48px;
+  max-width: 440px; width: 90%;
+}
+.ob-panel-wide { max-width: 860px; width: 92%; }
+.ob-brand { justify-content: center; }
+.ob-title {
+  font-family: var(--mono); letter-spacing: 2px; font-size: 14px;
+  color: var(--fg);
+}
+.ob-sub { color: var(--fg-dim); font-size: 12.5px; text-align: center; }
+.ob-google {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 22px; font-size: 13px; letter-spacing: 1px;
+}
+.ob-err { color: var(--err); font-size: 12px; min-height: 16px; text-align: center; }
+.ob-term {
+  width: 100%; height: 380px;
+  background: var(--editor-bg);
+  border: 1px solid var(--border-hi);
+  border-radius: 8px;
+  padding: 6px;
+  overflow: hidden;
+}
+.ob-term .xterm { height: 100%; }
+.ob-hint { color: var(--fg-dim); font-size: 11.5px; text-align: center; }
+.ob-spinner {
+  width: 28px; height: 28px;
+  border: 3px solid var(--accent-weak);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: ob-spin 0.9s linear infinite;
+}
+@keyframes ob-spin { to { transform: rotate(360deg); } }
+.ob-signout { font-size: 11px; letter-spacing: 1px; opacity: 0.8; }
+.ob-btn-spin {
+  display: inline-block; width: 11px; height: 11px;
+  border: 2px solid rgba(255,255,255,0.25);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  vertical-align: -1px;
+  animation: ob-spin 0.8s linear infinite;
+}
+button[disabled] .ob-btn-spin { opacity: 0.9; }
+
+/* ============================================================
+   COMMIT PIPELINE MODAL — redesigned (header stepper + sections)
+   ============================================================ */
+.cmt-card { width: 720px; max-height: 90vh; display: flex; flex-direction: column; padding: 0; overflow: hidden; }
+
+.cmt-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 18px;
+  padding: 18px 22px 14px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--hover), transparent);
+}
+.cmt-head-text { min-width: 0; }
+.cmt-card .modal-title.cmt-title { margin: 0 0 3px; }
+.cmt-card .cmt-summary { margin: 0; font-family: var(--mono); font-size: 11px; color: var(--fg-dim); }
+
+/* stepper: numbered nodes joined by a track */
+.cmt-steps { display: flex; align-items: center; gap: 0; margin: 0; flex: none; }
+.cmt-step {
+  display: flex; align-items: center; gap: 7px;
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: 1px;
+  color: var(--fg-dim); border: none; padding: 0; text-transform: uppercase;
+}
+.cmt-step i {
+  font-style: normal; display: grid; place-items: center;
+  width: 22px; height: 22px; border-radius: 50%;
+  border: 1.5px solid var(--border-hi); font-size: 10.5px;
+  transition: all 0.25s ease;
+}
+.cmt-step.active { color: var(--accent); }
+.cmt-step.active i {
+  border-color: var(--accent); color: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-weak);
+}
+.cmt-step.done { color: var(--ok); }
+.cmt-step.done i { border-color: var(--ok); background: var(--ok-weak); color: var(--ok); }
+.cmt-step.done i::before { content: "✓"; }
+.cmt-step.done i { font-size: 0; }
+.cmt-step.done i::before { font-size: 11px; }
+.cmt-step.fail { color: var(--err); }
+.cmt-step.fail i { border-color: var(--err); background: var(--err-weak); color: var(--err); }
+.cmt-step.fail i::before { content: "✕"; }
+.cmt-step.fail i { font-size: 0; }
+.cmt-step.fail i::before { font-size: 11px; }
+.cmt-track { width: 26px; height: 1.5px; background: var(--border-hi); margin: 0 8px; flex: none; }
+.cmt-step.done + .cmt-track { background: var(--ok); }
+
+/* body sections */
+.cmt-body { padding: 16px 22px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+.cmt-sec { display: flex; flex-direction: column; gap: 8px; }
+.cmt-sec-label {
+  display: flex; align-items: center; gap: 10px;
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: 1.5px;
+  color: var(--fg-dim); text-transform: uppercase;
+}
+.cmt-sec-label.err { color: var(--err); }
+.cmt-sec-label .mini-btn { opacity: 1; }
+.cmt-gen { margin-left: auto; }
+
+.cmt-msg-wrap { position: relative; }
+.cmt-msg-wrap #cmt-msg { width: 100%; margin: 0; min-height: 84px; }
+
+/* PR section */
+.cmt-pr-base { display: flex; align-items: center; gap: 8px; margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--fg-dim); text-transform: none; letter-spacing: 0; }
+.cmt-pr-into { color: var(--fg-dim); }
+.cmt-pr-desc-head { display: flex; align-items: center; gap: 10px; font-family: var(--mono); font-size: 10.5px; letter-spacing: 1.5px; color: var(--fg-dim); margin: 2px 0 0; }
+.cmt-pr-desc-head .mini-btn { opacity: 1; }
+#cmt-pr-row .ask-input { margin: 0; }
+
+/* error + live: terminal-style panels */
+.cmt-sec-err .cmt-error {
+  margin: 0; max-height: 180px; overflow: auto;
+  background: var(--editor-bg); color: var(--err);
+  border: 1px solid var(--err-line); border-radius: 8px;
+  padding: 10px 12px; font-size: 11.5px; line-height: 1.5;
+}
+.cmt-sec-live #cmt-live {
+  height: 210px; border-radius: 8px;
+  border: 1px solid var(--border-hi); background: var(--editor-bg);
+}
+
+/* footer */
+.cmt-actions { padding: 14px 22px; margin: 0; border-top: 1px solid var(--border); background: linear-gradient(0deg, var(--hover), transparent); }
+.cmt-actions-spacer { flex: 1; }
+
+/* ============================================================
+   FIND IN FILE — floating bar top-right of the editor (Ctrl+F)
+   ============================================================ */
+#vw-find {
+  position: absolute; top: 40px; right: 18px; z-index: 20;
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 7px;
+  background: var(--surface);
+  border: 1px solid var(--border-hi);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+#vw-find.hidden { display: none; }
+#vwf-input {
+  width: 190px; padding: 4px 8px;
+  background: var(--editor-bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 5px;
+  font-family: var(--mono); font-size: 12px;
+}
+#vwf-input:focus { outline: none; border-color: var(--accent); }
+#vwf-count {
+  font-family: var(--mono); font-size: 10.5px; color: var(--fg-dim);
+  min-width: 46px; text-align: center;
+}
+#vwf-count.none { color: var(--err); }
+.vwf-btn {
+  padding: 3px 7px; font-size: 11px; line-height: 1;
+  background: transparent; color: var(--fg-dim);
+  border: 1px solid transparent; border-radius: 5px; cursor: pointer;
+  font-family: var(--mono);
+}
+.vwf-btn:hover { background: var(--hover); color: var(--fg); }
+.vwf-btn.on { color: var(--accent); border-color: var(--accent-line); background: var(--accent-weak); }
+
+/* find-match highlight layer — sits between code colours and the textarea */
+.vw-marks {
+  position: absolute; inset: 0; z-index: 1;
+  color: transparent; pointer-events: none;
+}
+.vw-marks mark {
+  color: transparent;
+  background: rgba(255, 200, 60, 0.28);        /* all matches */
+  border-radius: 2px;
+  outline: 1px solid rgba(255, 200, 60, 0.35);
+}
+.vw-marks mark.cur {
+  background: rgba(255, 150, 40, 0.55);        /* current match */
+  outline: 1px solid rgba(255, 170, 60, 0.9);
+}
+:root[data-theme="light"] .vw-marks mark { background: rgba(255, 213, 0, 0.35); outline-color: rgba(200, 160, 0, 0.5); }
+:root[data-theme="light"] .vw-marks mark.cur { background: rgba(255, 160, 0, 0.5); outline-color: rgba(220, 120, 0, 0.9); }
+/* keep caret + selection above the marks layer */
+.vw-input { z-index: 2; }

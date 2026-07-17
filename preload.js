@@ -71,5 +71,17 @@ contextBridge.exposeInMainWorld('deck', {
   fileToPath: (file) => { try { return webUtils.getPathForFile(file); } catch { return file.path || null; } },
   clipboardRead: () => ipcRenderer.invoke('clipboard-read'),
   clipboardWrite: (text) => ipcRenderer.invoke('clipboard-write', text),
-  onAgentEvent: (cb) => ipcRenderer.on('agent-event', (_e, payload) => cb(payload))
+  onAgentEvent: (cb) => ipcRenderer.on('agent-event', (_e, payload) => cb(payload)),
+  saasSession: () => ipcRenderer.invoke('saas-session'),
+  saasLoginStart: () => ipcRenderer.invoke('saas-login-start'),
+  saasLogout: () => ipcRenderer.invoke('saas-logout'),
+  saasProfile: () => ipcRenderer.invoke('saas-profile'),
+  saasSettingsGet: () => ipcRenderer.invoke('saas-settings-get'),
+  saasSettingsSet: (s) => ipcRenderer.invoke('saas-settings-set', s),
+  saasRosterGet: () => ipcRenderer.invoke('saas-roster-get'),
+  saasRosterSet: (a) => ipcRenderer.invoke('saas-roster-set', a),
+  saasSkillsPush: () => ipcRenderer.invoke('saas-skills-push'),
+  saasSkillsPull: () => ipcRenderer.invoke('saas-skills-pull'),
+  onAuthChanged: (cb) => ipcRenderer.on('auth-changed', (_e, p) => cb(p)),
+  claudeSetupCheck: () => ipcRenderer.invoke('claude-setup-check')
 });

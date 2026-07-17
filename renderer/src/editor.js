@@ -234,6 +234,174 @@ document.getElementById('vw-close').onclick = () => {
   markOpenRows();
 };
 
+// ============================================================
+// FIND IN FILE — Ctrl+F, VS Code style. Enter = next,
+// Shift+Enter = previous, Esc = close. Aa toggles case.
+// ============================================================
+const findBar = document.createElement('div');
+findBar.id = 'vw-find';
+findBar.className = 'hidden';
+findBar.innerHTML = `
+  <input id="vwf-input" placeholder="Find" spellcheck="false" />
+  <span id="vwf-count">0 / 0</span>
+  <button id="vwf-case" class="vwf-btn" title="Match case">Aa</button>
+  <button id="vwf-prev" class="vwf-btn" title="Previous match (Shift+Enter)">↑</button>
+  <button id="vwf-next" class="vwf-btn" title="Next match (Enter)">↓</button>
+  <button id="vwf-close" class="vwf-btn" title="Close (Esc)">✕</button>`;
+viewer.insertBefore(findBar, document.getElementById('vw-body'));
+
+const vwfInput = document.getElementById('vwf-input');
+const vwfCount = document.getElementById('vwf-count');
+const find = { matches: [], at: -1, caseSensitive: false };
+
+// match-highlight layer: a mirror <pre> between the coloured code and the
+// textarea — transparent text, tinted <mark> boxes exactly under each match
+const vwMarks = document.createElement('pre');
+vwMarks.id = 'vw-marks';
+vwMarks.className = 'vw-code vw-marks';
+vwCode.after(vwMarks);
+
+function findEsc(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function htmlEsc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+function renderFindMarks() {
+  const f = activeF();
+  const qLen = vwfInput.value.length;
+  if (!f || !find.matches.length || !qLen || findBar.classList.contains('hidden')) {
+    vwMarks.innerHTML = '';
+    return;
+  }
+  const t = f.value;
+  let html = '', pos = 0;
+  for (let i = 0; i < find.matches.length; i++) {
+    const s = find.matches[i];
+    html += htmlEsc(t.slice(pos, s));
+    html += `<mark class="${i === find.at ? 'cur' : ''}">${htmlEsc(t.slice(s, s + qLen))}</mark>`;
+    pos = s + qLen;
+  }
+  html += htmlEsc(t.slice(pos));
+  vwMarks.innerHTML = html + EOF_PAD;
+}
+
+function findRun(moveTo = 'nearest') {
+  const f = activeF();
+  const q = vwfInput.value;
+  find.matches = [];
+  if (f && q) {
+    const re = new RegExp(findEsc(q), find.caseSensitive ? 'g' : 'gi');
+    let m;
+    while ((m = re.exec(f.value)) && find.matches.length < 5000) {
+      find.matches.push(m.index);
+      if (m.index === re.lastIndex) re.lastIndex++;   // zero-length guard
+    }
+  }
+  if (!find.matches.length) {
+    find.at = -1;
+    vwfCount.textContent = '0 / 0';
+    vwfCount.classList.toggle('none', !!q);
+    renderFindMarks();
+    return;
+  }
+  vwfCount.classList.remove('none');
+  if (moveTo === 'nearest') {
+    // first match at/after the caret, like VS Code
+    const caret = vwInput.selectionStart || 0;
+    find.at = find.matches.findIndex(i => i >= caret);
+    if (find.at < 0) find.at = 0;
+  } else if (moveTo === 'next') {
+    find.at = (find.at + 1) % find.matches.length;
+  } else if (moveTo === 'prev') {
+    find.at = (find.at - 1 + find.matches.length) % find.matches.length;
+  }
+  findShow();
+}
+
+function findShow() {
+  const f = activeF();
+  if (!f || find.at < 0) return;
+  const start = find.matches[find.at];
+  const len = vwfInput.value.length;
+  vwfCount.textContent = `${find.at + 1} / ${find.matches.length}`;
+  renderFindMarks();
+  // keep the buffer selection on the match too (typing replaces it, like VS Code)
+  vwInput.setSelectionRange(start, start + len);
+  // the textarea itself can't scroll — scroll the surrounding pane so the
+  // current match is on screen (vertically AND horizontally)
+  const before = f.value.slice(0, start);
+  const line = before.split('\n').length - 1;
+  const col = start - (before.lastIndexOf('\n') + 1);
+  const lineH = parseFloat(getComputedStyle(document.getElementById('vw-body')).lineHeight) || 19;
+  const body = document.getElementById('vw-body');
+  const y = line * lineH;
+  if (y < body.scrollTop + lineH || y > body.scrollTop + body.clientHeight - lineH * 2.5) {
+    body.scrollTop = Math.max(0, y - body.clientHeight / 2);
+  }
+  const charW = lineH * 0.47;                    // monospace estimate
+  const x = col * charW;
+  const gutterW = vwGutter.offsetWidth || 0;
+  const viewW = body.clientWidth - gutterW;
+  if (x < body.scrollLeft || x > body.scrollLeft + viewW - 80) {
+    body.scrollLeft = Math.max(0, x - viewW / 3);
+  }
+}
+
+function findOpen() {
+  findBar.classList.remove('hidden');
+  // prefill with the current selection, like VS Code
+  const sel = vwInput.value.slice(vwInput.selectionStart, vwInput.selectionEnd);
+  if (sel && !sel.includes('\n')) vwfInput.value = sel;
+  vwfInput.focus();
+  vwfInput.select();
+  findRun('nearest');
+}
+
+function findClose() {
+  findBar.classList.add('hidden');
+  vwMarks.innerHTML = '';
+  vwInput.focus();
+}
+
+vwfInput.addEventListener('input', () => findRun('nearest'));
+vwfInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' || e.key === 'ArrowDown') { e.preventDefault(); findRun(e.shiftKey ? 'prev' : 'next'); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); findRun('prev'); }
+  else if (e.key === 'Escape') { e.preventDefault(); findClose(); }
+});
+
+// buffer edited while the bar is open → positions moved; re-search in place
+vwInput.addEventListener('input', () => {
+  if (!findBar.classList.contains('hidden')) findRun('nearest');
+});
+document.getElementById('vwf-next').onclick = () => findRun('next');
+document.getElementById('vwf-prev').onclick = () => findRun('prev');
+document.getElementById('vwf-close').onclick = findClose;
+document.getElementById('vwf-case').onclick = (e) => {
+  find.caseSensitive = !find.caseSensitive;
+  e.currentTarget.classList.toggle('on', find.caseSensitive);
+  findRun('nearest');
+  vwfInput.focus();
+};
+
+// switching files/tabs: re-run the search against the new buffer (or clear)
+const _renderViewer = renderViewer;
+renderViewer = function () {
+  _renderViewer();
+  if (!findBar.classList.contains('hidden')) findRun('nearest');
+  else vwMarks.innerHTML = '';
+};
+
+// Ctrl+F anywhere in the editor pane opens the bar; Esc in the editor closes it
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f' &&
+      !viewer.classList.contains('hidden')) {
+    e.preventDefault();
+    findOpen();
+  } else if (e.key === 'Escape' && !findBar.classList.contains('hidden') &&
+      !viewer.classList.contains('hidden')) {
+    findClose();
+  }
+});
+
 applyTheme();
 renderProject();
 renderUsage();
