@@ -108,6 +108,71 @@ const MODEL_LABELS = {
   'claude-haiku-4-5-20251001': 'HAIKU 4.5',
   'claude-fable-5': 'FABLE 5'
 };
+// Global reasoning-effort setting — applies to the current session and every
+// agent (read inside runAgent(), never per-agent) — see [[chat-composer]].
+// The list of levels comes from Claude itself (the agent SDK reports the
+// current model's supportedEffortLevels): if Claude changes its reasoning
+// options, this dropdown follows. We only attach presentation (icon + blurb);
+// the level VALUES are Claude's. 'auto' is our own "no override" entry — the
+// agent then runs at Claude's own default.
+const EFFORT_AUTO = { value: 'auto', dot: '◇', label: 'EFFORT: AUTO',
+  sub: 'Claude default — model decides' };
+// icon + one-line blurb per known level; unknown/new levels get a generic look
+const EFFORT_META = {
+  low:    { dot: '◔', label: 'LOW',    sub: 'minimal reasoning · fastest' },
+  medium: { dot: '◑', label: 'MEDIUM', sub: 'moderate reasoning' },
+  high:   { dot: '◕', label: 'HIGH',   sub: 'deep reasoning' },
+  xhigh:  { dot: '◉', label: 'XHIGH',  sub: 'deeper — best for coding' },
+  max:    { dot: '●', label: 'MAX',    sub: 'maximum reasoning' },
+};
+function effortMeta(v) {
+  return EFFORT_META[v]
+    || { dot: '◆', label: String(v).toUpperCase(), sub: 'reasoning effort' };
+}
+// fallback used only if the SDK query fails (offline / older CLI)
+const EFFORT_FALLBACK = ['low', 'medium', 'high', 'xhigh', 'max'];
+// built at startup from Claude's reported levels; 'auto' is always first
+let EFFORT_LEVELS = [EFFORT_AUTO,
+  ...EFFORT_FALLBACK.map(v => ({ value: v, ...effortMeta(v) }))];
+// only these are passed to the agent as a real effort override ('auto' is not)
+let EFFORT_VALUES = EFFORT_FALLBACK.slice();
+
+// Claude's level list rarely changes, so we cache it and only re-ask the SDK
+// once a week — spawning the CLI on every launch just to read a static list
+// would be wasteful. Same idea as the CLI caching its model catalog.
+const EFFORT_CACHE_KEY = 'effortLevels.cache';
+const EFFORT_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;   // 7 days
+
+function applyEffortLevels(levels) {
+  EFFORT_VALUES = levels.slice();
+  EFFORT_LEVELS = [EFFORT_AUTO, ...levels.map(v => ({ value: v, ...effortMeta(v) }))];
+}
+
+// Rebuild the list from cache if it's fresh; otherwise re-fetch from Claude
+// and refresh the cache (falling back to the built-in list on any failure).
+async function loadEffortLevels() {
+  try {
+    const c = JSON.parse(localStorage.getItem(EFFORT_CACHE_KEY) || 'null');
+    if (c && Array.isArray(c.levels) && c.levels.length
+        && (Date.now() - c.at) < EFFORT_CACHE_TTL) {
+      applyEffortLevels(c.levels);
+      return;                                        // cache still fresh
+    }
+  } catch { /* bad cache — fall through and re-fetch */ }
+
+  try {
+    const r = await window.deck.effortLevels();
+    if (r && r.ok && Array.isArray(r.levels) && r.levels.length) {
+      applyEffortLevels(r.levels);
+      localStorage.setItem(EFFORT_CACHE_KEY,
+        JSON.stringify({ at: Date.now(), levels: r.levels }));
+    }
+  } catch { /* keep the fallback list */ }
+}
+
+function getEffort() { return localStorage.getItem('effortLevel') || 'auto'; }
+function setEffort(v) { localStorage.setItem('effortLevel', v); }
+
 const TOOL_ICON = {
   Bash: '⌨', PowerShell: '⌨', Read: '📄', Edit: '✏', Write: '✏', MultiEdit: '✏',
   Glob: '🔎', Grep: '🔎', WebSearch: '🌐', WebFetch: '🌐', Task: '🤖', Agent: '🤖', TodoWrite: '☑'
@@ -350,6 +415,112 @@ function ensureModelAgent(model) {
   // expose so renderTargets() can refresh label/menu after repopulating options
   window.refreshTargetMenu = () => { syncLabel(); if (!menu.classList.contains('hidden')) buildMenu(); };
   syncLabel();
+})();
+
+// effort select — persisted globally, mirrored into the wide composer. The
+// native <select> is the data source but hidden; a themed custom dropdown
+// drives it so the popup matches the app theme. Options come from
+// EFFORT_LEVELS (single source of truth) — nothing is hardcoded in the HTML.
+
+// fill an empty <select> from EFFORT_LEVELS so both composers stay in sync
+function populateEffortSelect(sel) {
+  if (!sel || sel.options.length) return;
+  EFFORT_LEVELS.forEach(l => {
+    const o = document.createElement('option');
+    o.value = l.value;
+    o.textContent = `${l.dot} ${l.label}`;
+    sel.appendChild(o);
+  });
+}
+
+// Turn a native <select> into a themed dropdown. Keeps the <select> as the
+// data source (its .value and 'change' events keep working unchanged).
+function enhanceThinkSelect(sel) {
+  if (!sel || sel.classList.contains('enhanced')) return;
+  populateEffortSelect(sel);
+  const opts = Array.from(sel.options);
+  const subFor = v => (EFFORT_LEVELS.find(l => l.value === v) || {}).sub || '';
+  sel.classList.add('enhanced');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'tsel';
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'tsel-btn';
+  if (sel.dataset.tip) btn.dataset.tip = sel.dataset.tip;
+  btn.innerHTML =
+    '<span class="tsel-cur"></span>' +
+    '<span class="tsel-caret">▾</span>';
+
+  const menu = document.createElement('div');
+  menu.className = 'tsel-menu';
+  opts.forEach(o => {
+    const item = document.createElement('div');
+    item.className = 'tsel-opt';
+    item.dataset.value = o.value;
+    const dot = (o.textContent.trim().split(' ')[0]) || '●';
+    const label = o.textContent.replace(dot, '').trim();
+    item.innerHTML =
+      `<span class="tsel-dot">${dot}</span>` +
+      `<span class="tsel-txt"><span>${label}</span>` +
+      `<span class="tsel-sub">${subFor(o.value)}</span></span>` +
+      `<span class="tsel-check">✓</span>`;
+    item.addEventListener('click', () => {
+      sel.value = o.value;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      close();
+    });
+    menu.appendChild(item);
+  });
+
+  function syncLabel() {
+    const cur = opts.find(o => o.value === sel.value) || opts[0];
+    btn.querySelector('.tsel-cur').textContent = cur ? cur.textContent : '';
+    menu.querySelectorAll('.tsel-opt').forEach(el =>
+      el.classList.toggle('sel', el.dataset.value === sel.value));
+  }
+  function close() { wrap.classList.remove('open'); }
+  function open() {
+    syncLabel();
+    // flip upward when the button sits low in the viewport
+    const r = btn.getBoundingClientRect();
+    wrap.classList.toggle('up', r.bottom + 180 > window.innerHeight);
+    wrap.classList.add('open');
+  }
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    wrap.classList.contains('open') ? close() : open();
+  });
+  document.addEventListener('click', e => {
+    if (!wrap.contains(e.target)) close();
+  });
+  // keep the trigger label in sync when .value is set programmatically
+  sel.addEventListener('change', syncLabel);
+  sel._tselSync = syncLabel;
+
+  sel.parentNode.insertBefore(wrap, sel);
+  wrap.appendChild(btn);
+  wrap.appendChild(menu);
+  wrap.appendChild(sel);
+  syncLabel();
+}
+
+(async function initEffortSelect() {
+  const sel = document.getElementById('chat-think');
+  if (!sel) return;
+  await loadEffortLevels();   // pull Claude's supported levels before building
+  // restore the saved choice; if it's no longer a valid level, fall back to auto
+  const saved = getEffort();
+  sel.value = EFFORT_LEVELS.some(l => l.value === saved) ? saved : 'auto';
+  setEffort(sel.value);
+  sel.addEventListener('change', () => {
+    setEffort(sel.value);
+    const cx = document.getElementById('cx-think');
+    if (cx) { cx.value = sel.value; cx._tselSync && cx._tselSync(); }
+  });
+  enhanceThinkSelect(sel);
+  enhanceThinkSelect(document.getElementById('cx-think'));
 })();
 
 
@@ -797,6 +968,10 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   ticker(agentId, 'initializing session...');
   feed(agentId, 'sys', (plan ? 'PLAN ▸ ' : 'TASK ▸ ') + prompt, plan ? '🗺' : '🎯');
   if (model !== a.model) feed(agentId, 'sys', `model routed by complexity → ${MODEL_LABELS[model]}`, '⚖');
+  const effort = getEffort();
+  if (effort !== 'auto') {
+    feed(agentId, 'sys', `reasoning effort → ${effort.toUpperCase()}`, '🧠');
+  }
 
   // point the agent at the project map so it never re-explores the repo.
   // The indexer writes the map, so it never gets the hint itself.
@@ -852,6 +1027,8 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
     model, cwd, rules: effectiveRules(a),
     permissionMode: plan ? 'plan' : a.perm,
     leanContext: !!a.lean,
+    // pass a real Claude effort level only when one is chosen ('auto' = none)
+    effort: EFFORT_VALUES.includes(effort) ? effort : null,
     // pipeline agents must do the work THEMSELVES — never delegate to the
     // project's own .claude/agents subagents (that loops and ignores our roster)
     noSubagents: ['prompt', 'senior', 'uiux', 'reviewer', 'indexer'].includes(a.role),
@@ -1891,6 +2068,9 @@ function openChatExpand() {
   cxt.innerHTML = tgt.innerHTML;
   cxt.value = tgt.value;
   document.getElementById('cx-plan').checked = document.getElementById('chat-plan').checked;
+  const cxt2 = document.getElementById('cx-think');
+  cxt2.value = document.getElementById('chat-think').value;
+  cxt2._tselSync && cxt2._tselSync();
   cxInput.value = chatInput.value;
   chatExpandModal.classList.remove('hidden');
   renderAttach();   // show any pending attachments in the modal too
@@ -1908,6 +2088,10 @@ document.getElementById('cx-send').onclick = () => {
   // push the modal's values into the real controls, then reuse sendChat()
   document.getElementById('chat-target').value = document.getElementById('cx-target').value;
   document.getElementById('chat-plan').checked = document.getElementById('cx-plan').checked;
+  const ct2 = document.getElementById('chat-think');
+  ct2.value = document.getElementById('cx-think').value;
+  ct2._tselSync && ct2._tselSync();
+  setEffort(document.getElementById('cx-think').value);
   chatInput.value = cxInput.value;
   chatExpandModal.classList.add('hidden');
   sendChat();

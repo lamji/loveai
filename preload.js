@@ -64,6 +64,7 @@ contextBridge.exposeInMainWorld('deck', {
   onSymbolUpdated: (cb) => ipcRenderer.on('symbol-updated', (_e, p) => cb(p)),
   retrieveContext: (cwd, query, k, withContent) => ipcRenderer.invoke('retrieve-context', { cwd, query, k, withContent }),
   authStatus: () => ipcRenderer.invoke('auth-status'),
+  effortLevels: () => ipcRenderer.invoke('effort-levels'),
   planUsage: () => ipcRenderer.invoke('plan-usage'),
   sessionsList: () => ipcRenderer.invoke('sessions-list'),
   sessionLoad: (sessionId) => ipcRenderer.invoke('session-load', sessionId),

@@ -93,6 +93,9 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
             <span>PLAN</span>
           </label>
+          <!-- options injected from EFFORT_LEVELS (single source of truth) -->
+          <select id="chat-think" class="think-select"
+            data-tip="Reasoning effort for this session and all agents (Claude effort levels)"></select>
           <button id="btn-chat-expand" class="mini-btn icon-only" data-tip="Open in a wider view">⛶</button>
           <button id="btn-new-session" class="mini-btn icon-only" data-tip="Start a fresh shared session (clears context for all agents)">↺</button>
         </span>
@@ -748,6 +751,8 @@
       <div class="cx-row">
         <select id="cx-target"></select>
         <label class="plan-toggle"><input type="checkbox" id="cx-plan" /> PLAN MODE</label>
+        <!-- options injected from EFFORT_LEVELS (single source of truth) -->
+        <select id="cx-think" class="think-select"></select>
       </div>
       <div id="cx-slash" class="slash-menu hidden"></div>
       <div id="cx-mention" class="mention-menu hidden"></div>

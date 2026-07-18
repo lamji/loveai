@@ -248,6 +248,62 @@ body {
 .head-pill:hover { color: var(--fg); border-color: var(--stroke-hi); }
 .head-pill:has(input:checked) { background: var(--accent-weak); border-color: var(--accent); color: var(--accent); }
 
+/* thinking-level dropdown — sits beside the PLAN pill, same compact shape */
+.think-select {
+  height: 24px; padding: 0 8px; margin-right: 2px;
+  background: transparent; color: var(--fg-dim);
+  border: 1px solid var(--accent-line); border-radius: 999px;
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: .5px;
+  cursor: pointer; max-width: 118px;
+}
+.think-select:hover { color: var(--fg); border-color: var(--stroke-hi); }
+.think-select:focus { outline: none; border-color: var(--accent); }
+
+/* Custom themed think dropdown (replaces the native, unthemeable popup) */
+.think-select.enhanced { display: none; }   /* keep as data source, hide native */
+
+.tsel { position: relative; display: inline-block; margin-right: 2px; }
+.tsel-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 24px; padding: 0 10px; max-width: 140px;
+  background: transparent; color: var(--fg-dim);
+  border: 1px solid var(--accent-line); border-radius: 999px;
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: .5px;
+  cursor: pointer; white-space: nowrap;
+}
+.tsel-btn:hover { color: var(--fg); border-color: var(--stroke-hi); }
+.tsel.open .tsel-btn { color: var(--fg); border-color: var(--accent); }
+.tsel-btn .tsel-cur { overflow: hidden; text-overflow: ellipsis; }
+.tsel-btn .tsel-caret { margin-left: auto; opacity: .7; transition: transform .15s; }
+.tsel.open .tsel-btn .tsel-caret { transform: rotate(180deg); }
+
+.tsel-menu {
+  position: absolute; z-index: 700; min-width: 190px;
+  background: var(--surface); color: var(--fg);
+  border: 1px solid var(--border-hi); border-radius: 10px;
+  padding: 5px; margin: 0;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  display: none;
+}
+.tsel.open .tsel-menu { display: block; }
+.tsel.up .tsel-menu { bottom: calc(100% + 6px); }
+.tsel:not(.up) .tsel-menu { top: calc(100% + 6px); }
+
+.tsel-opt {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 9px; border-radius: 7px; cursor: pointer;
+  font-family: var(--mono); font-size: 10px; letter-spacing: .4px;
+  color: var(--fg-dim);
+}
+.tsel-opt:hover { background: var(--accent-weak); color: var(--fg); }
+.tsel-opt .tsel-dot { color: var(--accent); font-size: 11px; width: 12px; text-align: center; }
+.tsel-opt .tsel-txt { display: flex; flex-direction: column; gap: 1px; }
+.tsel-opt .tsel-sub { font-size: 8.5px; color: var(--fg-dim); letter-spacing: .2px; }
+.tsel-opt.sel { background: var(--accent-weak); color: var(--fg); }
+.tsel-opt.sel .tsel-dot { color: var(--accent); }
+.tsel-opt .tsel-check { margin-left: auto; color: var(--accent); opacity: 0; }
+.tsel-opt.sel .tsel-check { opacity: 1; }
+
 /* ===== Themed tooltip (replaces the misaligned native title) ===== */
 #ttip {
   position: fixed; z-index: 600; pointer-events: none;

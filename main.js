@@ -226,6 +226,35 @@ ipcMain.handle('plan-usage', async () => {
   }
 });
 
+// Reasoning-effort options straight from Claude. We ask the agent SDK which
+// effort levels the current model supports (ModelInfo.supportedEffortLevels)
+// so the composer dropdown tracks whatever Claude offers — if Claude changes
+// its reasoning levels, this changes too, with nothing hardcoded here.
+// The input is a never-yielding stream so init happens but no turn runs.
+ipcMain.handle('effort-levels', async () => {
+  await sdkReady;
+  let q;
+  try {
+    const idle = (async function* () { await new Promise(() => {}); })();
+    const opts = { settingSources: ['user', 'project', 'local'] };
+    if (CLAUDE_EXE) opts.pathToClaudeCodeExecutable = CLAUDE_EXE;
+    q = query({ prompt: idle, options: opts });
+    // don't let a stalled init block the composer from rendering its dropdown
+    const timeout = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error('effort-levels timed out')), 8000));
+    const models = await Promise.race([q.supportedModels(), timeout]);
+    // effort levels for the default (first) model that supports effort
+    const withEffort = models.find(m => m.supportsEffort && m.supportedEffortLevels)
+      || models.find(m => m.supportedEffortLevels);
+    const levels = (withEffort && withEffort.supportedEffortLevels) || [];
+    return { ok: true, levels };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  } finally {
+    try { q && q.close(); } catch {}
+  }
+});
+
 ipcMain.handle('auth-logout', async () => {
   const r = await claudeCli(['auth', 'logout']);
   return { ok: r.ok, out: r.stdout + r.stderr };
@@ -1663,6 +1692,13 @@ ipcMain.handle('agent-run', async (_e, cfg) => {
   };
   // runaway guard: cap agentic turns per run (renderer sets a per-role ceiling)
   if (cfg.maxTurns > 0) options.maxTurns = cfg.maxTurns;
+  // reasoning effort — global setting from the composer EFFORT dropdown. These
+  // are Claude's own effort levels (low|medium|high|xhigh|max); omitted when the
+  // user leaves it on AUTO so the model runs at its default. Replaces the old
+  // maxThinkingTokens budget, which the agent SDK now deprecates.
+  const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+  if (cfg.effort && EFFORTS.includes(cfg.effort)) options.effort = cfg.effort;
+  else if (cfg.maxThinkingTokens > 0) options.maxThinkingTokens = cfg.maxThinkingTokens;
   // block the Task tool so pipeline agents can't delegate to the PROJECT's own
   // .claude/agents subagents — they must do the work with our roster themselves
   if (cfg.noSubagents) options.disallowedTools = ['Task'];
