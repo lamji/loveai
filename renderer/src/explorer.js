@@ -139,6 +139,7 @@ async function exRenderDir(dir, container) {
         if (e.ctrlKey || e.metaKey || e.shiftKey) return;   // multi-select click — don't open
         openFile(item.path);
       };
+      exBindDropTarget(row, exDirOf(item.path));   // OS files dropped on a file land beside it
     }
   }
   markOpenRows();
@@ -208,37 +209,114 @@ function exBindDrag(row, item) {
   });
 }
 
+// a row (file or folder) accepts drops from two sources: an in-app move
+// (EX_DRAG_MIME) or an OS file/image dragged in from outside the app
+// ('Files') — hovering either a file or a folder row highlights it as the
+// target; for a file row the target directory is the file's own parent.
 function exBindDropTarget(row, dirPath) {
   row.addEventListener('dragover', (e) => {
-    if (![...e.dataTransfer.types].includes(EX_DRAG_MIME)) return;
+    const types = [...e.dataTransfer.types];
+    const external = types.includes('Files');
+    if (!external && !types.includes(EX_DRAG_MIME)) return;
     e.preventDefault();
     e.stopPropagation();
-    e.dataTransfer.dropEffect = 'move';
+    e.dataTransfer.dropEffect = external ? 'copy' : 'move';
     row.classList.add('drag-over');
   });
   row.addEventListener('dragleave', () => row.classList.remove('drag-over'));
   row.addEventListener('drop', (e) => {
-    if (![...e.dataTransfer.types].includes(EX_DRAG_MIME)) return;
+    const types = [...e.dataTransfer.types];
+    row.classList.remove('drag-over');
+    if (types.includes('Files') && e.dataTransfer.files.length) {
+      e.preventDefault();
+      e.stopPropagation();
+      exImportExternalFiles(e.dataTransfer.files, dirPath);
+      return;
+    }
+    if (!types.includes(EX_DRAG_MIME)) return;
     e.preventDefault();
     e.stopPropagation();
-    row.classList.remove('drag-over');
     let paths; try { paths = JSON.parse(e.dataTransfer.getData(EX_DRAG_MIME)); } catch { return; }
     exMoveItems(paths, dirPath);
   });
 }
 
-// drop on empty tree space (below the last row) — moves to the project root
+// import absolute external path(s) (OS drag or the native file picker) into
+// `targetDir`, refreshing just that folder's already-rendered listing after.
+async function exImportPaths(srcs, targetDir) {
+  if (!srcs || !srcs.length) return 0;
+  let count = 0;
+  for (const src of srcs) {
+    const target = await exUniqueImportTarget(targetDir, exNameOf(src));
+    const r = await window.deck.fsImport(projectDir, src, target);
+    if (!r.ok) { toast(`✗ ${exNameOf(src)}: ${r.error}`, false); continue; }
+    count++;
+  }
+  if (count) {
+    toast(`✓ added ${count} item(s)`);
+    const container = await exResolveCreateContainer(targetDir);
+    await exRenderDir(targetDir, container);
+  }
+  return count;
+}
+
+// OS drag-and-drop of file(s)/folder(s) from outside the app
+async function exImportExternalFiles(fileList, targetDir) {
+  if (!projectDir) { toast('import a project first', false); return; }
+  const srcs = [...fileList].map(f => window.deck.fileToPath(f)).filter(Boolean);
+  await exImportPaths(srcs, targetDir);
+}
+
+// right-click "Add File(s)" / "Add Image(s)" — native picker into the
+// selected folder (or the selected file's parent), same target rule New
+// File/New Folder use.
+async function exAddViaPicker(images) {
+  if (!projectDir) { toast('import a project first', false); return; }
+  const dir = exTargetDir();
+  const srcs = await window.deck.pickFiles(images);
+  await exImportPaths(srcs, dir);
+}
+
+// drop on empty tree space (below the last row) — moves/imports to the project root
 exTree.addEventListener('dragover', (e) => {
-  if (![...e.dataTransfer.types].includes(EX_DRAG_MIME)) return;
+  const types = [...e.dataTransfer.types];
+  if (!types.includes('Files') && !types.includes(EX_DRAG_MIME)) return;
   e.preventDefault();
-  e.dataTransfer.dropEffect = 'move';
+  e.dataTransfer.dropEffect = types.includes('Files') ? 'copy' : 'move';
 });
 exTree.addEventListener('drop', (e) => {
-  if (![...e.dataTransfer.types].includes(EX_DRAG_MIME)) return;
+  const types = [...e.dataTransfer.types];
+  if (types.includes('Files') && e.dataTransfer.files.length) {
+    e.preventDefault();
+    exImportExternalFiles(e.dataTransfer.files, projectDir);
+    return;
+  }
+  if (!types.includes(EX_DRAG_MIME)) return;
   e.preventDefault();
   let paths; try { paths = JSON.parse(e.dataTransfer.getData(EX_DRAG_MIME)); } catch { return; }
   exMoveItems(paths, projectDir);
 });
+
+// dragging an OS file/image over the EXPLORER sidebar tab while another tab
+// is active switches to it automatically (VS Code-style hover-to-activate),
+// so the user can keep dragging straight down into the tree.
+(() => {
+  const tab = document.querySelector('.side-tab[data-tab="explorer"]');
+  if (!tab) return;
+  let timer = null;
+  const cancel = () => { clearTimeout(timer); timer = null; };
+  tab.addEventListener('dragenter', (e) => {
+    if (![...e.dataTransfer.types].includes('Files') || tab.classList.contains('active')) return;
+    e.preventDefault();
+    cancel();
+    timer = setTimeout(() => { tab.click(); cancel(); }, 500);
+  });
+  tab.addEventListener('dragover', (e) => {
+    if ([...e.dataTransfer.types].includes('Files')) e.preventDefault();
+  });
+  tab.addEventListener('dragleave', cancel);
+  tab.addEventListener('drop', cancel);
+})();
 
 // find a row by its exact stored path (not a CSS attribute selector — a raw
 // Windows path has backslashes, which are selector escape characters)
@@ -465,6 +543,22 @@ async function exUniqueTarget(dir, name) {
   while (existing.has(outName)) { outName = `${base} copy ${n}${ext}`; n++; }
   return `${dir}${sep}${outName}`;
 }
+// pick a target path for an IMPORTED item (drag-in / picker): keeps the
+// original name when it's free, only disambiguating on an actual collision —
+// unlike exUniqueTarget above, which always forces a "copy" suffix.
+async function exUniqueImportTarget(dir, name) {
+  const sep = exSepOf(dir) || exSepOf(projectDir) || '/';
+  const listing = await window.deck.fsList(projectDir, dir);
+  const existing = new Set((listing.ok ? listing.items : []).map(i => i.name));
+  if (!existing.has(name)) return `${dir}${sep}${name}`;
+  const dot = name.lastIndexOf('.');
+  const hasExt = dot > 0;
+  const base = hasExt ? name.slice(0, dot) : name;
+  const ext = hasExt ? name.slice(dot) : '';
+  let outName = `${base} (2)${ext}`, n = 3;
+  while (existing.has(outName)) { outName = `${base} (${n})${ext}`; n++; }
+  return `${dir}${sep}${outName}`;
+}
 
 // ----- Copy / Duplicate / Paste (clipboard here is our own, in-app only) -----
 let exClipboard = null;   // { path, isDir }
@@ -511,32 +605,56 @@ function exSendToChat(item) {
   toast(`✓ added @${rel} to chat`);
 }
 
+// stroke-style icon set for the right-click menu (same visual language as the
+// composer's attach/send buttons — 24x24 viewBox, currentColor stroke — so
+// the menu doesn't fall back to the OS's flat monochrome emoji glyphs)
+const EX_CTX_ICONS = {
+  newFile: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/>',
+  newFolder: '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/>',
+  attach: '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+  clipboard: '<path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  cornerUpRight: '<polyline points="15 14 20 9 15 4"/><path d="M4 20v-7a4 4 0 0 1 4-4h12"/>',
+  message: '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>',
+  edit: '<path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
+  trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>',
+};
+function exCtxSvg(name) {
+  return `<svg class="ex-ctx-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${EX_CTX_ICONS[name]}</svg>`;
+}
+
 // right-click menu
 let exMenu = null;
 function exContextMenu(e, item) {
   if (exMenu) exMenu.remove();
   exMenu = document.createElement('div');
   exMenu.className = 'ex-ctx';
-  const add = (label, fn) => {
-    const it = document.createElement('div'); it.className = 'ex-ctx-item'; it.textContent = label;
+  const add = (icon, label, fn) => {
+    const it = document.createElement('div'); it.className = 'ex-ctx-item';
+    it.innerHTML = exCtxSvg(icon) + `<span>${esc(label)}</span>`;
     it.onclick = () => { exMenu.remove(); exMenu = null; fn(); };
     exMenu.appendChild(it);
   };
   const sep = () => { const s = document.createElement('div'); s.className = 'ex-ctx-sep'; exMenu.appendChild(s); };
-  add('🗋 New File', () => exStartCreate(false));
-  add('🗀 New Folder', () => exStartCreate(true));
+  add('newFile', 'New File', () => exStartCreate(false));
+  add('newFolder', 'New Folder', () => exStartCreate(true));
+  add('attach', 'Add File(s)…', () => exAddViaPicker(false));
+  add('image', 'Add Image(s)…', () => exAddViaPicker(true));
   sep();
-  add('⧉ Copy', () => exCopy(item));
-  add('❐ Duplicate', () => exDuplicate(item));
-  if (item.dir && exClipboard) add('📋 Paste', () => exPaste(item));
+  add('copy', 'Copy', () => exCopy(item));
+  add('layers', 'Duplicate', () => exDuplicate(item));
+  if (item.dir && exClipboard) add('clipboard', 'Paste', () => exPaste(item));
   sep();
-  add('⎘ Copy Path', () => exCopyPath(item));
-  add('⎘ Copy Relative Path', () => exCopyRelativePath(item));
+  add('link', 'Copy Path', () => exCopyPath(item));
+  add('cornerUpRight', 'Copy Relative Path', () => exCopyRelativePath(item));
   sep();
-  add('💬 Send to Chat', () => exSendToChat(item));
+  add('message', 'Send to Chat', () => exSendToChat(item));
   sep();
-  add('✎ Rename', () => exRename(item));
-  add('🗑 Delete', () => exDelete(item));
+  add('edit', 'Rename', () => exRename(item));
+  add('trash', 'Delete', () => exDelete(item));
   document.body.appendChild(exMenu);
   exMenu.style.left = Math.min(e.clientX, window.innerWidth - 180) + 'px';
   exMenu.style.top = Math.min(e.clientY, window.innerHeight - exMenu.offsetHeight - 8) + 'px';
@@ -592,7 +710,7 @@ async function refreshWorkspace() {
   exReset();
   let activeChanged = false;
   for (const f of openFiles) {
-    if (f.dirty) continue;
+    if (f.dirty || f.kind === 'image') continue;
     const r = await window.deck.fsRead(projectDir, f.path, shikiTheme());
     if (!r.ok) continue;
     if (r.content !== f.content) {

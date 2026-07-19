@@ -193,6 +193,16 @@ ipcMain.handle('pick-folder', async () => {
   return r.canceled ? null : r.filePaths[0];
 });
 
+// used by Explorer's right-click "Add File(s)" / "Add Image(s)" — imports
+// picked paths the same way an OS drag-and-drop does (see fs-import)
+ipcMain.handle('pick-files', async (_e, { images } = {}) => {
+  const filters = images
+    ? [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico'] }]
+    : undefined;
+  const r = await dialog.showOpenDialog(win, { properties: ['openFile', 'multiSelections'], filters });
+  return r.canceled ? [] : r.filePaths;
+});
+
 function claudeCli(args) {
   return new Promise((resolve) => {
     execFile('claude', args, { shell: true, timeout: 20000 }, (err, stdout, stderr) => {
@@ -846,6 +856,30 @@ ipcMain.handle('fs-read', async (_e, { root, file, theme }) => {
   }
 });
 
+const IMAGE_MIME = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+  '.bmp': 'image/bmp', '.ico': 'image/x-icon', '.avif': 'image/avif',
+  '.apng': 'image/apng', '.tif': 'image/tiff', '.tiff': 'image/tiff'
+};
+
+// read an image as a data URL for Explorer's preview — unlike fs-read, this
+// doesn't assume text and doesn't reject binary content
+ipcMain.handle('fs-read-image', (_e, { root, file }) => {
+  try {
+    if (!root || !file || !insideRoot(root, file)) return { ok: false, error: 'outside the project root' };
+    const stat = fs.statSync(file);
+    if (stat.size > MAX_VIEW_BYTES) {
+      return { ok: false, error: `image is ${(stat.size / 1048576).toFixed(1)} MB — too large to preview (limit 2 MB)` };
+    }
+    const mime = IMAGE_MIME[path.extname(file).toLowerCase()] || 'application/octet-stream';
+    const b64 = fs.readFileSync(file).toString('base64');
+    return { ok: true, dataUrl: `data:${mime};base64,${b64}`, size: stat.size };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+});
+
 ipcMain.handle('fs-write', (_e, { root, file, content }) => {
   try {
     if (!root || !file || !insideRoot(root, file)) return { ok: false, error: 'outside the project root' };
@@ -984,6 +1018,19 @@ ipcMain.handle('fs-copy', (_e, { root, from, to }) => {
   try {
     if (!root || !insideRoot(root, from) || !insideRoot(root, to)) return { ok: false, error: 'outside the project root' };
     if (!fs.existsSync(from)) return { ok: false, error: 'source no longer exists' };
+    if (fs.existsSync(to)) return { ok: false, error: 'target already exists' };
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.cpSync(from, to, { recursive: true });
+    return { ok: true, path: to };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+
+// import a file/folder dragged in from outside the app (OS file drag) — like
+// fs-copy but `from` is expected to live outside the project root
+ipcMain.handle('fs-import', (_e, { root, from, to }) => {
+  try {
+    if (!root || !insideRoot(root, to)) return { ok: false, error: 'outside the project root' };
+    if (!from || !fs.existsSync(from)) return { ok: false, error: 'source no longer exists' };
     if (fs.existsSync(to)) return { ok: false, error: 'target already exists' };
     fs.mkdirSync(path.dirname(to), { recursive: true });
     fs.cpSync(from, to, { recursive: true });

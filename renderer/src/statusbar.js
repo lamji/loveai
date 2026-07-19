@@ -10,13 +10,22 @@ function sbShow(id, on) { const e = document.getElementById(id); if (e) e.classL
 // caret line/column of the active editor file
 function sbLnCol() {
   const f = (typeof activeF === 'function') ? activeF() : null;
-  if (!f || viewer.classList.contains('hidden')) return null;
+  if (!f || f.kind === 'image' || viewer.classList.contains('hidden')) return null;
   const pos = vwInput.selectionStart || 0;
   const before = vwInput.value.slice(0, pos);
   const line = before.split('\n').length;
   const col = pos - (before.lastIndexOf('\n') + 1) + 1;
   const selLen = (vwInput.selectionEnd || 0) - pos;
   return { line, col, lang: f.lang, indent: f.indent, selLen };
+}
+
+// zoom level of whatever's active — image preview scale, or text editor font
+// size expressed as a percentage of its 14px default
+function sbZoomInfo() {
+  const f = (typeof activeF === 'function') ? activeF() : null;
+  if (!f || viewer.classList.contains('hidden')) return null;
+  if (f.kind === 'image') return { pct: f.zoom || 100, image: true };
+  return { pct: Math.round((currentEditorFont() / EDITOR_FONT_DEFAULT) * 100), image: false };
 }
 
 function renderStatusBar() {
@@ -61,6 +70,11 @@ function renderStatusBar() {
   } else {
     sbShow('sb-lncol', false); sbShow('sb-lang', false); sbShow('sb-indent', false);
   }
+
+  // ----- zoom (image preview scale, or editor font size) -----
+  const zoom = sbZoomInfo();
+  if (zoom) { sbShow('sb-zoom', true); sbSet('sb-zoom', zoom.pct + '%'); }
+  else sbShow('sb-zoom', false);
 }
 window.renderStatusBar = renderStatusBar;
 
@@ -199,6 +213,13 @@ document.addEventListener('click', (e) => {
   }
 });
 document.getElementById('sb-lncol').onclick = () => { if (window.paletteGoToLine) window.paletteGoToLine(); };
+document.getElementById('sb-zoom').onclick = () => {
+  const f = (typeof activeF === 'function') ? activeF() : null;
+  if (!f) return;
+  if (f.kind === 'image') { if (typeof resetImageView === 'function') resetImageView(f); }
+  else if (typeof applyEditorFont === 'function') applyEditorFont(EDITOR_FONT_DEFAULT);
+  renderStatusBar();
+};
 document.getElementById('sb-agent').onclick = (e) => {
   const id = e.currentTarget.dataset.agent;
   if (id && typeof openChat === 'function') openChat(id);

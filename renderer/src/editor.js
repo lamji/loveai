@@ -12,11 +12,18 @@ const viewer = document.getElementById('viewer');
 const vwInput = document.getElementById('vw-input');
 const vwCode = document.getElementById('vw-code');
 const vwGutter = document.getElementById('vw-gutter');
+const vwEdit = document.querySelector('.vw-edit');
+const vwImage = document.getElementById('vw-image');
+const vwImageEl = document.getElementById('vw-image-el');
 const openFiles = [];
 let activeFile = null;
 
 function baseName(p) { return p.split(/[\\/]/).pop(); }
 function relPath(p) { return projectDir && p.startsWith(projectDir) ? p.slice(projectDir.length).replace(/^[\\/]/, '') : p; }
+
+// previewed, not edited — no text buffer, no shiki, no dirty tracking
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif|apng|tiff?|jfif)$/i;
+function isImageFile(p) { return IMAGE_EXT_RE.test(p); }
 
 function markOpenRows() {
   exTree.querySelectorAll('.ex-row.is-file').forEach(r => {
@@ -51,17 +58,27 @@ function detectIndent(text) {
 
 async function openFile(path) {
   if (!openFiles.some(f => f.path === path)) {
-    const r = await window.deck.fsRead(projectDir, path, shikiTheme());
-    if (!r.ok) { feedRaw('EXPLORER', 'err', `${baseName(path)}: ${r.error}`, '🗀'); return; }
-    openFiles.push({
-      path, lang: r.lang,
-      content: r.content,          // what's on disk
-      value: r.content,            // what's in the buffer
-      html: shikiInner(r.html),
-      indent: detectIndent(r.content),
-      dirty: false,
-      diskChanged: false
-    });
+    if (isImageFile(path)) {
+      const r = await window.deck.fsReadImage(projectDir, path);
+      if (!r.ok) { feedRaw('EXPLORER', 'err', `${baseName(path)}: ${r.error}`, '🗀'); return; }
+      openFiles.push({
+        path, kind: 'image', dataUrl: r.dataUrl,
+        zoom: 100, panX: 0, panY: 0,
+        dirty: false, diskChanged: false
+      });
+    } else {
+      const r = await window.deck.fsRead(projectDir, path, shikiTheme());
+      if (!r.ok) { feedRaw('EXPLORER', 'err', `${baseName(path)}: ${r.error}`, '🗀'); return; }
+      openFiles.push({
+        path, lang: r.lang,
+        content: r.content,          // what's on disk
+        value: r.content,            // what's in the buffer
+        html: shikiInner(r.html),
+        indent: detectIndent(r.content),
+        dirty: false,
+        diskChanged: false
+      });
+    }
     syncWatchedFiles();
   }
   activeFile = path;
@@ -70,7 +87,7 @@ async function openFile(path) {
   consoleFeed.classList.add('hidden');   // editor takes the editor-area (panel unaffected)
   renderViewer();
   renderConsoleChips();
-  vwInput.focus();
+  if (!isImageFile(path)) vwInput.focus();
 }
 
 async function closeFile(path) {
@@ -101,6 +118,16 @@ function syncWatchedFiles() {
 }
 
 async function reloadFromDisk(f) {
+  if (f.kind === 'image') {
+    const r = await window.deck.fsReadImage(projectDir, f.path);
+    if (!r.ok) { feedRaw('EDITOR', 'err', `reload failed — ${baseName(f.path)}: ${r.error}`, '🔄'); return; }
+    f.dataUrl = r.dataUrl;
+    f.diskChanged = false;
+    if (activeFile === f.path) renderViewer();
+    renderTabs();
+    updateDiskBanner();
+    return;
+  }
   const r = await window.deck.fsRead(projectDir, f.path, shikiTheme());
   if (!r.ok) { feedRaw('EDITOR', 'err', `reload failed — ${baseName(f.path)}: ${r.error}`, '🔄'); return; }
   f.content = r.content;
@@ -165,7 +192,7 @@ function renderTabs() {
       mark.onmouseenter = () => { mark.textContent = '✕'; };
       mark.onmouseleave = () => { mark.textContent = '○'; };
     }
-    t.onclick = () => { activeFile = f.path; renderViewer(); vwInput.focus(); };
+    t.onclick = () => { activeFile = f.path; renderViewer(); if (f.kind !== 'image') vwInput.focus(); };
     mark.onclick = e => { e.stopPropagation(); closeFile(f.path); };
     tabs.appendChild(t);
   }
@@ -194,9 +221,18 @@ function renderViewer() {
   const f = activeF();
   if (!f) return;
   renderTabs();
-  vwInput.value = f.value;
-  paintCode(f);
-  renderGutter(f.value);
+  const isImage = f.kind === 'image';
+  vwGutter.classList.toggle('hidden', isImage);
+  vwEdit.classList.toggle('hidden', isImage);
+  vwImage.classList.toggle('hidden', !isImage);
+  if (isImage) {
+    vwImageEl.src = f.dataUrl;
+    applyImageTransform(f);
+  } else {
+    vwInput.value = f.value;
+    paintCode(f);
+    renderGutter(f.value);
+  }
   document.getElementById('vw-body').scrollTop = 0;
   markOpenRows();
   updateDiskBanner();
@@ -337,12 +373,76 @@ applyEditorFont(currentEditorFont());
 function zoomEditor(delta) {
   const size = applyEditorFont(currentEditorFont() + delta);
   if (window.toast) toast(`Editor font: ${size}px`, true);
+  if (window.renderStatusBar) renderStatusBar();
 }
+
+// ============================================================
+// IMAGE PREVIEW ZOOM — same Ctrl+=/-/0 and Ctrl+wheel gestures as the text
+// editor, but scaling the <img> instead of the font. Not persisted — each
+// image reopens at 100% (fit-to-pane).
+// ============================================================
+const IMAGE_ZOOM_MIN = 25, IMAGE_ZOOM_MAX = 800, IMAGE_ZOOM_STEP = 10;
+
+function applyImageZoom(f, pct) {
+  f.zoom = Math.max(IMAGE_ZOOM_MIN, Math.min(IMAGE_ZOOM_MAX, Math.round(pct)));
+  applyImageTransform(f);
+  if (window.toast) toast(`Image zoom: ${f.zoom}%`, true);
+  if (window.renderStatusBar) renderStatusBar();
+  return f.zoom;
+}
+function zoomImage(f, delta) { return applyImageZoom(f, (f.zoom || 100) + delta); }
+
+// translate (pan) then scale (zoom) — combined so panning around a zoomed-in
+// image works instead of the two fighting over the same style property
+function applyImageTransform(f) {
+  const zoom = (f.zoom || 100) / 100;
+  const x = f.panX || 0, y = f.panY || 0;
+  vwImageEl.style.transform = `translate(${x}px, ${y}px) scale(${zoom})`;
+  // dragging only makes sense once the image is bigger than its fitted pane
+  vwImage.classList.toggle('zoomed', (f.zoom || 100) > 100);
+}
+function resetImageView(f) {
+  f.zoom = 100; f.panX = 0; f.panY = 0;
+  applyImageTransform(f);
+  if (window.toast) toast('Image zoom: 100%', true);
+  if (window.renderStatusBar) renderStatusBar();
+}
+
+// drag with the left mouse button to pan a zoomed-in image around, VS
+// Code/Photoshop-style — reveals whichever edge got cropped by the pane.
+vwImageEl.draggable = false;
+let imgDrag = null;
+vwImageEl.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  const f = activeF();
+  if (!f || f.kind !== 'image' || (f.zoom || 100) <= 100) return;
+  e.preventDefault();
+  imgDrag = { startX: e.clientX, startY: e.clientY, panX: f.panX || 0, panY: f.panY || 0, f };
+  vwImage.classList.add('dragging');
+});
+window.addEventListener('mousemove', e => {
+  if (!imgDrag) return;
+  imgDrag.f.panX = imgDrag.panX + (e.clientX - imgDrag.startX);
+  imgDrag.f.panY = imgDrag.panY + (e.clientY - imgDrag.startY);
+  applyImageTransform(imgDrag.f);
+});
+window.addEventListener('mouseup', () => {
+  if (!imgDrag) return;
+  imgDrag = null;
+  vwImage.classList.remove('dragging');
+});
 
 // Ctrl/Cmd + = / - / 0 — only while the editor pane is visible
 document.addEventListener('keydown', e => {
   if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
   if (viewer.classList.contains('hidden')) return;
+  const f = activeF();
+  if (f && f.kind === 'image') {
+    if (e.key === '=' || e.key === '+') { e.preventDefault(); zoomImage(f, IMAGE_ZOOM_STEP); }
+    else if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomImage(f, -IMAGE_ZOOM_STEP); }
+    else if (e.key === '0') { e.preventDefault(); resetImageView(f); }
+    return;
+  }
   if (e.key === '=' || e.key === '+') { e.preventDefault(); zoomEditor(1); }
   else if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomEditor(-1); }
   else if (e.key === '0') { e.preventDefault(); applyEditorFont(EDITOR_FONT_DEFAULT); }
@@ -352,6 +452,8 @@ document.addEventListener('keydown', e => {
 document.getElementById('vw-body').addEventListener('wheel', e => {
   if (!(e.ctrlKey || e.metaKey)) return;
   e.preventDefault();
+  const f = activeF();
+  if (f && f.kind === 'image') { zoomImage(f, e.deltaY < 0 ? IMAGE_ZOOM_STEP : -IMAGE_ZOOM_STEP); return; }
   zoomEditor(e.deltaY < 0 ? 1 : -1);
 }, { passive: false });
 
