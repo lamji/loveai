@@ -326,6 +326,19 @@ const consoleFeed = document.getElementById('console-feed');
 // the "SYSTEMS NOMINAL" empty state, captured before anything removes it
 const FEED_EMPTY_HTML = consoleFeed.innerHTML;
 
+// Auto-scroll only while the user is at (or near) the bottom already — new
+// activity must never yank the view out from under someone reading history.
+// Scrolling up disengages the stick; scrolling back to the bottom re-engages it.
+let feedStuck = true;
+const FEED_STICK_PX = 40;
+consoleFeed.addEventListener('scroll', () => {
+  feedStuck = consoleFeed.scrollHeight - consoleFeed.scrollTop - consoleFeed.clientHeight
+    < FEED_STICK_PX;
+});
+function pinFeedToBottom() {
+  if (feedStuck) consoleFeed.scrollTop = consoleFeed.scrollHeight;
+}
+
 // ---- Phase 3: route each run's output to the project that owns it ----
 const feedBuf = {};   // wsId -> detached <div> holding that project's .ev nodes
 const runWs = {};     // runId  -> wsId that started the run
@@ -356,11 +369,15 @@ function getFeedBuf(wsId) {
   if (!feedBuf[wsId]) feedBuf[wsId] = document.createElement('div');
   return feedBuf[wsId];
 }
+// the container a project's output should append to: the visible feed when
+// it's the active project, otherwise its off-screen buffer.
+function feedElForWs(wsId) {
+  return wsId === activeWorkspaceId ? consoleFeed : getFeedBuf(wsId);
+}
 // the container an agent's output should append to: the visible feed when its
 // project is active, otherwise that project's off-screen buffer.
 function feedElFor(agentId) {
-  const wsId = wsForAgent(agentId);
-  return wsId === activeWorkspaceId ? consoleFeed : getFeedBuf(wsId);
+  return feedElForWs(wsForAgent(agentId));
 }
 
 function save() {
@@ -482,7 +499,10 @@ function renderTargets() {
 // an on-demand, hidden agent that just runs a chosen model (no persona/roster
 // entry). Reused across sends so it doesn't spawn duplicates.
 function ensureModelAgent(model) {
-  const id = 'eph-model-' + model;
+  // namespaced per project — a bare-model id shared across workspaces would
+  // make their "is it running" state collide (same id -> same rt[] entry),
+  // showing every other project as busy the moment ANY of them used this model.
+  const id = 'eph-model-' + activeWorkspaceId + '-' + model;
   let a = agents.find(x => x.id === id);
   if (!a) {
     a = {
@@ -757,7 +777,7 @@ function feed(agentId, cls, text, ico, sameLine = false) {
     if (sameLine) { streamEls[agentId] = el; el.classList.add('streaming'); }
     else delete streamEls[agentId];
   }
-  if (cont === consoleFeed) consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  if (cont === consoleFeed) pinFeedToBottom();
 }
 
 function endStream(agentId) {
@@ -788,7 +808,7 @@ function showThinking(agentId, label) {
   }
   el.querySelector('.think-label').textContent = label || 'thinking…';
   cont.appendChild(el);                        // keep it as the last (current) line
-  if (cont === consoleFeed) consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  if (cont === consoleFeed) pinFeedToBottom();
 }
 function hideThinking(agentId) {
   const el = thinkEls[agentId];
@@ -807,7 +827,7 @@ function showReassigning() {
     `<span class="ico think-dots"><i></i><i></i><i></i></span>` +
     `<span class="body think-label">REJECTED — reassigning to the right engineer…</span>`;
   consoleFeed.appendChild(reassignEl);
-  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  pinFeedToBottom();
 }
 function hideReassigning() {
   if (reassignEl && reassignEl.parentNode) reassignEl.parentNode.removeChild(reassignEl);
@@ -873,7 +893,7 @@ function feedDiff(agentId, tool, inp) {
   card.querySelector('.diff-head').onclick = () => inner.classList.toggle('open');
   if (feedFilter && feedFilter !== agentId) card.style.display = 'none';
   cont.appendChild(card);
-  if (cont === consoleFeed) consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  if (cont === consoleFeed) pinFeedToBottom();
 }
 
 // After a plan-mode run finishes, drop an inline action card into the console.
@@ -886,8 +906,10 @@ function feedImplementCard(plannerId, planSessionId) {
   if (cont === consoleFeed) hideFeedEmpty();
   const planner = findAgent(plannerId);
   // UI-related plans hand off to the UI/UX engineer instead of a generic senior
+  // — resolved from the PLANNER's own project roster, not whatever's on screen
+  const planWsId = wsForAgent(plannerId);
   const planText = R(plannerId).lastText || '';
-  const senior = (isUiTask(planText) && uiuxAgent()) || byRole('senior')[0];
+  const senior = (isUiTask(planText) && uiuxAgentIn(planWsId)) || byRoleIn(planWsId, 'senior')[0];
   // the planner rates its own plan's complexity (IMPLEMENT-MODEL: line, per
   // RULES.prompt) — capture it now, before lastText gets overwritten
   const routeModel = parseModelLine(R(plannerId).lastText, 'IMPLEMENT-MODEL');
@@ -915,7 +937,7 @@ function feedImplementCard(plannerId, planSessionId) {
     implementPlan(runnerId, plannerId, planSessionId, routeModel);
   };
   cont.appendChild(el);
-  if (cont === consoleFeed) consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  if (cont === consoleFeed) pinFeedToBottom();
 }
 
 function lockImplCard(btn, hint, label) {
@@ -977,6 +999,7 @@ function applyFilter() {
   consoleFeed.querySelectorAll('.ev').forEach(el => {
     el.style.display = (!feedFilter || el.dataset.agent === feedFilter) ? '' : 'none';
   });
+  feedStuck = true;
   consoleFeed.scrollTop = consoleFeed.scrollHeight;
 }
 
@@ -1008,10 +1031,13 @@ function renderActivity() {
 }
 
 // one place to stop whatever is running — used by the status-bar stop button.
-// Aborts the pipeline (covers paused "awaiting review") AND any loose agents.
+// Scoped to the ACTIVE project only: aborts ITS pipeline (covers paused
+// "awaiting review") AND its own loose agents — a background project's
+// pipeline keeps running untouched.
 function stopEverything() {
-  if (pipe.active && typeof abortPipeline === 'function') {
-    abortPipeline('pipeline aborted by operator.');
+  const p = pipelines.get(activeWorkspaceId);
+  if (p && p.active && typeof abortPipeline === 'function') {
+    abortPipeline('pipeline aborted by operator.', activeWorkspaceId);
   }
   agents.filter(a => R(a.id).running).forEach(x => {
     stopAgent(x.id); feed(x.id, 'sys', 'stop requested — aborting…', '■');
@@ -1019,7 +1045,10 @@ function stopEverything() {
   if (window.renderStatusBar) window.renderStatusBar();
 }
 window.stopEverything = stopEverything;
-window.pipeState = () => ({ active: pipe.active, stage: pipe.stage, label: STAGE_LABEL[pipe.stage] });
+window.pipeState = () => {
+  const p = pipelines.get(activeWorkspaceId);
+  return p ? { active: p.active, stage: p.stage, label: STAGE_LABEL[p.stage] } : { active: false, stage: null, label: null };
+};
 
 // keep the elapsed counters moving so the console never looks frozen
 setInterval(() => { if (!activityEl.classList.contains('hidden')) renderActivity(); }, 1000);
@@ -1031,7 +1060,10 @@ setInterval(() => { if (!activityEl.classList.contains('hidden')) renderActivity
 let paneOverride = null;
 let lastBusy = null;
 
-function anyBusy() { return pipe.active || agents.some(a => R(a.id).running); }
+function anyBusy() {
+  const p = pipelines.get(activeWorkspaceId);
+  return (p && p.active) || agents.some(a => R(a.id).running);
+}
 
 function syncPane() {
   // the ticket workspace owns the center area while it's open
@@ -1153,10 +1185,11 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   // The indexer writes the map, so it never gets the hint itself.
   const cwd = opts.cwd || a.cwd;
   // CHECKPOINT — one snapshot per task, not per stage: a pipeline run already
-  // owns a checkpoint for pipe.cwd, so a stage sharing that cwd joins it
+  // owns a checkpoint for its cwd, so a stage sharing that cwd joins it
   // instead of starting a redundant one. A stage in a different cwd (or any
-  // standalone run) gets its own.
-  r.cpStandalone = !(pipe.active && pipe.cwd === cwd);
+  // standalone run) gets its own. Checked across ALL projects' pipelines, not
+  // just the active one — a background pipeline still owns its checkpoint.
+  r.cpStandalone = !pipelineActiveForCwd(cwd);
   if (r.cpStandalone && cwd) cpBeginTask(cwd, prompt);
   r.cpCwd = cwd;
   let fullPrompt = prompt;
@@ -1319,8 +1352,18 @@ window.deck.onAgentEvent(ev => {
       r.lastResult = ev.subtype;
       trackUsage(ev);
       const doneAgent = findAgent(ev.agentId);
-      if (ev.sessionId && doneAgent && doneAgent.role === 'prompt' && pipe.cwd) savePESession(pipe.cwd, ev.sessionId);
-      if (ev.sessionId && doneAgent && doneAgent.role === 'reviewer' && pipe.active) pipe.reviewerSessionId = ev.sessionId;
+      // only remember this as "the pipeline's warm planning session" when it
+      // actually WAS a pipeline planning run (Stage 1 / a plan revision) — a
+      // manual chat or ticket run with the Prompt Engineer must never become
+      // the session the NEXT auto-pipeline run resumes into.
+      if (ev.sessionId && doneAgent && doneAgent.role === 'prompt' && doneAgent.cwd) {
+        const pePipe = pipelines.get(wsForAgent(ev.agentId));
+        if (pePipe && pePipe.active && pePipe.stage === 'prompt') savePESession(doneAgent.cwd, ev.sessionId);
+      }
+      if (ev.sessionId && doneAgent && doneAgent.role === 'reviewer') {
+        const rvPipe = pipelines.get(wsForAgent(ev.agentId));
+        if (rvPipe && rvPipe.active) rvPipe.reviewerSessionId = ev.sessionId;
+      }
       // background learner: outcome per model + turn-cap kills per role
       learnMark(r.curModel, ev.subtype !== 'success');
       if (/max_turns/i.test(ev.subtype || '') && doneAgent) {
@@ -1377,17 +1420,21 @@ window.deck.onAgentEvent(ev => {
       if (typeof gitRefresh === 'function' && gitRepo) gitRefresh();
       // a MANUAL Prompt Engineer run (outside the pipeline) that produced task
       // files → offer to deploy engineers, so the work doesn't just stop
-      if (!pipe.active && r.lastResult === 'success') {
+      const doneWsId = wsForAgent(ev.agentId);
+      const doneWsPipe = pipelines.get(doneWsId);
+      if (!(doneWsPipe && doneWsPipe.active) && r.lastResult === 'success') {
         const da = findAgent(ev.agentId);
         // only prompt the deploy offer when its project is on screen — don't
         // pop a card into whatever project the operator is currently viewing
-        if (da && da.role === 'prompt' && da.cwd
-            && wsForAgent(ev.agentId) === activeWorkspaceId) {
-          maybeOfferDeploy(da.cwd);
+        if (da && da.role === 'prompt' && da.cwd && doneWsId === activeWorkspaceId) {
+          maybeOfferDeploy(da.cwd, doneWsId, r.startedAt);
         }
       }
       onPipelineAgentDone(ev.agentId, r.lastResult)
-        .then(() => { if (!pipe.active) cleanupSeniors(); });
+        .then(() => {
+          const afterPipe = pipelines.get(doneWsId);
+          if (!afterPipe || !afterPipe.active) cleanupSeniors(doneWsId);
+        });
       break;
     }
   }
@@ -1397,18 +1444,59 @@ window.deck.onAgentEvent(ev => {
 // AUTO PIPELINE ORCHESTRATOR
 // prompt -> PLAN REVIEW (operator gate) -> build -> review -> loop
 // ============================================================
-const pipe = {
-  active: false, stage: null, cwd: '', iteration: 0, maxIter: 5,
-  pending: new Set(), taskAssign: new Map(), planTasks: [], taskModels: new Map(),
-  reviewModel: null,
-  // per-run reasoning-effort override (e.g. a workspace ticket's REASONING
-  // choice) — null means "use the global session setting" as before
-  effort: null,
-  // Reviewer's own session for THIS run — resumed (not forked) on re-review
-  // passes so it keeps everything it already read/validated in context instead
-  // of re-reading unchanged files from scratch on every rejection loop.
-  reviewerSessionId: null
-};
+// each project runs its own pipeline independently — state lives in a Map
+// keyed by workspace id (not a single shared object), the same way each
+// project already keeps its own agent roster.
+function freshPipe() {
+  return {
+    active: false, stage: null, cwd: '', iteration: 0, maxIter: 5,
+    pending: new Set(), taskAssign: new Map(), planTasks: [], taskModels: new Map(),
+    reviewModel: null,
+    // per-run reasoning-effort override (e.g. a workspace ticket's REASONING
+    // choice) — null means "use the global session setting" as before
+    effort: null,
+    // Reviewer's own session for THIS run — resumed (not forked) on re-review
+    // passes so it keeps everything it already read/validated in context instead
+    // of re-reading unchanged files from scratch on every rejection loop.
+    reviewerSessionId: null,
+    pendingIssue: null,
+    // plan-review data captured when the plan lands — the modal is a single
+    // shared DOM element, so it's populated lazily (on open) from here instead
+    // of at plan-ready time, which would clobber another project's open modal.
+    planCardEl: null, planFiles: [], planSummary: ''
+  };
+}
+const pipelines = new Map();   // wsId -> pipe state
+function pipeFor(wsId) {
+  if (!pipelines.has(wsId)) pipelines.set(wsId, freshPipe());
+  return pipelines.get(wsId);
+}
+// true if ANY project's pipeline (not just the active one) already owns cwd —
+// used only to decide checkpoint co-location, so it must see every project.
+function pipelineActiveForCwd(cwd) {
+  for (const p of pipelines.values()) if (p.active && p.cwd === cwd) return true;
+  return false;
+}
+// which project's plan is currently populated into the (single, shared)
+// plan-review modal
+let planReviewWsId = null;
+
+// roster of a SPECIFIC project (not whichever one is on screen) — the pipeline
+// orchestrator must always act on the project that owns it, even in the
+// background, never the "currently displayed" `agents` pointer.
+function rosterFor(wsId) {
+  const w = workspaces.find(x => x.id === wsId);
+  return (w && w.agents) || agents;
+}
+function byRoleIn(wsId, role) { return rosterFor(wsId).filter(a => a.role === role); }
+function uiuxAgentIn(wsId) { return byRoleIn(wsId, 'uiux')[0]; }
+// persist a roster mutation for a specific project — save() assumes it's
+// mutating the ACTIVE roster (it re-links `agents` and mirrors a legacy key),
+// so a background project's mutation goes straight to storage instead.
+function saveRosterFor(wsId) {
+  if (wsId === activeWorkspaceId) save();
+  else saveWorkspaces();
+}
 
 // "MODEL: <id>" line written by the Prompt Engineer — routes each task to the
 // cheapest model that fits its complexity
@@ -1418,66 +1506,84 @@ function parseModelLine(content, key = 'MODEL') {
 }
 
 // pipeline log lines go straight to the central console
-function plog(cls, text) {
+function plog(cls, text, wsId) {
   const map = { ok: 'ok', err: 'err', info: 'sys' };
-  feedRaw('PIPELINE', map[cls] || 'sys', text, '⟢');
+  feedRaw('PIPELINE', map[cls] || 'sys', text, '⟢',
+    wsId === undefined ? activeWorkspaceId : wsId);
 }
 
-function setStage(stage) {
-  pipe.stage = stage;
-  renderActivity();
+function setStage(wsId, stage) {
+  pipeFor(wsId).stage = stage;
+  if (wsId === activeWorkspaceId) renderActivity();
 }
 
 function byRole(role) { return agents.filter(a => a.role === role); }
 
-async function launchPipeline(issue, effort) {
-  const pe = byRole('prompt')[0];
-  if (!pe) { plog('err', 'no Prompt Engineer agent on roster.'); return; }
-  if (!pe.cwd) { plog('err', 'set a working directory on PROMPT-ENGINEER first (⚙), or import a project.'); return; }
-
-  pipe.active = true;
-  pipe.cwd = pe.cwd;
-  cpBeginTask(pipe.cwd, issue);
-  pipe.iteration = 0;
-  pipe.effort = effort || null;
-  pipe.reviewerSessionId = null;
-  pipe.pending.clear();
-  pipe.taskAssign.clear();
-  document.getElementById('btn-pipeline-stop').classList.remove('hidden');
-  hidePlanReview();
-
-  await window.deck.pipelineReset(pipe.cwd);
-  plog('info', 'pipeline dir reset.');
-
-  let st = { exists: false, stale: false, changedFiles: [] };
-  try { st = await window.deck.indexStatus(pipe.cwd); } catch {}
-
-  if (st.exists && !st.stale) {
-    plog('info', 'project index fresh — skipping Stage 0.');
-    startStage1(issue);
+async function launchPipeline(issue, effort, wsId) {
+  const pe = byRoleIn(wsId, 'prompt')[0];
+  if (!pe) { plog('err', 'no Prompt Engineer agent on roster.', wsId); return; }
+  if (!pe.cwd) {
+    plog('err',
+      'set a working directory on PROMPT-ENGINEER first (⚙), or import a project.',
+      wsId);
     return;
   }
 
-  const indexer = byRole('indexer')[0];
-  if (!indexer) { plog('err', 'no Indexer agent on roster — skipping Stage 0.'); startStage1(issue); return; }
-  if (!indexer.cwd) { indexer.cwd = pipe.cwd; save(); }
+  const p = pipeFor(wsId);
+  p.active = true;
+  p.cwd = pe.cwd;
+  cpBeginTask(p.cwd, issue);
+  p.iteration = 0;
+  p.effort = effort || null;
+  p.reviewerSessionId = null;
+  p.pending.clear();
+  p.taskAssign.clear();
+  if (wsId === activeWorkspaceId) document.getElementById('btn-pipeline-stop').classList.remove('hidden');
+  if (planReviewWsId === wsId) hidePlanReview();
 
-  pipe.pendingIssue = issue;
-  setStage('index');
+  await window.deck.pipelineReset(p.cwd);
+  plog('info', 'pipeline dir reset.', wsId);
+
+  let st = { exists: false, stale: false, changedFiles: [] };
+  try { st = await window.deck.indexStatus(p.cwd); } catch {}
+
+  if (st.exists && !st.stale) {
+    plog('info', 'project index fresh — skipping Stage 0.', wsId);
+    startStage1(issue, wsId);
+    return;
+  }
+
+  const indexer = byRoleIn(wsId, 'indexer')[0];
+  if (!indexer) {
+    plog('err', 'no Indexer agent on roster — skipping Stage 0.', wsId);
+    startStage1(issue, wsId);
+    return;
+  }
+  if (!indexer.cwd) { indexer.cwd = p.cwd; saveRosterFor(wsId); }
+
+  p.pendingIssue = issue;
+  setStage(wsId, 'index');
   const prompt = st.exists
     ? `These files changed since the last index: ${st.changedFiles.join(', ')}\nUpdate only the affected sections of .loveai/index/PROJECT-MAP.md per your rules.`
     : 'Index this project per your rules.';
-  plog('info', st.exists ? 'project index stale — Stage 0: INDEXER updating map...' : 'no project index — Stage 0: INDEXER mapping project...');
-  runAgent(indexer.id, prompt, false, false, { fresh: true, effort: pipe.effort });
+  plog('info', st.exists
+    ? 'project index stale — Stage 0: INDEXER updating map...'
+    : 'no project index — Stage 0: INDEXER mapping project...', wsId);
+  runAgent(indexer.id, prompt, false, false, { fresh: true, effort: p.effort });
 }
 
-function startStage1(issue) {
-  const pe = byRole('prompt')[0];
-  plog('info', 'Stage 1: PROMPT ENGINEER analyzing...');
-  setStage('prompt');
-  const resume = getPESession(pipe.cwd);
-  const opts = resume ? { resume, fork: true, effort: pipe.effort } : { effort: pipe.effort };
-  if (resume) plog('info', `resuming Prompt Engineer session ${resume.slice(0, 8)} (warm context)`);
+function startStage1(issue, wsId) {
+  const p = pipeFor(wsId);
+  const pe = byRoleIn(wsId, 'prompt')[0];
+  plog('info', 'Stage 1: PROMPT ENGINEER analyzing...', wsId);
+  setStage(wsId, 'prompt');
+  const resume = getPESession(p.cwd);
+  const opts = resume ? { resume, fork: true, effort: p.effort } : { effort: p.effort };
+  if (resume) {
+    plog('info',
+      `resuming Prompt Engineer session ${resume.slice(0, 8)} (warm context)`,
+      wsId);
+  }
   runAgent(pe.id, `ISSUE: ${issue}\n\nAnalyze the codebase and produce the executable task prompt file(s) and review-brief.md per your pipeline rules.`, false, false, opts);
 }
 
@@ -1486,106 +1592,97 @@ function startStage1(issue) {
 // a run doesn't land in an empty session. The Reviewer read the fullest picture
 // of what changed (falls back to the Prompt Engineer's session); it's ONLY the
 // shared-session pointer that moves — no pipeline agent's own run is touched,
-// so every stage still runs exactly as fresh/token-lean as before.
-function bridgePipelineSession() {
-  const sid = pipe.reviewerSessionId || getPESession(pipe.cwd);
+// so every stage still runs exactly as fresh/token-lean as before. Only
+// meaningful for the project you're actually looking at (setSession/getSession
+// are keyed off the active project's directory), so a background project's
+// pipeline ending never redirects your current chat session out from under you.
+function bridgePipelineSession(wsId) {
+  if (wsId !== activeWorkspaceId) return;
+  const p = pipeFor(wsId);
+  const sid = p.reviewerSessionId || getPESession(p.cwd);
   if (!sid) return;
   setSession(sid);
   feedRaw('SESSION', 'sys',
     'follow-up context bridged — chat with a model or agent below to continue from what the pipeline just did (↺ New session to start fresh instead).',
-    '🔗');
+    '🔗', wsId);
 }
 
-function abortPipeline(msg) {
-  pipe.active = false;
-  setStage(null);
-  cpEndTask(pipe.cwd);
-  document.getElementById('btn-pipeline-stop').classList.add('hidden');
-  hidePlanReview();
-  hideReassigning();
-  for (const id of pipe.pending) stopAgent(id);
-  const pr = byRole('prompt')[0]; if (pr && R(pr.id).running) stopAgent(pr.id);
-  const rv = byRole('reviewer')[0]; if (rv && R(rv.id).running) stopAgent(rv.id);
-  if (msg) plog('err', msg);
-  cleanupSeniors();
-  bridgePipelineSession();
-  if (window.wsPipelineEnded) window.wsPipelineEnded();
+function abortPipeline(msg, wsId) {
+  const p = pipeFor(wsId);
+  p.active = false;
+  setStage(wsId, null);
+  cpEndTask(p.cwd);
+  if (wsId === activeWorkspaceId) {
+    document.getElementById('btn-pipeline-stop').classList.add('hidden');
+    hideReassigning();
+  }
+  if (planReviewWsId === wsId) hidePlanReview();
+  for (const id of p.pending) stopAgent(id);
+  const pr = byRoleIn(wsId, 'prompt')[0]; if (pr && R(pr.id).running) stopAgent(pr.id);
+  const rv = byRoleIn(wsId, 'reviewer')[0]; if (rv && R(rv.id).running) stopAgent(rv.id);
+  if (msg) plog('err', msg, wsId);
+  cleanupSeniors(wsId);
+  bridgePipelineSession(wsId);
+  if (window.wsPipelineEnded) window.wsPipelineEnded(wsId);
 }
 
-function finishPipeline(msg) {
-  pipe.active = false;
-  setStage(null);
-  cpEndTask(pipe.cwd);
-  document.getElementById('btn-pipeline-stop').classList.add('hidden');
-  plog('ok', msg);
-  cleanupSeniors();
-  bridgePipelineSession();
-  if (window.wsPipelineEnded) window.wsPipelineEnded();
+function finishPipeline(msg, wsId) {
+  const p = pipeFor(wsId);
+  p.active = false;
+  setStage(wsId, null);
+  cpEndTask(p.cwd);
+  if (wsId === activeWorkspaceId) document.getElementById('btn-pipeline-stop').classList.add('hidden');
+  plog('ok', msg, wsId);
+  cleanupSeniors(wsId);
+  bridgePipelineSession(wsId);
+  if (window.wsPipelineEnded) window.wsPipelineEnded(wsId);
 }
 
 // the pipeline may clone extra SENIOR-ENG agents for parallel builds — once the
-// work is over, retire them so the roster returns to the default line-up
-function cleanupSeniors() {
-  const keep = agents.find(a => a.id === 'def-senior-eng-01') || byRole('senior')[0];
+// work is over, retire them so the roster returns to the default line-up.
+// Operates directly on the OWNING project's roster (never the shared `agents`
+// pointer), so cleaning up a background pipeline can't touch the roster of
+// whatever project happens to be on screen.
+function cleanupSeniors(wsId) {
+  const w = workspaces.find(x => x.id === wsId);
+  if (!w) return;
+  const roster = w.agents || [];
+  const keep = roster.find(a => a.id === 'def-senior-eng-01') || roster.find(a => a.role === 'senior');
   let removed = 0;
-  setAgents(agents.filter(a => {
+  const next = roster.filter(a => {
     if (a.role !== 'senior' || (keep && a.id === keep.id)) return true;
     if (R(a.id).running) return true;   // retired later, on its done event
-    if (feedFilter === a.id) feedFilter = null;
+    if (wsId === activeWorkspaceId && feedFilter === a.id) feedFilter = null;
     removed++;
     return false;
-  }));
+  });
+  w.agents = next;
+  if (wsId === activeWorkspaceId) agents = next;
   if (removed) {
-    save(); render(); applyFilter();
-    plog('info', `auto-retired ${removed} extra senior engineer(s) — roster back to default.`);
+    saveRosterFor(wsId);
+    if (wsId === activeWorkspaceId) { render(); applyFilter(); }
+    plog('info',
+      `auto-retired ${removed} extra senior engineer(s) — roster back to default.`,
+      wsId);
   }
 }
 
 // ---------- Plan review gate ----------
 // The plan lands as a summary card at the end of the console; the card opens
 // the full result (task files + follow-up chatbox) in a scrollable modal.
+// The modal is a SINGLE shared DOM element (only one project's plan can be
+// under review at a time) — its content is populated lazily on open from
+// that project's own pipe.planFiles/planSummary, never at plan-ready time,
+// so a background project's plan landing can't clobber a modal you have open.
 const planModal = document.getElementById('plan-modal');
-let planCardEl = null;
 
-function openPlanModal() {
-  planModal.classList.remove('hidden');
-  document.getElementById('pr-revision').focus();
-}
-function hidePlanReview() { planModal.classList.add('hidden'); }
-
-function feedPlanCard(summary, count) {
-  hideFeedEmpty();
-  const el = document.createElement('button');
-  el.className = 'plan-result';
-  el.innerHTML = `<div class="pl-head">🧠 PLAN READY <span class="pl-open">CLICK FOR FULL RESULT ▸</span></div>
-    <div class="pl-summary"></div><div class="pl-meta"></div>`;
-  const sum = el.querySelector('.pl-summary');
-  sum.innerHTML = renderMarkdown(summary);
-  sum.classList.add('md-body');
-  el.querySelector('.pl-meta').textContent = `${count} task file(s) · awaiting your review`;
-  el.onclick = openPlanModal;
-  consoleFeed.appendChild(el);
-  consoleFeed.scrollTop = consoleFeed.scrollHeight;
-  planCardEl = el;
-}
-
-// retire the pending card once the plan is approved, discarded or superseded
-function closePlanCard(note) {
-  if (!planCardEl) return;
-  planCardEl.classList.add('done');
-  planCardEl.querySelector('.pl-meta').textContent = note;
-  planCardEl.querySelector('.pl-open').textContent = 'VIEW ▸';
-  planCardEl = null;
-}
-
-async function showPlanReview() {
-  setStage('plan');
-  const files = await window.deck.pipelineRead(pipe.cwd);
-  const relevant = files.filter(f => /^task-\d+.*\.md$/i.test(f.name) || f.name === 'review-brief.md');
+function openPlanModalFor(wsId) {
+  planReviewWsId = wsId;
+  const p = pipeFor(wsId);
   const tabs = document.getElementById('pr-tabs');
   const content = document.getElementById('pr-content');
   tabs.innerHTML = '';
-  relevant.forEach((f, i) => {
+  (p.planFiles || []).forEach((f, i) => {
     const tab = document.createElement('button');
     tab.className = 'pr-tab' + (i === 0 ? ' active' : '');
     tab.textContent = f.name;
@@ -1597,13 +1694,55 @@ async function showPlanReview() {
     };
     tabs.appendChild(tab);
   });
-  content.textContent = relevant.length ? relevant[0].content : '(no plan files found)';
+  content.textContent = (p.planFiles && p.planFiles.length) ? p.planFiles[0].content : '(no plan files found)';
+  document.getElementById('pr-summary').textContent = p.planSummary || '(no summary returned — open the card for the full plan)';
+  planModal.classList.remove('hidden');
+  document.getElementById('pr-revision').focus();
+}
+function hidePlanReview() { planModal.classList.add('hidden'); }
 
-  const pe = byRole('prompt')[0];
+function feedPlanCard(wsId, summary, count) {
+  const p = pipeFor(wsId);
+  const cont = feedElForWs(wsId);
+  if (cont === consoleFeed) hideFeedEmpty();
+  const el = document.createElement('button');
+  el.className = 'plan-result';
+  el.innerHTML = `<div class="pl-head">🧠 PLAN READY <span class="pl-open">CLICK FOR FULL RESULT ▸</span></div>
+    <div class="pl-summary"></div><div class="pl-meta"></div>`;
+  const sum = el.querySelector('.pl-summary');
+  sum.innerHTML = renderMarkdown(summary);
+  sum.classList.add('md-body');
+  el.querySelector('.pl-meta').textContent = `${count} task file(s) · awaiting your review`;
+  el.onclick = () => openPlanModalFor(wsId);
+  cont.appendChild(el);
+  if (cont === consoleFeed) pinFeedToBottom();
+  p.planCardEl = el;
+}
+
+// retire the pending card once the plan is approved, discarded or superseded
+function closePlanCard(wsId, note) {
+  const p = pipeFor(wsId);
+  if (!p.planCardEl) return;
+  p.planCardEl.classList.add('done');
+  p.planCardEl.querySelector('.pl-meta').textContent = note;
+  p.planCardEl.querySelector('.pl-open').textContent = 'VIEW ▸';
+  p.planCardEl = null;
+}
+
+async function showPlanReview(wsId) {
+  const p = pipeFor(wsId);
+  setStage(wsId, 'plan');
+  const files = await window.deck.pipelineRead(p.cwd);
+  const relevant = files.filter(f => /^task-\d+.*\.md$/i.test(f.name) || f.name === 'review-brief.md');
+  p.planFiles = relevant;
+
+  const pe = byRoleIn(wsId, 'prompt')[0];
   const summary = (pe && (R(pe.id).lastText || '').trim()) || '(no summary returned — open the card for the full plan)';
-  document.getElementById('pr-summary').textContent = summary;
-  feedPlanCard(summary, pipe.planTasks.length);
-  plog('info', `PLAN READY — ${pipe.planTasks.length} task file(s). Open the card above to review and pass to engineers.`);
+  p.planSummary = summary;
+  feedPlanCard(wsId, summary, p.planTasks.length);
+  plog('info',
+    `PLAN READY — ${p.planTasks.length} task file(s). Open the card above to review and pass to engineers.`,
+    wsId);
 }
 
 document.getElementById('pr-close').onclick = hidePlanReview;
@@ -1611,56 +1750,75 @@ document.getElementById('pr-close').onclick = hidePlanReview;
 // Read the task files in .loveai/pipeline/, route each to an agent, and start the
 // BUILD → REVIEW stages. Used both by the plan-approval gate AND when a manual
 // (non-pipeline) Prompt Engineer run leaves task files that need executing.
-async function deployEngineersFromDir() {
-  pipe.taskModels.clear();
-  pipe.reviewModel = null;
+async function deployEngineersFromDir(wsId) {
+  const p = pipeFor(wsId);
+  p.taskModels.clear();
+  p.reviewModel = null;
   const uiTasks = new Set();
-  const files = await window.deck.pipelineRead(pipe.cwd);
+  const files = await window.deck.pipelineRead(p.cwd);
   for (const f of files) {
     if (/^task-\d+.*\.md$/i.test(f.name)) {
       const m = parseModelLine(f.content);
-      if (m) pipe.taskModels.set(f.name, m);
+      if (m) p.taskModels.set(f.name, m);
       if (isUiTask(f.name + ' ' + f.content.slice(0, 2000))) uiTasks.add(f.name);
     } else if (f.name === 'review-brief.md') {
-      pipe.reviewModel = parseModelLine(f.content, 'REVIEW-MODEL');
+      p.reviewModel = parseModelLine(f.content, 'REVIEW-MODEL');
     }
   }
-  const tasks = pipe.planTasks.slice(0, 4);
-  const ui = uiuxAgent();
+  const tasks = p.planTasks.slice(0, 4);
+  const ui = uiuxAgentIn(wsId);
   const uiAssigned = ui ? tasks.filter(t => uiTasks.has(t)) : [];
   const genTasks = tasks.filter(t => !uiAssigned.includes(t));
   const n = Math.min(Math.max(genTasks.length, 1), 4);
-  plog('ok', `deploying ${genTasks.length ? n + ' senior(s)' : 'engineers'}${uiAssigned.length ? ' + UI/UX engineer' : ''}...`);
-  const seniors = genTasks.length ? ensureSeniors(Math.min(genTasks.length, 4)) : [];
-  pipe.taskAssign.clear();
-  genTasks.forEach((t, i) => pipe.taskAssign.set(seniors[i % seniors.length].id, t));
+  plog('ok',
+    `deploying ${genTasks.length ? n + ' senior(s)' : 'engineers'}` +
+    `${uiAssigned.length ? ' + UI/UX engineer' : ''}...`,
+    wsId);
+  const seniors = genTasks.length ? ensureSeniors(Math.min(genTasks.length, 4), wsId) : [];
+  p.taskAssign.clear();
+  genTasks.forEach((t, i) => p.taskAssign.set(seniors[i % seniors.length].id, t));
   uiAssigned.forEach((t, i) => {
-    if (i === 0) { if (!ui.cwd) { ui.cwd = pipe.cwd; save(); } pipe.taskAssign.set(ui.id, t); plog('info', `${t} ▸ routed to ${ui.name} (UI task)`); }
-    else if (seniors.length) pipe.taskAssign.set(seniors[i % seniors.length].id, t);
-    else { const s = ensureSeniors(1); pipe.taskAssign.set(s[0].id, t); }
+    if (i === 0) {
+      if (!ui.cwd) { ui.cwd = p.cwd; saveRosterFor(wsId); }
+      p.taskAssign.set(ui.id, t);
+      plog('info', `${t} ▸ routed to ${ui.name} (UI task)`, wsId);
+    }
+    else if (seniors.length) p.taskAssign.set(seniors[i % seniors.length].id, t);
+    else { const s = ensureSeniors(1, wsId); p.taskAssign.set(s[0].id, t); }
   });
-  plog('info', 'Stage 3: BUILD — engineers executing in parallel...');
-  startBuild('execute');
+  plog('info', 'Stage 3: BUILD — engineers executing in parallel...', wsId);
+  startBuild('execute', wsId);
 }
 
 document.getElementById('pr-approve').onclick = async () => {
-  if (!pipe.active || pipe.stage !== 'plan') return;
+  const wsId = planReviewWsId;
+  if (wsId == null) return;
+  const p = pipeFor(wsId);
+  if (!p.active || p.stage !== 'plan') return;
   hidePlanReview();
-  closePlanCard('approved — passed to engineers');
-  await deployEngineersFromDir();
+  closePlanCard(wsId, 'approved — passed to engineers');
+  await deployEngineersFromDir(wsId);
 };
 
 // A manual Prompt Engineer run left task files but there's no live pipeline to run
 // them — offer a one-click deploy so the work doesn't just stop.
-async function maybeOfferDeploy(cwd) {
-  if (pipe.active) return;
+// `sinceTs` is the run's start time: only task files this run actually wrote
+// (mtime after the run started) qualify — stale files left by an earlier,
+// unrelated session must not resurface as a deploy offer.
+async function maybeOfferDeploy(cwd, wsId, sinceTs) {
+  if (pipeFor(wsId).active) return;
   let scan; try { scan = await window.deck.pipelineScan(cwd); } catch { return; }
   if (!scan || !scan.tasks || !scan.tasks.length) return;
-  feedDeployCard(cwd, scan.tasks);
+  const fresh = sinceTs
+    ? scan.tasks.filter(t => (scan.taskMtimes?.[t] || 0) >= sinceTs)
+    : scan.tasks;
+  if (!fresh.length) return;
+  feedDeployCard(cwd, fresh, wsId);
 }
 
-function feedDeployCard(cwd, taskNames) {
-  hideFeedEmpty();
+function feedDeployCard(cwd, taskNames, wsId) {
+  const cont = feedElForWs(wsId);
+  if (cont === consoleFeed) hideFeedEmpty();
   const el = document.createElement('button');
   el.className = 'plan-result';
   el.innerHTML = `<div class="pl-head">🚀 TASK FILES READY <span class="pl-open">▶ DEPLOY ENGINEERS</span></div>
@@ -1668,38 +1826,43 @@ function feedDeployCard(cwd, taskNames) {
   el.querySelector('.pl-summary').textContent = taskNames.join(', ');
   el.querySelector('.pl-meta').textContent = `${taskNames.length} task file(s) — click to build + review with your roster`;
   el.onclick = async () => {
-    if (pipe.active) { plog('err', 'a pipeline is already running.'); return; }
+    const p = pipeFor(wsId);
+    if (p.active) { plog('err', 'a pipeline is already running.', wsId); return; }
     el.classList.add('done');
     el.querySelector('.pl-meta').textContent = 'deploying…';
-    pipe.active = true; pipe.cwd = cwd; pipe.iteration = 0;
-    document.getElementById('btn-pipeline-stop').classList.remove('hidden');
-    pipe.planTasks = taskNames;
-    await deployEngineersFromDir();
+    p.active = true; p.cwd = cwd; p.iteration = 0;
+    if (wsId === activeWorkspaceId) document.getElementById('btn-pipeline-stop').classList.remove('hidden');
+    p.planTasks = taskNames;
+    await deployEngineersFromDir(wsId);
   };
-  consoleFeed.appendChild(el);
-  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  cont.appendChild(el);
+  if (cont === consoleFeed) pinFeedToBottom();
 }
 
 document.getElementById('pr-discard').onclick = () => {
-  if (!pipe.active) { hidePlanReview(); return; }
-  closePlanCard('discarded by operator');
-  abortPipeline('plan discarded by operator.');
+  const wsId = planReviewWsId;
+  if (wsId == null || !pipeFor(wsId).active) { hidePlanReview(); return; }
+  closePlanCard(wsId, 'discarded by operator');
+  abortPipeline('plan discarded by operator.', wsId);
 };
 
 function revisePlan() {
+  const wsId = planReviewWsId;
   const box = document.getElementById('pr-revision');
   const text = box.value.trim();
-  if (!text || !pipe.active || pipe.stage !== 'plan') return;
-  const pe = byRole('prompt')[0];
+  if (!text || wsId == null) return;
+  const p = pipeFor(wsId);
+  if (!p.active || p.stage !== 'plan') return;
+  const pe = byRoleIn(wsId, 'prompt')[0];
   if (!pe) return;
   box.value = '';
   hidePlanReview();
-  closePlanCard('superseded by a revision request');
-  setStage('prompt');
-  plog('info', 'revision requested — Prompt Engineer updating the plan...');
+  closePlanCard(wsId, 'superseded by a revision request');
+  setStage(wsId, 'prompt');
+  plog('info', 'revision requested — Prompt Engineer updating the plan...', wsId);
   // resume the PE's own planning session so the plan (and the analysis behind
   // it) is still in context — runs no longer inherit the shared session
-  const resume = getPESession(pipe.cwd) || R(pe.id).sessionId;
+  const resume = getPESession(p.cwd) || R(pe.id).sessionId;
   runAgent(pe.id, `PLAN REVISION REQUEST: ${text}
 
 Update the existing plan files in .loveai/pipeline/ accordingly. Modify ONLY the sections affected by this revision — keep every unaffected section exactly as it is. Edit the existing task-*.md / review-brief.md files in place (add or delete files only if the revision requires it), then summarize what changed.`,
@@ -1711,8 +1874,13 @@ document.getElementById('pr-revision').addEventListener('keydown', e => {
 });
 
 // ---------- Stages ----------
-function ensureSeniors(n) {
-  let seniors = byRole('senior');
+// Clones/registers extra SENIOR-ENG agents directly on the OWNING project's
+// roster (never the shared `agents` pointer) so a background pipeline can
+// grow its own build team without touching whatever project is on screen.
+function ensureSeniors(n, wsId) {
+  const w = workspaces.find(x => x.id === wsId);
+  const p = pipeFor(wsId);
+  let seniors = (w.agents || []).filter(a => a.role === 'senior');
   const template = seniors[0] || DEFAULT_AGENTS[1];
   while (seniors.length < n) {
     const idx = seniors.length + 1;
@@ -1721,21 +1889,24 @@ function ensureSeniors(n) {
       id: uid(),
       name: 'SENIOR-ENG-0' + idx,
       role: 'senior',
-      cwd: pipe.cwd,
+      cwd: p.cwd,
       rules: RULES.senior
     };
-    agents.push(clone);
-    seniors = byRole('senior');
+    w.agents.push(clone);
+    seniors = w.agents.filter(a => a.role === 'senior');
   }
-  for (const s of seniors) if (!s.cwd) s.cwd = pipe.cwd;
-  save(); render();
+  for (const s of seniors) if (!s.cwd) s.cwd = p.cwd;
+  if (wsId === activeWorkspaceId) agents = w.agents;
+  saveRosterFor(wsId);
+  if (wsId === activeWorkspaceId) render();
   return seniors.slice(0, n);
 }
 
-function startBuild(taskCmd) {
-  setStage('build');
-  const entries = [...pipe.taskAssign.entries()];
-  pipe.pending = new Set(entries.map(([agentId]) => agentId));
+function startBuild(taskCmd, wsId) {
+  const p = pipeFor(wsId);
+  setStage(wsId, 'build');
+  const entries = [...p.taskAssign.entries()];
+  p.pending = new Set(entries.map(([agentId]) => agentId));
   for (const [agentId, taskFile] of entries) {
     const prompt = taskCmd === 'fix'
       ? `Fix review findings: read .loveai/pipeline/review-findings.md and fix ONLY the findings for your task file (${taskFile}), per your rules. Then update changes-log.md.`
@@ -1743,10 +1914,14 @@ function startBuild(taskCmd) {
     // token-lean: task files are self-contained, so each senior starts FRESH
     // (no replay of the whole planning conversation) on the model the Prompt
     // Engineer rated for that task's complexity
-    const model = learnedModel(pipe.taskModels.get(taskFile));   // learner may bump an unreliable model
-    const a = agents.find(x => x.id === agentId);
-    if (model) plog('info', `${a ? a.name : agentId} ▸ ${taskFile} on ${MODEL_LABELS[model]} (complexity-routed)`);
-    runAgent(agentId, prompt, false, false, { model, fresh: true, effort: pipe.effort });
+    const model = learnedModel(p.taskModels.get(taskFile));   // learner may bump an unreliable model
+    const a = findAgent(agentId);
+    if (model) {
+      plog('info',
+        `${a ? a.name : agentId} ▸ ${taskFile} on ${MODEL_LABELS[model]} (complexity-routed)`,
+        wsId);
+    }
+    runAgent(agentId, prompt, false, false, { model, fresh: true, effort: p.effort });
   }
 }
 
@@ -1765,21 +1940,22 @@ const ROLE_CAP = {
 // DYNAMIC ROUTING: an AI (cheap Haiku) reads the findings and the actual roster,
 // then names the best engineer to implement the fixes. No brittle keyword regex —
 // it reasons about the work, and adapts to whatever agents are on the roster.
-async function pickFixerByAI(findings) {
-  const candidates = agents.filter(a => ['senior', 'uiux', 'custom'].includes(a.role));
-  if (candidates.length <= 1) return candidates[0] || byRole('senior')[0] || uiuxAgent();
-  const roster = candidates.map(a => `- ${a.name} [${a.role}]: ${ROLE_CAP[a.role] || 'general engineering'}`).join('\n');
+async function pickFixerByAI(findings, wsId) {
+  const roster = rosterFor(wsId);
+  const candidates = roster.filter(a => ['senior', 'uiux', 'custom'].includes(a.role));
+  if (candidates.length <= 1) return candidates[0] || byRoleIn(wsId, 'senior')[0] || uiuxAgentIn(wsId);
+  const list = candidates.map(a => `- ${a.name} [${a.role}]: ${ROLE_CAP[a.role] || 'general engineering'}`).join('\n');
   const prompt = `Route this code-review rejection to the SINGLE best engineer to IMPLEMENT the fixes. Judge by what the findings actually require (front-end vs backend vs mixed).
 
 ENGINEERS:
-${roster}
+${list}
 
 REVIEW FINDINGS:
 ${String(findings).slice(0, 7000)}
 
 Reply with ONLY the exact engineer name from the list above — one line, nothing else.`;
   try {
-    const r = await window.deck.aiGenerate(prompt, 'claude-haiku-4-5-20251001', pipe.cwd);
+    const r = await window.deck.aiGenerate(prompt, 'claude-haiku-4-5-20251001', pipeFor(wsId).cwd);
     if (r.ok && r.text) {
       const name = r.text.trim().split('\n')[0].replace(/["'`.*_]/g, '').trim().toLowerCase();
       const hit = candidates.find(a => a.name.toLowerCase() === name)
@@ -1788,37 +1964,43 @@ Reply with ONLY the exact engineer name from the list above — one line, nothin
       if (hit) return hit;
     }
   } catch {}
-  return byRole('senior')[0] || candidates[0] || uiuxAgent();   // safe fallback
+  return byRoleIn(wsId, 'senior')[0] || candidates[0] || uiuxAgentIn(wsId);   // safe fallback
 }
 
-async function startFixRound() {
-  setStage('build');
-  const files = await window.deck.pipelineRead(pipe.cwd);
+async function startFixRound(wsId) {
+  const p = pipeFor(wsId);
+  setStage(wsId, 'build');
+  const files = await window.deck.pipelineRead(p.cwd);
   const findings = (files.find(f => f.name === 'review-findings.md') || {}).content || '';
-  const fixer = await pickFixerByAI(findings);
-  hideReassigning();
-  if (!fixer) { abortPipeline('no engineer available to fix findings — halted.'); return; }
-  if (!fixer.cwd) { fixer.cwd = pipe.cwd; save(); }
-  pipe.pending = new Set([fixer.id]);
-  pipe.taskAssign = new Map([[fixer.id, 'review-findings.md']]);   // so onDone counts it
-  plog('err', `REJECTED — fix round ${pipe.iteration}: AI routed ALL findings to ${fixer.name} (${ROLE_LABEL[fixer.role] || fixer.role}).`);
+  const fixer = await pickFixerByAI(findings, wsId);
+  if (wsId === activeWorkspaceId) hideReassigning();
+  if (!fixer) { abortPipeline('no engineer available to fix findings — halted.', wsId); return; }
+  if (!fixer.cwd) { fixer.cwd = p.cwd; saveRosterFor(wsId); }
+  p.pending = new Set([fixer.id]);
+  p.taskAssign = new Map([[fixer.id, 'review-findings.md']]);   // so onDone counts it
+  plog('err',
+    `REJECTED — fix round ${p.iteration}: AI routed ALL findings to ` +
+    `${fixer.name} (${ROLE_LABEL[fixer.role] || fixer.role}).`,
+    wsId);
   const prompt = `The Reviewer REJECTED this work. Read .loveai/pipeline/review-findings.md AND the original task file(s) in .loveai/pipeline/, then COMPLETE the feature so every finding is resolved and every acceptance criterion is met. You own ALL findings this round — do NOT skip any because it "belongs to another task".
 
 IMPORTANT: findings that say a file is "untouched", a component/prop/filter/badge is "missing", or a criterion "doesn't exist" mean that work was NEVER DONE — you must IMPLEMENT it now (edit the real component/source files named in the findings; create code where it's missing). Do not just tweak what already changed.
 
 For each finding: implement the fix in the actual files, OR — only if you are certain it is a FALSE POSITIVE — leave it and write an evidence-backed justification in changes-log.md. Then append everything you did to .loveai/pipeline/changes-log.md. Verify against the acceptance criteria before finishing.`;
-  runAgent(fixer.id, prompt, false, false, { fresh: true, effort: pipe.effort });
+  runAgent(fixer.id, prompt, false, false, { fresh: true, effort: p.effort });
 }
 
 // the Prompt Engineer is supposed to write review-brief.md. If a run skipped it
 // (e.g. a manual/partial plan), synthesize a fallback so the Reviewer always has
 // proper scope instead of guessing from a lone task file.
-async function ensureReviewBrief(cwd) {
+async function ensureReviewBrief(wsId) {
+  const p = pipeFor(wsId);
+  const cwd = p.cwd;
   const files = await window.deck.pipelineRead(cwd);
   if (files.some(f => f.name === 'review-brief.md')) return;
   const tasks = files.filter(f => /^task-\d+.*\.md$/i.test(f.name));
   const changes = (files.find(f => f.name === 'changes-log.md') || {}).content || '';
-  const model = pipe.reviewModel || 'claude-sonnet-5';
+  const model = p.reviewModel || 'claude-sonnet-5';
   const scope = tasks.map(t => {
     const ctx = (t.content.match(/SCOPE[\s\S]{0,600}/i) || [t.content.slice(0, 400)])[0];
     return `### ${t.name}\n${ctx.trim()}`;
@@ -1837,84 +2019,87 @@ CHANGES LOG (what the engineers did):
 ${changes.slice(0, 4000) || '(changes-log.md not found — infer from git diff)'}
 `;
   await window.deck.pipelineWrite(cwd, 'review-brief.md', body);
-  plog('info', 'no review-brief.md found — generated a fallback brief for the Reviewer.');
-  if (!pipe.reviewModel) pipe.reviewModel = model;
+  plog('info', 'no review-brief.md found — generated a fallback brief for the Reviewer.', wsId);
+  if (!p.reviewModel) p.reviewModel = model;
 }
 
-async function startReview() {
-  setStage('review');
-  const rv = byRole('reviewer')[0];
-  if (!rv) { abortPipeline('no Reviewer agent on roster.'); return; }
-  if (!rv.cwd) { rv.cwd = pipe.cwd; save(); }
-  await ensureReviewBrief(pipe.cwd);   // guarantee the Reviewer has a brief
-  plog('info', `Stage 4: REVIEWER validating (pass ${pipe.iteration + 1})...`);
+async function startReview(wsId) {
+  const p = pipeFor(wsId);
+  setStage(wsId, 'review');
+  const rv = byRoleIn(wsId, 'reviewer')[0];
+  if (!rv) { abortPipeline('no Reviewer agent on roster.', wsId); return; }
+  if (!rv.cwd) { rv.cwd = p.cwd; saveRosterFor(wsId); }
+  await ensureReviewBrief(wsId);   // guarantee the Reviewer has a brief
+  plog('info', `Stage 4: REVIEWER validating (pass ${p.iteration + 1})...`, wsId);
   // Resume (never fork) the reviewer's OWN session from the previous pass so it
   // keeps every file it already read/validated in context — a fresh session
   // every pass forced a full from-scratch re-read even when only one file
   // changed. Only the very first pass runs fresh (nothing to resume yet).
-  const resume = pipe.reviewerSessionId;
+  const resume = p.reviewerSessionId;
   const opts = resume
-    ? { model: pipe.reviewModel, fresh: true, resume, fork: false, effort: pipe.effort }
-    : { model: pipe.reviewModel, fresh: true, effort: pipe.effort };
-  runAgent(rv.id, pipe.iteration === 0
+    ? { model: p.reviewModel, fresh: true, resume, fork: false, effort: p.effort }
+    : { model: p.reviewModel, fresh: true, effort: p.effort };
+  runAgent(rv.id, p.iteration === 0
     ? 'Review the pipeline changes per your rules. Write validation-plan.md first, then review-findings.md with a VERDICT first line.'
     : 'The Senior Engineers applied fixes for the findings you listed last round (see the newest entries in changes-log.md). You already have full context from your last review still loaded — do NOT re-read files you already validated and found fine; re-check ONLY the files touched by this fix round against those specific findings, then write a fresh review-findings.md with a VERDICT first line.',
     false, false, opts);
 }
 
 async function onPipelineAgentDone(agentId, result) {
-  if (!pipe.active) return;
-  const a = agents.find(x => x.id === agentId);
+  const wsId = wsForAgent(agentId);
+  const p = pipelines.get(wsId);
+  if (!p || !p.active) return;
+  const a = findAgent(agentId);
   if (!a) return;
 
-  if (pipe.stage === 'index' && a.role === 'indexer') {
+  if (p.stage === 'index' && a.role === 'indexer') {
     if (result === 'success') {
-      try { await window.deck.indexMark(pipe.cwd); } catch {}
+      try { await window.deck.indexMark(p.cwd); } catch {}
     } else {
-      plog('err', `${a.name} ${result} building the index — continuing without it.`);
+      plog('err', `${a.name} ${result} building the index — continuing without it.`, wsId);
     }
-    const issue = pipe.pendingIssue;
-    pipe.pendingIssue = null;
-    startStage1(issue);
+    const issue = p.pendingIssue;
+    p.pendingIssue = null;
+    startStage1(issue, wsId);
     return;
   }
 
   if (result === 'error' || result === 'aborted') {
-    abortPipeline(`${a.name} ${result} — pipeline halted.`);
+    abortPipeline(`${a.name} ${result} — pipeline halted.`, wsId);
     return;
   }
 
-  if (pipe.stage === 'prompt' && a.role === 'prompt') {
-    const scan = await window.deck.pipelineScan(pipe.cwd);
-    if (!scan.tasks.length) { abortPipeline('Prompt Engineer produced no task files — halted.'); return; }
-    pipe.planTasks = scan.tasks;
-    await showPlanReview();
+  if (p.stage === 'prompt' && a.role === 'prompt') {
+    const scan = await window.deck.pipelineScan(p.cwd);
+    if (!scan.tasks.length) { abortPipeline('Prompt Engineer produced no task files — halted.', wsId); return; }
+    p.planTasks = scan.tasks;
+    await showPlanReview(wsId);
     return;
   }
 
-  if (pipe.stage === 'build' && (a.role === 'senior' || a.role === 'uiux')) {
-    pipe.pending.delete(agentId);
-    plog('ok', `${a.name} finished (${pipe.pending.size} still working).`);
-    if (pipe.pending.size === 0) startReview();
+  if (p.stage === 'build' && (a.role === 'senior' || a.role === 'uiux')) {
+    p.pending.delete(agentId);
+    plog('ok', `${a.name} finished (${p.pending.size} still working).`, wsId);
+    if (p.pending.size === 0) startReview(wsId);
     return;
   }
 
-  if (pipe.stage === 'review' && a.role === 'reviewer') {
-    const scan = await window.deck.pipelineScan(pipe.cwd);
+  if (p.stage === 'review' && a.role === 'reviewer') {
+    const scan = await window.deck.pipelineScan(p.cwd);
     if (scan.verdict === 'APPROVED') {
-      finishPipeline(`APPROVED after ${pipe.iteration + 1} review pass(es). Pipeline complete. ✔`);
+      finishPipeline(`APPROVED after ${p.iteration + 1} review pass(es). Pipeline complete. ✔`, wsId);
     } else if (scan.verdict === 'REJECTED') {
-      pipe.iteration++;
-      if (pipe.iteration >= pipe.maxIter) {
-        abortPipeline(`still REJECTED after ${pipe.maxIter} passes — manual attention needed (see review-findings.md).`);
+      p.iteration++;
+      if (p.iteration >= p.maxIter) {
+        abortPipeline(`still REJECTED after ${p.maxIter} passes — manual attention needed (see review-findings.md).`, wsId);
       } else {
         // learner: a rejection counts against the model that produced each task
-        for (const [, taskFile] of pipe.taskAssign) learnMark(pipe.taskModels.get(taskFile), true);
-        showReassigning();       // bridge the gap while pickFixerByAI() resolves
-        await startFixRound();   // reassign ALL findings to the right agent (UI/UX for UI)
+        for (const [, taskFile] of p.taskAssign) learnMark(p.taskModels.get(taskFile), true);
+        if (wsId === activeWorkspaceId) showReassigning();   // bridge the gap while pickFixerByAI() resolves
+        await startFixRound(wsId);   // reassign ALL findings to the right agent (UI/UX for UI)
       }
     } else {
-      abortPipeline('reviewer produced no VERDICT — halted (check review-findings.md).');
+      abortPipeline('reviewer produced no VERDICT — halted (check review-findings.md).', wsId);
     }
   }
 }
@@ -1929,19 +2114,22 @@ document.getElementById('btn-pipeline-stop').onclick = () => stopEverything();
 // debugging, and live status is shown in the activity strip instead.
 const SILENT_FEED_TAGS = new Set(['PIPELINE', 'EXPLORER', 'EDITOR']);
 
-// raw console line not tied to an agent (operator/shell output)
-function feedRaw(tag, cls, text, ico) {
+// raw console line not tied to an agent (operator/shell output). wsId lets a
+// background project's system message land in ITS buffer instead of leaking
+// into whatever project is currently on screen; defaults to the active one.
+function feedRaw(tag, cls, text, ico, wsId = activeWorkspaceId) {
   if (SILENT_FEED_TAGS.has(tag)) {
     (cls === 'err' ? console.warn : console.debug)(`[${tag}] ${text}`);
     return;
   }
-  hideFeedEmpty();
+  const cont = feedElForWs(wsId);
+  if (cont === consoleFeed) hideFeedEmpty();
   const el = document.createElement('div');
   el.className = 'ev';
   el.innerHTML = `<span class="tag op">${esc(tag)}</span><span class="ico">${ico || ''}</span><span class="body ${cls}"></span>`;
   el.querySelector('.body').textContent = text;
-  consoleFeed.appendChild(el);
-  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  cont.appendChild(el);
+  if (cont === consoleFeed) pinFeedToBottom();
 }
 
 // ===== Attachments (drag & drop or 📎) =====
@@ -2137,8 +2325,8 @@ async function sendChat() {
   const plan = document.getElementById('chat-plan').checked;
   const full = text + attachBlock() + slashDirective(text);
   if (target === '__pipeline__') {
-    if (pipe.active) { plog('err', 'pipeline already running — abort it first.'); return; }
-    launchPipeline(full);
+    if (pipeFor(activeWorkspaceId).active) { plog('err', 'pipeline already running for this project — abort it first.'); return; }
+    launchPipeline(full, null, activeWorkspaceId);
   } else if (target.startsWith('model:')) {
     // run a bare Claude model, no agent persona. Unlike a roster agent (which
     // gets a real follow-up composer in the agent dock), a bare model has no
@@ -2484,8 +2672,6 @@ function isUiTask(text) {
   const lower = s.toLowerCase();
   return (LEARN.uiWords || []).some(w => lower.includes(w));
 }
-function uiuxAgent() { return byRole('uiux')[0]; }
-
 // ============================================================
 // SELF-LEARNING (background, zero tokens — pure local heuristics)
 // The app watches its own runs: results, turns, pipeline rejections and the
@@ -2684,6 +2870,7 @@ function restoreFeed(wsId) {
   } else {
     showFeedEmpty();
   }
+  feedStuck = true;
   consoleFeed.scrollTop = consoleFeed.scrollHeight;
 }
 
@@ -2744,6 +2931,8 @@ function refreshProjectBindings() {
   if (window.tkProjectChanged) tkProjectChanged();
   // terminals are per-project too — show this project's, hide the others
   if (typeof syncTermsToWorkspace === 'function') syncTermsToWorkspace();
+  // re-sync stop button / status bar / console-vs-editor pane for this workspace
+  renderActivity();
   if (projectDir) {
     window.deck.symbolEnsure(projectDir)
       .then(r => { if (r && r.ok) window.deck.symbolWatch(projectDir).catch(() => {}); })

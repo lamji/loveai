@@ -12,6 +12,13 @@
   const headBtn = document.getElementById('btn-tickets');
   const modal = document.getElementById('tk-modal');
   const fileIn = document.getElementById('tk-file-in');
+  const acField = document.getElementById('tk-f-ac');
+  const acView = document.getElementById('tk-ac-view');
+  const attPreview = document.getElementById('tk-att-preview');
+  const attPreviewImg = document.getElementById('tk-att-preview-img');
+  const attPreviewFile = document.getElementById('tk-att-preview-file');
+  const attPreviewName = document.getElementById('tk-att-preview-name');
+  const attPreviewPath = document.getElementById('tk-att-preview-path');
 
   const TK_IMG_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
   const DEFAULT_PROMPT =
@@ -134,10 +141,11 @@
     finishTicketRun(id);
   }
 
-  // the pipeline is a single global resource — when it ends, clear every
-  // ticket that was waiting on it (only one can be pipeline-driven at a time)
-  window.wsPipelineEnded = function () {
-    for (const [id, run] of tkRun) if (run.kind === 'pipeline') finishTicketRun(id);
+  // each project's pipeline is independent — when ONE ends, only clear the
+  // ticket(s) that were waiting on THAT project's pipeline, not every
+  // pipeline-driven ticket across every open project.
+  window.wsPipelineEnded = function (wsId) {
+    for (const [id, run] of tkRun) if (run.kind === 'pipeline' && run.wsId === wsId) finishTicketRun(id);
   };
 
   function startTicket(id, message) {
@@ -153,12 +161,12 @@
     const effort = t.effort || 'auto';
 
     if (target === '__pipeline__') {
-      if (typeof pipe !== 'undefined' && pipe.active) {
-        if (window.toast) toast('A pipeline is already running — stop it first', false);
+      if (typeof pipeFor === 'function' && pipeFor(activeWorkspaceId).active) {
+        if (window.toast) toast('A pipeline is already running for this project — stop it first', false);
         return;
       }
-      tkRun.set(id, { kind: 'pipeline', startedAt: Date.now() });
-      launchPipeline(prompt, effort);
+      tkRun.set(id, { kind: 'pipeline', startedAt: Date.now(), wsId: activeWorkspaceId });
+      launchPipeline(prompt, effort, activeWorkspaceId);
     } else if (target.startsWith('model:')) {
       const model = target.slice('model:'.length);
       const aid = ensureModelAgent(model);
@@ -192,7 +200,7 @@
     const run = tkRun.get(id);
     if (!run) return;
     if (run.kind === 'pipeline') {
-      if (typeof abortPipeline === 'function') abortPipeline('pipeline aborted from workspace card.');
+      if (typeof abortPipeline === 'function') abortPipeline('pipeline aborted from workspace card.', run.wsId);
     } else if (run.agentId && typeof stopAgent === 'function') {
       stopAgent(run.agentId);
     }
@@ -352,10 +360,14 @@
     // one chatbox does both jobs: first message Starts the ticket, every one
     // after that is a follow-up anchored to its own last session
     const everRun = !!t.lastAgentId;
-    const showChat = !run && !!t.agentId;
+    const inProg = t.status === 'inprogress';
+    const isDone = t.status === 'done';
+    const showChat = !run && !!t.agentId && inProg;
+    const showStart = !run && !!t.agentId && !inProg && !isDone;
     el.className = 'tk-card-item' + (run ? ' tk-running' : '');
     el.draggable = true;
     el.dataset.id = t.id;
+    el.dataset.status = t.status;
     el.innerHTML = `
       <div class="tk-card-top">
         <span class="tk-num">${esc(t.num || '')}</span>
@@ -370,6 +382,9 @@
       <div class="tk-card-chat ${showChat ? '' : 'hidden'}">
         <input class="tk-chat-input" placeholder="${everRun ? 'Follow up…' : 'Start with a message…'}" />
         <button class="tk-chat-send" title="${everRun ? 'Send — continues its last session' : 'Start'}">➤</button>
+      </div>
+      <div class="tk-card-start ${showStart ? '' : 'hidden'}">
+        <button class="tk-start-btn" title="Start this task">▶ START</button>
       </div>`;
     if (run) el.querySelector('.tk-run-label').textContent = runLabel(run);
     el.querySelector('.tk-run-stop').onclick = (e) => { e.stopPropagation(); stopTicket(t.id); };
@@ -382,6 +397,12 @@
         if (e.key === 'Enter') { e.preventDefault(); sendTicketChat(t.id); }
       };
       chatSend.onclick = (e) => { e.stopPropagation(); sendTicketChat(t.id); };
+    }
+    if (showStart) {
+      el.querySelector('.tk-start-btn').onclick = (e) => {
+        e.stopPropagation();
+        startTicket(t.id, '');
+      };
     }
     el.onclick = () => openModal(t.id);
     el.addEventListener('dragstart', (e) => {
@@ -430,6 +451,7 @@
         <span class="tk-cell-title">TITLE</span>
         <span class="tk-cell-status">STATUS</span>
         <span class="tk-cell-agent">AGENT</span>
+        <span class="tk-cell-actions"></span>
       </div>`;
     if (!tk.tickets.length) {
       const empty = document.createElement('div');
@@ -441,19 +463,55 @@
     for (const t of tk.tickets) {
       const st = statusById(t.status);
       const run = tkRun.get(t.id);
+      const inProg = t.status === 'inprogress';
+      const isDone = t.status === 'done';
+      const everRun = !!t.lastAgentId;
+      const showChat = !run && !!t.agentId && inProg;
+      const showStart = !run && !!t.agentId && !inProg && !isDone;
+      const desc = (t.description || '').trim();
       const row = document.createElement('div');
       row.className = 'tk-row' + (run ? ' tk-running' : '');
       row.dataset.id = t.id;
       row.innerHTML = `
         <span class="tk-cell-num">${esc(t.num || '')}</span>
-        <span class="tk-cell-title">${esc(t.title)}</span>
+        <span class="tk-cell-title">
+          <span class="tk-cell-title-text">${esc(t.title)}</span>
+          ${desc ? `<span class="tk-cell-desc">${esc(desc)}</span>` : ''}
+        </span>
         <span class="tk-cell-status">
           <span class="tk-status-pill ${esc(t.status)}">${esc(st.label)}</span>
         </span>
         <span class="tk-cell-agent">${run
           ? `<span class="think-dots"><i></i><i></i><i></i></span> <span class="tk-run-label"></span>`
-          : esc(agentLabel(t) || '—')}</span>`;
+          : esc(agentLabel(t) || '—')}</span>
+        <span class="tk-cell-actions">
+          ${showStart
+            ? '<button class="tk-start-btn" title="Start this task">▶ START</button>'
+            : ''}
+          ${showChat ? `
+            <input class="tk-chat-input"
+              placeholder="${everRun ? 'Follow up…' : 'Start with a message…'}" />
+            <button class="tk-chat-send"
+              title="${everRun ? 'Send — continues its last session' : 'Start'}">➤</button>
+          ` : ''}
+        </span>`;
       if (run) row.querySelector('.tk-run-label').textContent = runLabel(run);
+      if (showStart) {
+        row.querySelector('.tk-start-btn').onclick = (e) => {
+          e.stopPropagation();
+          startTicket(t.id, '');
+        };
+      }
+      if (showChat) {
+        const chatInput = row.querySelector('.tk-chat-input');
+        const chatSend = row.querySelector('.tk-chat-send');
+        chatInput.onclick = (e) => e.stopPropagation();
+        chatInput.onkeydown = (e) => {
+          e.stopPropagation();
+          if (e.key === 'Enter') { e.preventDefault(); sendTicketChat(t.id); }
+        };
+        chatSend.onclick = (e) => { e.stopPropagation(); sendTicketChat(t.id); };
+      }
       row.onclick = () => openModal(t.id);
       listEl.appendChild(row);
     }
@@ -521,8 +579,9 @@
     document.getElementById('tk-m-title').textContent =
       t ? `TICKET ${t.num || ''}` : 'NEW TICKET';
     document.getElementById('tk-f-title').value = t ? t.title : '';
-    document.getElementById('tk-f-desc').value = t ? (t.description || '') : '';
-    document.getElementById('tk-f-ac').value = t ? (t.acceptance || '') : '';
+    const acText = t ? (t.acceptance || '') : '';
+    acField.value = acText;
+    if (acText.trim()) showAcView(acText); else showAcEdit();
     document.getElementById('tk-f-status').value =
       t ? t.status : (presetStatus || tk.statuses[0].id);
     document.getElementById('tk-f-agent').value = t ? (t.agentId || '') : '';
@@ -545,17 +604,50 @@
 
   document.getElementById('tk-f-cancel').onclick = closeModal;
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal();
+    if (e.key !== 'Escape') return;
+    if (!attPreview.classList.contains('hidden')) { closeAttPreview(); return; }
+    if (!modal.classList.contains('hidden')) closeModal();
   });
 
   // ACCEPTANCE CRITERIA gets the same @ file/folder mention and / skill menus
-  // as the main chat composer — same setupMention/setupSlash from app.js.
+  // as the main chat composer — same setupMention/setupSlash from app.js —
+  // plus a # trigger (below) that attaches an image/file right where typed.
   if (typeof setupMention === 'function') {
-    setupMention(document.getElementById('tk-f-ac'), document.getElementById('tk-ac-mention'));
+    setupMention(acField, document.getElementById('tk-ac-mention'));
   }
   if (typeof setupSlash === 'function') {
-    setupSlash(document.getElementById('tk-f-ac'), document.getElementById('tk-ac-slash'));
+    setupSlash(acField, document.getElementById('tk-ac-slash'));
   }
+
+  // once a ticket has saved acceptance criteria, show it read-only (a plain
+  // checklist look) instead of a bare textarea — click it to edit again.
+  function showAcEdit() {
+    acView.classList.add('hidden');
+    acField.classList.remove('hidden');
+    acField.focus();
+    const end = acField.value.length;
+    acField.setSelectionRange(end, end);
+  }
+  function showAcView(text) {
+    acField.classList.add('hidden');
+    acView.innerHTML = text.split('\n').map(line => {
+      const clean = line.replace(/^[-*]\s*/, '').trim();
+      return clean ? `<div class="tk-ac-line">☐ ${esc(clean)}</div>` : '';
+    }).join('');
+    acView.classList.remove('hidden');
+  }
+  acView.onclick = showAcEdit;
+
+  // committing the field (clicking/tabbing away) swaps it back to the
+  // read-only view — but not while the # attach file dialog is opening
+  // (that steals focus too, and hashTarget stays set until it resolves).
+  acField.addEventListener('blur', () => {
+    if (hashTarget) return;
+    setTimeout(() => {
+      if (document.activeElement === acField) return;
+      if (acField.value.trim()) showAcView(acField.value);
+    }, 150);
+  });
 
   document.getElementById('tk-f-save').onclick = () => {
     const title = document.getElementById('tk-f-title').value.trim();
@@ -569,8 +661,7 @@
     const efSel = document.getElementById('tk-f-effort');
     const fields = {
       title,
-      description: document.getElementById('tk-f-desc').value,
-      acceptance: document.getElementById('tk-f-ac').value,
+      acceptance: acField.value,
       status: document.getElementById('tk-f-status').value,
       agentId,
       agentName: ag ? ag.name : null,   // survives roster changes
@@ -610,13 +701,18 @@
   };
 
   // ---------- attachments (basic: keep the file's path, preview images) ----------
+  // returns the names actually added, so a # trigger can insert them inline
   function addAttachmentFiles(fileList) {
+    const added = [];
     for (const f of fileList) {
       const p = window.deck.fileToPath(f);
       if (!p || draftAtt.some(a => a.path === p)) continue;
-      draftAtt.push({ path: p, name: p.split(/[\\/]/).pop() });
+      const name = p.split(/[\\/]/).pop();
+      draftAtt.push({ path: p, name });
+      added.push(name);
     }
     renderDraftAtt();
+    return added;
   }
 
   function renderDraftAtt() {
@@ -634,21 +730,46 @@
           `<span class="tk-att-name"></span><b title="Remove">✕</b>`;
       }
       item.querySelector('.tk-att-name').textContent = a.name;
-      item.querySelector('b').onclick = () => {
+      item.querySelector('b').onclick = (e) => {
+        e.stopPropagation();
         draftAtt.splice(i, 1);
         renderDraftAtt();
       };
+      item.addEventListener('click', () => openAttPreview(a));
       box.appendChild(item);
     });
-    const add = document.createElement('button');
-    add.className = 'tk-att-add';
-    add.type = 'button';
-    add.textContent = '＋ ADD FILE';
-    add.onclick = () => fileIn.click();
-    box.appendChild(add);
   }
 
-  fileIn.onchange = () => { addAttachmentFiles(fileIn.files); fileIn.value = ''; };
+  // ---------- # trigger — attaches a file/image right where it was typed,
+  // same spirit as the @ mention and / skill triggers on this same field ----------
+  let hashTarget = null; // { textarea, start } — caret position that opened the picker
+  function setupHashAttach(textarea) {
+    textarea.addEventListener('input', (e) => {
+      if (e.data !== '#') return;
+      const pos = textarea.selectionStart;
+      const before = textarea.value.slice(0, pos - 1);
+      if (before && !/[\s\n]$/.test(before)) return; // only at start of a word
+      hashTarget = { textarea, start: pos - 1 };
+      fileIn.click();
+    });
+  }
+  setupHashAttach(acField);
+
+  function insertHashTokens({ textarea, start }, names) {
+    const v = textarea.value;
+    const token = names.map(n => '#' + n).join(' ') + ' ';
+    textarea.value = v.slice(0, start) + token + v.slice(start + 1);
+    const caret = start + token.length;
+    textarea.setSelectionRange(caret, caret);
+    textarea.focus();
+  }
+
+  fileIn.onchange = () => {
+    const target = hashTarget; hashTarget = null;
+    const added = addAttachmentFiles(fileIn.files);
+    fileIn.value = '';
+    if (target && added.length) insertHashTokens(target, added);
+  };
   const attBox = document.getElementById('tk-f-att');
   attBox.addEventListener('dragover', (e) => {
     e.preventDefault();
@@ -659,5 +780,27 @@
     e.preventDefault();
     attBox.classList.remove('dropping');
     if (e.dataTransfer && e.dataTransfer.files) addAttachmentFiles(e.dataTransfer.files);
+  });
+
+  // ---------- attachment preview (image lightbox / file info card) ----------
+  function openAttPreview(a) {
+    const isImg = TK_IMG_RE.test(a.path);
+    attPreviewImg.classList.toggle('hidden', !isImg);
+    attPreviewFile.classList.toggle('hidden', isImg);
+    if (isImg) {
+      attPreviewImg.src = fileUrl(a.path);
+    } else {
+      attPreviewName.textContent = a.name;
+      attPreviewPath.textContent = a.path;
+    }
+    attPreview.classList.remove('hidden');
+  }
+  function closeAttPreview() {
+    attPreview.classList.add('hidden');
+    attPreviewImg.src = '';
+  }
+  document.getElementById('tk-att-preview-close').onclick = closeAttPreview;
+  attPreview.addEventListener('click', (e) => {
+    if (e.target === attPreview) closeAttPreview();
   });
 })();

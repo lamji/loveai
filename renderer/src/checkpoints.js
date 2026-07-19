@@ -71,6 +71,15 @@ async function cpPersist(repo) {
   try { await window.deck.checkpointsSave(repo, mine); } catch {}
 }
 
+// a since-fixed main.js bug let a git stderr warning (e.g. a CRLF/LF notice)
+// leak into a checkpoint's touched-files list as if it were a real path — strip
+// any such bogus entry out of records loaded from disk so an old checkpoint
+// from before the fix self-heals instead of staying stuck with a permanently
+// failing revert button forever.
+function cpSanitizeFiles(files) {
+  return (files || []).filter(f => !/^\s*(warning|hint|error|fatal):/i.test(f));
+}
+
 // called when a project/workspace is opened — see gitDetect() in git.js
 async function cpLoadForRepos(repoList) {
   let changed = false;
@@ -78,7 +87,18 @@ async function cpLoadForRepos(repoList) {
     if (cpList.some(c => c.repo === repo)) continue;   // already loaded this session
     try {
       const r = await window.deck.checkpointsLoad(repo);
-      if (r && r.ok && r.list && r.list.length) { cpList.push(...r.list); changed = true; }
+      if (r && r.ok && r.list && r.list.length) {
+        let dirty = false;
+        const cleaned = [];
+        for (const record of r.list) {
+          const files = cpSanitizeFiles(record.files);
+          if (files.length !== (record.files || []).length) dirty = true;
+          if (files.length) cleaned.push(files.length === record.files.length ? record : { ...record, files });
+        }
+        cpList.push(...cleaned);
+        changed = true;
+        if (dirty) await cpPersist(repo);
+      }
     } catch {}
   }
   if (!changed) return;
@@ -97,7 +117,7 @@ function cpFeedNote(record) {
     `<span class="body ok cp-note-link">checkpoint saved — ${n} file${n === 1 ? '' : 's'}, revertable</span>`;
   el.querySelector('.cp-note-link').onclick = () => { cpOpenPanel(); cpHighlight(record.id); };
   consoleFeed.appendChild(el);
-  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  pinFeedToBottom();
 }
 
 // ============================================================

@@ -1074,9 +1074,7 @@ const gitModal = document.getElementById('git-modal');
 function closeGitModal() { gitModal.classList.add('hidden'); }
 document.getElementById('git-modal-close').onclick = closeGitModal;
 
-function renderDiff(container, diffText) {
-  container.innerHTML = '';
-  if (!diffText || !diffText.trim()) { container.innerHTML = '<div class="git-none">no changes to show</div>'; return; }
+function renderLegacyDiff(container, diffText) {
   const pre = document.createElement('pre');
   pre.className = 'diff-pre';
   for (const line of diffText.split('\n')) {
@@ -1090,6 +1088,171 @@ function renderDiff(container, diffText) {
     pre.appendChild(span);
   }
   container.appendChild(pre);
+}
+
+// Split a path into dir + basename for the dimmed-dir / bright-basename look.
+function splitPath(p) {
+  const i = p.lastIndexOf('/');
+  return i < 0 ? { dir: '', base: p } : { dir: p.slice(0, i + 1), base: p.slice(i + 1) };
+}
+
+function parseDiffFiles(diffText) {
+  const lines = diffText.split('\n');
+  if (lines[lines.length - 1] === '') lines.pop(); // trailing newline artifact, not a real line
+  const files = [];
+  let cur = null;
+  const startFile = () => {
+    cur = { header: [], hunks: [], add: 0, del: 0, binary: false };
+    files.push(cur);
+  };
+  for (const line of lines) {
+    if (line.startsWith('diff --git ')) { startFile(); cur.header.push(line); continue; }
+    if (!cur) continue;
+    if (line.startsWith('@@ ')) {
+      const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (!m) continue;
+      cur.hunks.push({ header: line, oldStart: +m[1], newStart: +m[3], rows: [] });
+      continue;
+    }
+    if (line.startsWith('Binary files ') && line.endsWith(' differ')) { cur.binary = true; continue; }
+    const hunk = cur.hunks[cur.hunks.length - 1];
+    if (!hunk) { cur.header.push(line); continue; }
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      cur.add++; hunk.rows.push({ t: '+', text: line.slice(1) });
+    } else if (line.startsWith('-') && !line.startsWith('---')) {
+      cur.del++; hunk.rows.push({ t: '-', text: line.slice(1) });
+    } else if (line.startsWith('\\ No newline')) {
+      hunk.rows.push({ t: '\\', text: line });
+    } else if (line.startsWith(' ') || line === '') {
+      hunk.rows.push({ t: ' ', text: line.slice(1) });
+    }
+  }
+  return files.filter(f => f.hunks.length || f.binary || f.header.length).map(parseFileMeta);
+}
+
+function parseFileMeta(f) {
+  let oldPath = '', newPath = '', renamed = false, added = false, deleted = false;
+  const gitLine = /^diff --git a\/(.+) b\/(.+)$/.exec(f.header[0] || '');
+  if (gitLine) { oldPath = gitLine[1]; newPath = gitLine[2]; }
+  for (const line of f.header) {
+    let m;
+    if ((m = /^--- (?:a\/(.+)|(\/dev\/null))$/.exec(line))) {
+      oldPath = m[1] || ''; if (m[2]) added = true;
+    } else if ((m = /^\+\+\+ (?:b\/(.+)|(\/dev\/null))$/.exec(line))) {
+      newPath = m[1] || ''; if (m[2]) deleted = true;
+    } else if ((m = /^rename from (.+)$/.exec(line))) {
+      oldPath = m[1]; renamed = true;
+    } else if ((m = /^rename to (.+)$/.exec(line))) {
+      newPath = m[1]; renamed = true;
+    }
+  }
+  const path = newPath || oldPath;
+  const status = renamed ? 'renamed' : added ? 'added' : deleted ? 'deleted' : 'modified';
+  return { ...f, oldPath, newPath, path, status };
+}
+
+function fileHeadEl(f) {
+  const head = document.createElement('div');
+  head.className = 'diff-file-head';
+  const pathEl = document.createElement('span');
+  pathEl.className = 'diff-file-path';
+  if (f.status === 'renamed') {
+    const from = splitPath(f.oldPath), to = splitPath(f.newPath);
+    pathEl.append(
+      spanDim(from.dir + from.base), textNode(' → '), spanDim(to.dir), spanBase(to.base)
+    );
+  } else {
+    const { dir, base } = splitPath(f.path);
+    pathEl.append(spanDim(dir), spanBase(base));
+  }
+  head.appendChild(pathEl);
+  const tag = document.createElement('span');
+  tag.className = 'diff-file-tag diff-tag-' + f.status;
+  tag.textContent = f.status;
+  head.appendChild(tag);
+  const counts = document.createElement('span');
+  counts.className = 'diff-file-counts';
+  const addEl = document.createElement('span');
+  addEl.className = 'diff-count-add';
+  addEl.textContent = '+' + f.add;
+  const delEl = document.createElement('span');
+  delEl.className = 'diff-count-del';
+  delEl.textContent = '−' + f.del;
+  counts.append(addEl, delEl);
+  head.appendChild(counts);
+  return head;
+}
+function spanDim(s) {
+  const el = document.createElement('span');
+  el.className = 'diff-path-dim'; el.textContent = s;
+  return el;
+}
+function spanBase(s) {
+  const el = document.createElement('span');
+  el.className = 'diff-path-base'; el.textContent = s;
+  return el;
+}
+function textNode(s) { return document.createTextNode(s); }
+
+function diffRow(oldLn, newLn, marker, text, cls) {
+  const tr = document.createElement('tr');
+  tr.className = 'diff-row' + (cls ? ' diff-row-' + cls : '');
+  const oldCell = document.createElement('td');
+  oldCell.className = 'diff-gutter';
+  oldCell.textContent = oldLn == null ? '' : String(oldLn);
+  const newCell = document.createElement('td');
+  newCell.className = 'diff-gutter';
+  newCell.textContent = newLn == null ? '' : String(newLn);
+  const codeCell = document.createElement('td');
+  codeCell.className = 'diff-code';
+  codeCell.textContent = marker + text;
+  tr.append(oldCell, newCell, codeCell);
+  return tr;
+}
+
+function fileTableEl(f) {
+  const table = document.createElement('table');
+  table.className = 'diff-table';
+  const tbody = document.createElement('tbody');
+  for (const hunk of f.hunks) {
+    const hunkRow = document.createElement('tr');
+    hunkRow.className = 'diff-hunk-row';
+    const hunkCell = document.createElement('td');
+    hunkCell.colSpan = 3;
+    hunkCell.textContent = hunk.header;
+    hunkRow.appendChild(hunkCell);
+    tbody.appendChild(hunkRow);
+    let oldLn = hunk.oldStart, newLn = hunk.newStart;
+    for (const row of hunk.rows) {
+      if (row.t === '+') { tbody.appendChild(diffRow(null, newLn++, '+', row.text, 'add')); }
+      else if (row.t === '-') { tbody.appendChild(diffRow(oldLn++, null, '-', row.text, 'del')); }
+      else if (row.t === '\\') { tbody.appendChild(diffRow(null, null, '', row.text, 'ctx')); }
+      else { tbody.appendChild(diffRow(oldLn++, newLn++, ' ', row.text, 'ctx')); }
+    }
+  }
+  table.appendChild(tbody);
+  return table;
+}
+
+function renderDiff(container, diffText) {
+  container.innerHTML = '';
+  if (!diffText || !diffText.trim()) { container.innerHTML = '<div class="git-none">no changes to show</div>'; return; }
+  const files = parseDiffFiles(diffText);
+  if (!files.length) { renderLegacyDiff(container, diffText); return; }
+  for (const f of files) {
+    const block = document.createElement('div');
+    block.className = 'diff-file';
+    block.appendChild(fileHeadEl(f));
+    if (f.binary) {
+      const bin = document.createElement('div');
+      bin.className = 'diff-binary-row';
+      bin.textContent = 'binary file';
+      block.appendChild(bin);
+    } else {
+      block.appendChild(fileTableEl(f));
+    }
+    container.appendChild(block);
+  }
 }
 
 async function openDiff({ file, staged, commit }) {

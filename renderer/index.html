@@ -674,17 +674,15 @@
           <select id="tk-f-effort" class="think-select"></select>
         </div>
       </div>
-      <label>DESCRIPTION</label>
-      <textarea id="tk-f-desc" rows="4"
-        placeholder="What needs to be done and why"></textarea>
-      <label>ACCEPTANCE CRITERIA <span class="hint">(@ files/folders · / skills)</span></label>
+      <label>ACCEPTANCE CRITERIA <span class="hint">(@ files/folders · / skills · # image)</span></label>
       <div class="tk-input-wrap">
         <div id="tk-ac-slash" class="slash-menu hidden"></div>
         <div id="tk-ac-mention" class="mention-menu hidden"></div>
+        <div id="tk-ac-view" class="tk-ac-view hidden" title="Click to edit"></div>
         <textarea id="tk-f-ac" rows="4"
           placeholder="- criterion 1&#10;- criterion 2"></textarea>
       </div>
-      <label>ATTACHMENTS <span class="hint">(images or files — click ＋ or drop here)</span></label>
+      <label>ATTACHMENTS <span class="hint">(type # above, or drop files here)</span></label>
       <div id="tk-f-att" class="tk-att"></div>
       <input type="file" id="tk-file-in" multiple hidden />
       <div class="modal-actions tk-modal-actions">
@@ -692,6 +690,19 @@
         <div style="flex:1"></div>
         <button id="tk-f-cancel" class="btn">CANCEL</button>
         <button id="tk-f-save" class="btn btn-launch">✓ SAVE</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Ticket attachment preview (image lightbox / file info) ===== -->
+  <div id="tk-att-preview" class="tk-att-preview hidden">
+    <div class="tk-att-preview-inner">
+      <button id="tk-att-preview-close" class="tk-att-preview-close" title="Close">✕</button>
+      <img id="tk-att-preview-img" class="hidden" alt="" />
+      <div id="tk-att-preview-file" class="tk-att-preview-file hidden">
+        <span class="tk-att-preview-ico">📄</span>
+        <span id="tk-att-preview-name"></span>
+        <span id="tk-att-preview-path"></span>
       </div>
     </div>
   </div>
