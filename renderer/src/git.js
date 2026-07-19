@@ -22,6 +22,7 @@ async function ensureLoveaiIgnored() {
 async function gitDetect() {
   repos = projectDir ? await window.deck.gitRepos(projectDir) : [];
   await ensureLoveaiIgnored();
+  if (typeof cpLoadForRepos === 'function') cpLoadForRepos(repos);
   const sel = document.getElementById('git-repo-sel');
   sel.innerHTML = '';
   for (const r of repos) {
@@ -309,7 +310,6 @@ async function cfCancel() {
   }
 }
 document.getElementById('cf-cancel').onclick = cfCancel;
-conflictModal.addEventListener('click', e => { if (e.target === conflictModal) cfCancel(); });
 
 // AI pass: an agent reads every conflict and recommends a side per conflict
 document.getElementById('cf-ai').onclick = async () => {
@@ -441,7 +441,6 @@ function askText({ title, placeholder = '', value = '', work = null, workingText
       if (e.key === 'Enter') submit();
       else if (e.key === 'Escape') done(null);
     });
-    ov.addEventListener('click', e => { if (e.target === ov) done(null); });
   });
 }
 
@@ -915,7 +914,6 @@ function askNewBranch(r, work = null) {
       if (e.key === 'Enter') submit();
       else if (e.key === 'Escape') done(null);
     });
-    ov.addEventListener('click', (e) => { if (e.target === ov) done(null); });
   });
 }
 
@@ -1034,7 +1032,6 @@ function askCheckoutBlocked(name, errText, repo) {
     }
   };
   ov.querySelector('.ask-cancel').onclick = done;
-  ov.addEventListener('click', (e) => { if (e.target === ov) done(); });
   document.body.appendChild(ov);
 }
 
@@ -1076,7 +1073,6 @@ document.getElementById('git-merge-abort').onclick = async () => {
 const gitModal = document.getElementById('git-modal');
 function closeGitModal() { gitModal.classList.add('hidden'); }
 document.getElementById('git-modal-close').onclick = closeGitModal;
-gitModal.addEventListener('click', e => { if (e.target === gitModal) closeGitModal(); });
 
 function renderDiff(container, diffText) {
   container.innerHTML = '';
@@ -1681,9 +1677,86 @@ ${aiState.resultText}`;
 };
 
 // create-PR dialog
+// fetch remote branch short names only (deduped, no HEAD/symref noise) — used
+// anywhere a PR *base* is picked, since a base must exist on the remote for
+// `gh pr create` to work; a local-only branch is never a valid PR base.
+async function remoteBranchNames(repo, exclude) {
+  const b = await window.deck.gitBranches(repo);
+  const seen = new Set();
+  const out = [];
+  for (const rb of (b.ok ? b.remote : [])) {
+    if (/\/HEAD$|->/.test(rb)) continue;
+    const short = rb.replace(/^[^/]+\//, '');
+    if (!short || short === exclude || seen.has(short)) continue;
+    seen.add(short);
+    out.push(short);
+  }
+  return out;
+}
+
+// shared searchable branch-picker (button + dropdown), for any "pick a base
+// branch" field. escapeClipping:true reparents the menu to <body> and
+// positions it with fitDropUp() so an ancestor with overflow:hidden (e.g.
+// .cmt-card's rounded corners) can't clip it — same fix as cmt-push-menu.
+function makeBranchPicker({ btnId, menuId, searchId, listId, escapeClipping }) {
+  const btn = document.getElementById(btnId);
+  const menu = document.getElementById(menuId);
+  const search = document.getElementById(searchId);
+  const list = document.getElementById(listId);
+  let branches = [];
+  let selected = '';
+
+  function render(q) {
+    list.innerHTML = '';
+    const ql = (q || '').toLowerCase();
+    const hits = branches.filter(b => !ql || b.toLowerCase().includes(ql));
+    if (!hits.length) { list.innerHTML = '<div class="git-none">no match</div>'; return; }
+    for (const b of hits.slice(0, 200)) {
+      const row = document.createElement('div');
+      row.className = 'sbranch-item' + (b === selected ? ' sel' : '');
+      row.textContent = b;
+      row.onclick = () => { selected = b; btn.textContent = b; close(); };
+      list.appendChild(row);
+    }
+  }
+  function open() {
+    if (escapeClipping) {
+      if (menu.parentNode !== document.body) document.body.appendChild(menu);
+      menu.classList.remove('hidden');
+      fitDropUp(menu, btn);
+      menu.style.zIndex = '150';
+    } else {
+      menu.classList.remove('hidden');
+    }
+    search.value = '';
+    render('');
+    search.focus();
+  }
+  function close() { menu.classList.add('hidden'); }
+  btn.onclick = (e) => { e.stopPropagation(); menu.classList.contains('hidden') ? open() : close(); };
+  search.oninput = (e) => render(e.target.value);
+  search.onclick = (e) => e.stopPropagation();
+  search.addEventListener('keydown', e => e.stopPropagation());
+  document.addEventListener('click', (e) => {
+    if (!menu.classList.contains('hidden') && !menu.contains(e.target) && e.target !== btn) close();
+  });
+  return {
+    setBranches(names, def) {
+      branches = names;
+      selected = (def && names.includes(def)) ? def : (names[0] || '');
+      btn.textContent = selected || 'select branch…';
+    },
+    get value() { return selected; }
+  };
+}
+
+const ghprBasePicker = makeBranchPicker({
+  btnId: 'ghpr-base-btn', menuId: 'ghpr-base-menu',
+  searchId: 'ghpr-base-search', listId: 'ghpr-base-list'
+});
+
 const ghprModal = document.getElementById('ghpr-modal');
 document.getElementById('ghpr-close').onclick = () => ghprModal.classList.add('hidden');
-ghprModal.addEventListener('click', e => { if (e.target === ghprModal) ghprModal.classList.add('hidden'); });
 document.getElementById('ghpr-refresh').onclick = (e) => { e.stopPropagation(); ghprRefresh(); };
 // searchable head-branch picker for the New PR dialog
 let ghprHead = '';   // chosen source branch
@@ -1729,12 +1802,10 @@ document.getElementById('ghpr-new').onclick = async (e) => {
   for (const rb of (b.ok ? b.remote : [])) if (!/\/HEAD$|->/.test(rb)) add(rb.replace(/^[^/]+\//, ''));
   ghprHead = cur;
   document.getElementById('ghpr-head-btn').textContent = cur ? '⎇ ' + cur : 'select branch…';
-  // base options (everything except the head), default main/master/qa
-  const sel = document.getElementById('ghpr-base-sel');
-  sel.innerHTML = '';
-  for (const name of ghprBranchList.filter(x => x !== cur)) { const o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o); }
-  const def = ghprBranchList.find(x => x === 'main') || ghprBranchList.find(x => x === 'master') || ghprBranchList.find(x => x === 'qa') || sel.options[0]?.value;
-  if (def) sel.value = def;
+  // base must exist on the remote for `gh pr create` to work — remote branches only
+  const remoteBases = await remoteBranchNames(gitRepo, cur);
+  const def = remoteBases.find(x => x === 'main') || remoteBases.find(x => x === 'master') || remoteBases.find(x => x === 'qa');
+  ghprBasePicker.setBranches(remoteBases, def);
   document.getElementById('ghpr-title').value = '';
   document.getElementById('ghpr-body').value = '';
   ghprHeadMenu.classList.add('hidden');
@@ -1774,7 +1845,7 @@ document.getElementById('ghpr-create-btn').onclick = async () => {
   if (!ghprHead) { await showAlert({ title: 'PICK A BRANCH', message: 'Choose the source branch to open the PR from.', okText: 'OK' }); return; }
   if (!title) { document.getElementById('ghpr-title').focus(); return; }
   const body = document.getElementById('ghpr-body').value;
-  const base = document.getElementById('ghpr-base-sel').value;
+  const base = ghprBasePicker.value;
   const btn = document.getElementById('ghpr-create-btn');
   btn.disabled = true; btn.textContent = 'checking conflicts…';
   const chk = await window.deck.prConflictCheck(gitRepo, base, ghprHead);

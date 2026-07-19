@@ -350,14 +350,13 @@ document.getElementById('git-stage-all').onclick = () => gitDo('stage', '*');
 document.getElementById('git-unstage-all').onclick = () => gitDo('unstage', '*');
 document.getElementById('git-pull').onclick = () => gitDo('pull');
 
-// commit like VS Code: if nothing is staged, stage everything first
-// push; if the branch has no upstream yet, publish it (push -u origin <branch>)
+// always push explicitly to the branch of the same name (push -u origin HEAD),
+// never a bare `git push` — a bare push is ambiguous and fails outright whenever
+// the branch's configured upstream doesn't share its name, which happens any
+// time the branch was created off a differently-named base (e.g. branched from
+// origin/qa — git then tracks "qa", not this branch's own name)
 async function pushOrPublish() {
-  let r = await window.deck.gitCmd(gitRepo, 'push');
-  if (!r.ok && /no upstream branch|set-upstream/i.test(r.out)) {
-    const st = await window.deck.gitStatus(gitRepo);
-    r = await window.deck.gitCmd(gitRepo, 'publish', st.branch || 'HEAD');
-  }
-  return r;
+  const st = await window.deck.gitStatus(gitRepo);
+  return window.deck.gitCmd(gitRepo, 'publish', st.branch || 'HEAD');
 }
 

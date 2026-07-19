@@ -248,7 +248,9 @@
           <textarea id="git-msg" rows="1" placeholder="Message (Ctrl+Enter to commit)"></textarea>
           <div class="commit-split">
             <button id="git-commit" class="commit-main">✔ Commit</button>
-            <button id="git-commit-more" class="commit-caret">⌄</button>
+            <button id="git-commit-more" class="commit-caret">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+            </button>
             <div id="commit-menu" class="commit-menu hidden">
               <div class="cm-item" data-kind="plain">Commit</div>
               <div class="cm-item" data-kind="amend">Commit (Amend)</div>
@@ -284,6 +286,14 @@
             <div id="ghpr-body" class="ci-body ghpr-body-list"></div>
           </div>
         </div>
+      </div>
+
+      <!-- ===== Checkpoints — revert a task's edits back to its pre-task snapshot ===== -->
+      <div id="cp-wrap" class="git-wrap">
+        <div id="cp-badge" class="git-badge hidden" title="Checkpoints — revert a task's edits">
+          <span class="gb-ico">↺</span><span class="gb-count" id="cp-count">0</span>
+        </div>
+        <div id="cp-panel" class="git-panel hidden"></div>
       </div>
     </div>
 
@@ -811,7 +821,13 @@
         <span class="ghpr-into">→</span>
         <div class="ghpr-bf">
           <label>Into (base)</label>
-          <select id="ghpr-base-sel"></select>
+          <div class="sbranch">
+            <button type="button" class="sbranch-btn" id="ghpr-base-btn">select branch…</button>
+            <div class="sbranch-menu hidden" id="ghpr-base-menu">
+              <input class="branch-search" id="ghpr-base-search" placeholder="🔎 search branch…" spellcheck="false" />
+              <div class="sbranch-list" id="ghpr-base-list"></div>
+            </div>
+          </div>
         </div>
       </div>
       <input id="ghpr-title" class="ask-input" placeholder="Title" spellcheck="false" />
@@ -943,7 +959,13 @@
             <span class="cmt-pr-base">
               <span id="cmt-pr-head" class="cmt-pr-head"></span>
               <span class="cmt-pr-into">→</span>
-              <select id="cmt-pr-base-sel" title="Base branch"></select>
+              <div class="sbranch cmt-pr-sbranch">
+                <button type="button" class="sbranch-btn" id="cmt-pr-base-btn" title="Base branch">select branch…</button>
+                <div class="sbranch-menu hidden" id="cmt-pr-base-menu">
+                  <input class="branch-search" id="cmt-pr-base-search" placeholder="🔎 search branch…" spellcheck="false" />
+                  <div class="sbranch-list" id="cmt-pr-base-list"></div>
+                </div>
+              </div>
             </span>
           </div>
           <input id="cmt-pr-title" class="ask-input" placeholder="Pull request title" spellcheck="false" />
@@ -980,7 +1002,9 @@
         <div id="cmt-push-wrap" class="cmt-push-split hidden">
           <button id="cmt-push" class="btn btn-launch cmt-push-main">⇡ PUSH</button>
           <button id="cmt-push-caret" class="btn btn-launch cmt-push-caret" title="Push flags — -f, --no-verify, --tags...">
-            <span id="cmt-push-badge" class="cmt-push-badge hidden">0</span>⌄</button>
+            <span id="cmt-push-badge" class="cmt-push-badge hidden">0</span>
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+          </button>
           <div id="cmt-push-menu" class="commit-menu cmt-push-menu hidden">
             <input id="cmt-push-search" class="branch-search" placeholder="🔎 search flags…" spellcheck="false" />
             <div id="cmt-push-flaglist" class="cmt-push-flaglist"></div>
@@ -1030,6 +1054,7 @@
   <script src="src/terminal.js"></script>
   <script src="src/commit.js"></script>
   <script src="src/alert.js"></script>
+  <script src="src/checkpoints.js"></script>
   <script src="src/settings.js"></script>
   <script src="src/explorer.js"></script>
   <script src="src/editor.js"></script>

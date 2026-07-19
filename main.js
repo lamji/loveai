@@ -1486,14 +1486,120 @@ ipcMain.handle('git-log', async (_e, { repo, limit }) => {
   return { ok: true, commits };
 });
 
-// diff for one file (working tree vs index/HEAD), or a whole commit
-ipcMain.handle('git-diff', async (_e, { repo, file, staged, commit }) => {
+// diff for one file (working tree vs index/HEAD), a single whole commit, or a
+// revision range (e.g. "base...HEAD" for "everything this branch adds over base").
+// `commit` and `range` are deliberately separate: `commit` always gets `^!`
+// appended (git's "just this one commit" shorthand) — correct for a single
+// hash, but nonsense appended to an already-a-range string like "qa...HEAD".
+ipcMain.handle('git-diff', async (_e, { repo, file, staged, commit, range }) => {
   const args = ['diff', '--no-color'];
-  if (commit) { args.push(commit + '^!', '--'); }
+  if (range) args.push(range);
+  else if (commit) args.push(commit + '^!');
   else if (staged) args.push('--staged');
-  if (file) args.push('--', file);
+  // exactly one trailing "--", never two — a second "--" is itself parsed as
+  // a literal pathspec and silently breaks any file filter that follows it
+  args.push('--');
+  if (file) args.push(file);
   const r = await git(repo, args);
   return { ok: r.ok, diff: r.out };
+});
+
+// ============================================================
+// CHECKPOINTS — snapshot a repo the instant a task starts, then let the
+// user revert exactly the files that task touched back to that snapshot.
+// Everything here goes through git() so it inherits the same per-repo
+// queueing + stale-lock retry as the rest of source control.
+// ============================================================
+
+// resolve the true repo root for any cwd (handles monorepo subfolders)
+ipcMain.handle('git-repo-root', async (_e, cwd) => {
+  const r = await git(cwd, ['rev-parse', '--show-toplevel']);
+  return r.ok ? { ok: true, repo: r.out.trim() } : { ok: false, error: r.out };
+});
+
+// snapshot the current index+worktree without touching HEAD/branch/stage.
+// `stash create` returns nothing when the tree is already clean — fall back
+// to HEAD so a checkpoint always resolves to a valid ref. Also records the
+// untracked files that already exist at this instant, so a later diff can
+// tell "task created this file" apart from "this junk was already there."
+ipcMain.handle('checkpoint-create', async (_e, repo) => {
+  const s = await git(repo, ['stash', 'create']);
+  let ref = s.ok ? s.out.trim() : '';
+  if (!ref) {
+    const h = await git(repo, ['rev-parse', 'HEAD']);
+    ref = h.ok ? h.out.trim() : '';
+  }
+  const u = await git(repo, ['ls-files', '--others', '--exclude-standard']);
+  const untracked = u.ok ? u.out.split('\n').filter(Boolean) : [];
+  return { ok: !!ref, ref, untracked };
+});
+
+// which files actually changed since the checkpoint — computed from git
+// itself (not from watching individual tool calls), so it catches edits
+// made ANY way: Edit/Write/MultiEdit, Bash (rm/mv/sed/redirects), whatever.
+// - tracked files: `git diff --name-only <ref>` catches any content change
+//   or deletion to a file that existed at the checkpoint, regardless of tool.
+// - untracked files: anything untracked now that wasn't in the checkpoint's
+//   untracked baseline is new-since-checkpoint.
+ipcMain.handle('checkpoint-touched', async (_e, { repo, ref, baselineUntracked }) => {
+  const d = await git(repo, ['diff', '--name-only', ref]);
+  const trackedChanged = d.ok ? d.out.split('\n').filter(Boolean) : [];
+  const u = await git(repo, ['ls-files', '--others', '--exclude-standard']);
+  const curUntracked = u.ok ? u.out.split('\n').filter(Boolean) : [];
+  const baseSet = new Set(baselineUntracked || []);
+  const newUntracked = curUntracked.filter(f => !baseSet.has(f));
+  return { ok: true, files: [...new Set([...trackedChanged, ...newUntracked])] };
+});
+
+// diff one touched file against its checkpoint snapshot (panel preview)
+ipcMain.handle('checkpoint-diff', async (_e, { repo, ref, file }) => {
+  const r = await git(repo, ['diff', '--no-color', ref, '--', file]);
+  return { ok: r.ok, diff: r.out };
+});
+
+// revert touched files to their exact checkpoint content. A file missing
+// from the snapshot was created by the task itself — delete it; one present
+// gets its pre-task bytes restored via checkout.
+ipcMain.handle('checkpoint-revert', async (_e, { repo, ref, files }) => {
+  const results = [];
+  for (const f of files || []) {
+    const exists = await git(repo, ['cat-file', '-e', `${ref}:${f}`]);
+    if (exists.ok) {
+      const co = await git(repo, ['checkout', ref, '--', f]);
+      results.push({ file: f, ok: co.ok, action: 'restored', out: co.out });
+    } else {
+      try {
+        fs.unlinkSync(path.join(repo, f));
+        results.push({ file: f, ok: true, action: 'deleted' });
+      } catch (e) {
+        results.push({ file: f, ok: false, action: 'delete-failed', out: String(e && e.message ? e.message : e) });
+      }
+    }
+  }
+  return { ok: results.every(r => r.ok), results };
+});
+
+// checkpoint history, kept per-repo under .loveai/ (already gitignored)
+function checkpointsPath(repo) { return path.join(repo, '.loveai', 'checkpoints.json'); }
+
+ipcMain.handle('checkpoints-load', (_e, repo) => {
+  try {
+    const p = checkpointsPath(repo);
+    return { ok: true, list: fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : [] };
+  } catch (e) {
+    return { ok: false, list: [], error: String(e && e.message ? e.message : e) };
+  }
+});
+
+ipcMain.handle('checkpoints-save', (_e, { repo, list }) => {
+  try {
+    const dir = path.join(repo, '.loveai');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(checkpointsPath(repo), JSON.stringify((list || []).slice(-30), null, 2));
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
 });
 
 // remotes: name -> url

@@ -1802,6 +1802,7 @@ textarea.dropping { border-color: var(--accent) !important; background: var(--ac
   background: var(--accent); color: #fff;
   border: none; border-left: 1px solid var(--surface-2); border-radius: 0 4px 4px 0;
   font-size: 13px;
+  display: flex; align-items: center; justify-content: center;
 }
 .commit-caret:hover { background: var(--accent); filter: brightness(1.1); }
 .commit-menu {
@@ -1831,13 +1832,17 @@ textarea.dropping { border-color: var(--accent) !important; background: var(--ac
   top: auto; bottom: calc(100% + 6px); right: 0;
   overflow: hidden; display: flex; flex-direction: column;
 }
-.cmt-push-flaglist { overflow-y: auto; flex: 1; }
+.cmt-push-flaglist { overflow-y: auto; overflow-x: hidden; flex: 1; }
 .cmt-push-flag-row { display: flex; align-items: center; gap: 8px; }
 .cmt-push-flag-row input { cursor: pointer; flex: none; }
-.cmt-push-flag-name { flex: 1; }
+.cmt-push-flag-name {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .cmt-push-flag-code {
   font-family: var(--mono); font-size: 10px; color: var(--dim);
   background: var(--surface-2); border-radius: 4px; padding: 1px 6px; flex: none;
+  white-space: nowrap;
 }
 
 /* sections + file rows */
@@ -1867,6 +1872,32 @@ textarea.dropping { border-color: var(--accent) !important; background: var(--ac
 .git-file.gf-conflict .gf-name { color: var(--red); }
 .git-file.gf-conflict .gf-status { color: var(--red); }
 .git-out { font-family: var(--mono); font-size: 10px; min-height: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ===== Checkpoints ===== */
+#cp-panel { width: 360px; max-height: 70vh; overflow-y: auto; }
+.cp-list { display: flex; flex-direction: column; gap: 4px; }
+.cp-item { border-radius: 6px; padding: 2px 0; }
+.cp-item.cp-flash { animation: cp-flash-anim 1.2s ease; }
+@keyframes cp-flash-anim { 0%, 100% { background: transparent; } 30% { background: var(--accent-weak); } }
+.cp-head {
+  display: flex; align-items: center; gap: 6px; cursor: pointer;
+  padding: 5px 6px; border-radius: 6px;
+}
+.cp-head:hover { background: var(--hover); }
+.cp-caret { flex: none; color: var(--dim); font-size: 10px; width: 10px; }
+.cp-label {
+  font-size: 12px; color: var(--text); white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; max-width: 150px; flex: none;
+}
+.cp-meta { flex: 1; font-size: 10px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cp-revert-all {
+  flex: none; font-size: 10px; padding: 3px 8px; opacity: 0; transition: opacity .1s;
+}
+.cp-head:hover .cp-revert-all { opacity: 1; }
+.cp-files { padding: 2px 0 6px 18px; display: flex; flex-direction: column; gap: 2px; }
+.cp-file .gf-name { max-width: 130px; }
+.cp-note-link { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+.cp-note-link:hover { color: var(--accent); }
 
 /* branch switcher + sync state */
 .git-branch-row { display: flex; align-items: center; gap: 8px; position: relative; }
@@ -2007,8 +2038,8 @@ textarea.dropping { border-color: var(--accent) !important; background: var(--ac
 }
 .ghpr-body:focus { outline: none; border-color: var(--cyan); }
 
-/* PR accordion section */
-.ghpr-body-list { max-height: 340px; }
+/* PR accordion section — cap at ~5 rows (each ~46px), rest scrolls */
+.ghpr-body-list { max-height: 230px; }
 .ghpr-item { border-bottom: 1px solid var(--stroke); }
 .ghpr-row { display: flex; align-items: center; gap: 8px; padding: 6px 6px 6px 14px; cursor: pointer; }
 .ghpr-row:hover { background: var(--hover); }
@@ -2128,11 +2159,8 @@ textarea.dropping { border-color: var(--accent) !important; background: var(--ac
 .cmt-pr-row .ask-input { margin: 0 0 8px; }
 .cmt-pr-base { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 11px; color: var(--dim); }
 .cmt-pr-head { color: var(--cyan); }
-.cmt-pr-base select {
-  flex: 1; background: var(--surface-2); color: var(--text);
-  border: 1px solid var(--stroke); border-radius: 6px; padding: 6px 9px;
-  font-family: var(--mono); font-size: 12px;
-}
+.cmt-pr-sbranch { flex: 1; min-width: 0; }
+.cmt-pr-sbranch .sbranch-btn { padding: 6px 9px; font-size: 12px; }
 .ai-line.git { color: #9fb4c9; }
 .cmt-msg-row { display: flex; gap: 8px; align-items: stretch; margin-bottom: 10px; }
 .cmt-msg-wrap { flex: 1; position: relative; }

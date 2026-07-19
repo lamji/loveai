@@ -1152,6 +1152,13 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   // point the agent at the project map so it never re-explores the repo.
   // The indexer writes the map, so it never gets the hint itself.
   const cwd = opts.cwd || a.cwd;
+  // CHECKPOINT — one snapshot per task, not per stage: a pipeline run already
+  // owns a checkpoint for pipe.cwd, so a stage sharing that cwd joins it
+  // instead of starting a redundant one. A stage in a different cwd (or any
+  // standalone run) gets its own.
+  r.cpStandalone = !(pipe.active && pipe.cwd === cwd);
+  if (r.cpStandalone && cwd) cpBeginTask(cwd, prompt);
+  r.cpCwd = cwd;
   let fullPrompt = prompt;
   if (a.role !== 'indexer' && await hasProjectMap(cwd)) {
     fullPrompt += '\n\nOrientation: read .loveai/index/PROJECT-MAP.md first and open only the files relevant to this task — do not survey the repo.';
@@ -1366,6 +1373,7 @@ window.deck.onAgentEvent(ev => {
         try { cb(r.lastResult, r.lastText || ''); } catch {}
       }
       delete runEventSinks[ev.runId];
+      if (r.cpStandalone && r.cpCwd) { cpEndTask(r.cpCwd); r.cpStandalone = false; }
       if (typeof gitRefresh === 'function' && gitRepo) gitRefresh();
       // a MANUAL Prompt Engineer run (outside the pipeline) that produced task
       // files → offer to deploy engineers, so the work doesn't just stop
@@ -1429,6 +1437,7 @@ async function launchPipeline(issue, effort) {
 
   pipe.active = true;
   pipe.cwd = pe.cwd;
+  cpBeginTask(pipe.cwd, issue);
   pipe.iteration = 0;
   pipe.effort = effort || null;
   pipe.reviewerSessionId = null;
@@ -1490,6 +1499,7 @@ function bridgePipelineSession() {
 function abortPipeline(msg) {
   pipe.active = false;
   setStage(null);
+  cpEndTask(pipe.cwd);
   document.getElementById('btn-pipeline-stop').classList.add('hidden');
   hidePlanReview();
   hideReassigning();
@@ -1505,6 +1515,7 @@ function abortPipeline(msg) {
 function finishPipeline(msg) {
   pipe.active = false;
   setStage(null);
+  cpEndTask(pipe.cwd);
   document.getElementById('btn-pipeline-stop').classList.add('hidden');
   plog('ok', msg);
   cleanupSeniors();
@@ -1596,7 +1607,6 @@ async function showPlanReview() {
 }
 
 document.getElementById('pr-close').onclick = hidePlanReview;
-planModal.addEventListener('click', e => { if (e.target === planModal) hidePlanReview(); });
 
 // Read the task files in .loveai/pipeline/, route each to an agent, and start the
 // BUILD → REVIEW stages. Used both by the plan-approval gate AND when a manual
@@ -2332,7 +2342,6 @@ function closeChatExpand() {
 }
 document.getElementById('btn-chat-expand').onclick = openChatExpand;
 document.getElementById('cx-close').onclick = closeChatExpand;
-chatExpandModal.addEventListener('click', e => { if (e.target === chatExpandModal) closeChatExpand(); });
 document.getElementById('cx-send').onclick = () => {
   // push the modal's values into the real controls, then reuse sendChat()
   document.getElementById('chat-target').value = document.getElementById('cx-target').value;
@@ -2606,7 +2615,6 @@ document.getElementById('f-save').onclick = () => {
   modal.classList.add('hidden');
   render();
 };
-modal.addEventListener('click', e => { if (e.target === modal) modal.classList.add('hidden'); });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     // the alert is modal on purpose — Escape answers it, nothing else
@@ -3079,7 +3087,6 @@ document.getElementById('account-bar').onclick = () => { acctModal.classList.rem
 document.getElementById('ac-close').onclick = () => acctModal.classList.add('hidden');
 // live: re-fetch plan usage every 60s while the modal is open
 setInterval(() => { if (!acctModal.classList.contains('hidden')) renderPlanUsage(); }, 60000);
-acctModal.addEventListener('click', e => { if (e.target === acctModal) acctModal.classList.add('hidden'); });
 document.getElementById('ac-refresh').onclick = () => { refreshAuth(); renderPlanUsage(); };
 document.getElementById('ac-reset').onclick = () => {
   usage = { date: todayKey(), runs: 0, in: 0, out: 0, cost: 0 };

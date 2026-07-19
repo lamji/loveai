@@ -50,5 +50,3 @@ function showAlert({ title, message, okText = 'OK', cancelText = null, kind = 'w
   return new Promise(res => { alertResolve = res; });
 }
 
-alertModal.addEventListener('click', e => { if (e.target === alertModal && !alertBusy) closeAlert(false); });
-

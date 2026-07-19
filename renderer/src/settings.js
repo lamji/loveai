@@ -306,7 +306,6 @@ document.getElementById('sk-create').onclick = async () => {
 document.getElementById('btn-settings').onclick = () => { settingsModal.classList.remove('hidden'); loadSettings(); };
 document.getElementById('set-close').onclick = () => settingsModal.classList.add('hidden');
 document.getElementById('set-refresh').onclick = loadSettings;
-settingsModal.addEventListener('click', e => { if (e.target === settingsModal) settingsModal.classList.add('hidden'); });
 
 // ============================================================
 // THEME — dark / light

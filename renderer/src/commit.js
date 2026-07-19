@@ -17,19 +17,27 @@ function cmtStepMark(step, cls) {
 
 // ===== PUSH FLAGS — searchable multi-select menu next to the PUSH button =====
 const PUSH_FLAGS = [
-  { flag: '--force-with-lease', label: 'Force (safe)', hint: 'Overwrite the remote, but fail if it has commits you have not fetched yet' },
-  { flag: '--force', label: 'Force', hint: 'Overwrite the remote branch unconditionally — can destroy other people’s work' },
-  { flag: '--force-if-includes', label: 'Force if includes', hint: 'With Force (safe): also require the remote tip is already integrated locally' },
-  { flag: '--no-verify', label: 'Skip hooks', hint: 'Bypass the pre-push hook' },
-  { flag: '--tags', label: 'Push tags', hint: 'Push all local tags along with this push' },
-  { flag: '--follow-tags', label: 'Follow tags', hint: 'Push annotated tags reachable from the pushed commits' },
-  { flag: '--atomic', label: 'Atomic', hint: 'All refs update together, or none do' },
-  { flag: '--prune', label: 'Prune', hint: 'Remove remote branches that no longer exist locally' },
-  { flag: '--dry-run', label: 'Dry run', hint: 'Show what would be pushed without actually pushing anything' },
-  { flag: '--no-thin', label: 'No thin pack', hint: 'Disable the thin-pack transfer optimization' },
-  { flag: '-v', label: 'Verbose', hint: 'Verbose push output' }
+  { flag: '--force-with-lease', label: 'Force (safe)' },
+  { flag: '--force', label: 'Force' },
+  { flag: '--force-if-includes', label: 'Force if includes' },
+  { flag: '--no-verify', label: 'Skip hooks' },
+  { flag: '--tags', label: 'Push tags' },
+  { flag: '--follow-tags', label: 'Follow tags' },
+  { flag: '--atomic', label: 'Atomic' },
+  { flag: '--prune', label: 'Prune' },
+  { flag: '--dry-run', label: 'Dry run' },
+  { flag: '--no-thin', label: 'No thin pack' },
+  { flag: '-v', label: 'Verbose' }
 ];
 const cmtPushFlags = new Set();   // extra flags selected for the NEXT push — reset per modal open
+
+// PR base-branch picker — escapeClipping:true because .cmt-card has
+// overflow:hidden (rounded corners), same clipping problem as cmt-push-menu
+const cmtPrBasePicker = makeBranchPicker({
+  btnId: 'cmt-pr-base-btn', menuId: 'cmt-pr-base-menu',
+  searchId: 'cmt-pr-base-search', listId: 'cmt-pr-base-list',
+  escapeClipping: true
+});
 
 function cmtPushBadgeSync() {
   const badge = cmtEl('cmt-push-badge');
@@ -47,7 +55,6 @@ function cmtRenderPushFlags(filter) {
   for (const f of rows) {
     const row = document.createElement('label');
     row.className = 'cm-item cmt-push-flag-row';
-    row.title = f.hint;
     row.innerHTML = '<input type="checkbox" />' +
       '<span class="cmt-push-flag-name"></span><code class="cmt-push-flag-code"></code>';
     row.querySelector('input').checked = cmtPushFlags.has(f.flag);
@@ -64,10 +71,18 @@ function cmtRenderPushFlags(filter) {
 document.getElementById('cmt-push-caret').onclick = (e) => {
   e.stopPropagation();
   const menu = cmtEl('cmt-push-menu');
+  const anchor = e.currentTarget;
   if (menu.classList.contains('hidden')) {
+    // .cmt-card has overflow:hidden (for its rounded corners), which clips ANY
+    // descendant regardless of position — fixed or not. Reparent the menu to
+    // <body> so it escapes that ancestor entirely, then anchor it to the
+    // button with fixed coordinates (same pattern as the branch-switcher menu).
+    if (menu.parentNode !== document.body) document.body.appendChild(menu);
     cmtEl('cmt-push-search').value = '';
     cmtRenderPushFlags('');
     menu.classList.remove('hidden');
+    fitDropUp(menu, anchor);
+    menu.style.zIndex = '150';   // now a body-level sibling of .modal (z-index:100) — must sit above it
     cmtEl('cmt-push-search').focus();
   } else {
     menu.classList.add('hidden');
@@ -270,10 +285,12 @@ cmtEl('cmt-push').onclick = async () => {
   cmtSetState('pushing');
   if (cmt.kind === 'sync') await cmtGitStream('pull');
   const flags = [...cmtPushFlags];
-  let r = await cmtGitStream('push', flags.length ? flags : undefined);
-  if (!r.ok && /no upstream branch|set-upstream/i.test(r.out)) {
-    r = await cmtGitStream('publish', { branch: cmt.branch || 'HEAD', flags });
-  }
+  // always push explicitly to the branch of the same name (git push -u origin
+  // HEAD), never a bare `git push` — a bare push is ambiguous and fails outright
+  // whenever the branch's configured upstream doesn't share its name, which
+  // happens any time the branch was created off a differently-named base (e.g.
+  // branched from origin/qa — git then tracks "qa", not this branch's own name)
+  const r = await cmtGitStream('publish', { branch: cmt.branch || 'HEAD', flags });
   cmt.running = false;
   if (!r.ok) {
     // the live panel already streamed the full output — no duplicate error pane
@@ -295,24 +312,13 @@ async function cmtPreparePR() {
   const msg = cmtEl('cmt-msg').value || '';
   cmtEl('cmt-pr-title').value = msg.split('\n')[0] || cmt.branch;
   cmtEl('cmt-pr-head').textContent = cmt.branch;
-  const sel = cmtEl('cmt-pr-base-sel');
-  sel.innerHTML = '<option>loading…</option>';
   cmtEl('cmt-pr-row').classList.remove('hidden');
   cmtStepMark('pr', 'active');
   cmtSetState('pushed');
-  const b = await window.deck.gitBranches(gitRepo);
-  const bases = [];
-  const seen = new Set();
-  for (const rb of (b.ok ? b.remote : [])) {
-    const short = rb.replace(/^[^/]+\//, '');
-    if (!/\/HEAD$|->/.test(rb) && short !== cmt.branch && !seen.has(short)) { seen.add(short); bases.push(short); }
-  }
-  for (const l of (b.ok ? b.local : [])) if (l.name !== cmt.branch && !seen.has(l.name)) { seen.add(l.name); bases.push(l.name); }
-  sel.innerHTML = '';
-  for (const name of bases) { const o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o); }
-  // default base: main → master → qa → first
+  // base must exist on the remote for `gh pr create` to work — remote branches only
+  const bases = await remoteBranchNames(gitRepo, cmt.branch);
   const def = bases.find(x => x === 'main') || bases.find(x => x === 'master') || bases.find(x => x === 'qa') || bases[0];
-  if (def) sel.value = def;
+  cmtPrBasePicker.setBranches(bases, def);
   // auto-write the PR description from the branch's changes (editable)
   cmtGenPRDesc();
 }
@@ -322,18 +328,28 @@ async function cmtGenPRDesc() {
   const status = cmtEl('cmt-desc-status');
   const box = cmtEl('cmt-pr-desc');
   // lock the PR inputs + show a spinner overlay while the AI writes
-  const locked = ['cmt-pr-desc', 'cmt-pr-title', 'cmt-pr-base-sel', 'cmt-gen-desc', 'cmt-pr'];
+  const locked = ['cmt-pr-desc', 'cmt-pr-title', 'cmt-pr-base-btn', 'cmt-gen-desc', 'cmt-pr'];
   const setLocked = on => locked.forEach(id => { const e = cmtEl(id); if (e) e.disabled = on; });
   setLocked(true);
   cmtEl('cmt-desc-overlay').classList.remove('hidden');
   box.classList.add('generating');
   status.textContent = '';
   const done = () => { setLocked(false); cmtEl('cmt-desc-overlay').classList.add('hidden'); box.classList.remove('generating'); };
-  const base = cmtEl('cmt-pr-base-sel').value || 'main';
-  // diff of this branch vs the base gives the reviewer-facing change set
-  let d = await window.deck.gitDiff(gitRepo, { commit: `${base}...HEAD` });
+  const base = cmtPrBasePicker.value || 'main';
+  // diff of this branch vs the base gives the reviewer-facing change set. Use
+  // `range`, NOT `commit` — `commit` always gets `^!` appended (single-commit
+  // shorthand), which mangles an already-a-range string like "qa...HEAD".
+  let d = await window.deck.gitDiff(gitRepo, { range: `${base}...HEAD` });
   let diff = (d.ok && d.diff) ? d.diff : '';
   if (!diff.trim()) diff = await cmtChangeDiff();
+  if (!diff.trim()) {
+    // never hand the model an empty diff — it will fabricate a plausible-
+    // sounding but entirely made-up description instead of admitting there's
+    // nothing to describe
+    done();
+    status.textContent = `✗ no diff found for ${cmt.branch} vs ${base} — write the description manually`;
+    return;
+  }
   const prompt = `Write a pull-request description for these changes.
 
 Decide the type from the diff and branch name "${cmt.branch}":
@@ -357,7 +373,7 @@ cmtEl('cmt-pr').onclick = async () => {
   if (cmt.running) return;
   const title = cmtEl('cmt-pr-title').value.trim() || cmt.branch;
   const bodyDesc = cmtEl('cmt-pr-desc').value.trim();
-  const base = cmtEl('cmt-pr-base-sel').value;
+  const base = cmtPrBasePicker.value;
   if (!base) { cmtLive('✗ pick a base branch', 'err'); return; }
   cmt.running = true;
   cmtShowLive('CREATE PR PROCESS');
@@ -414,10 +430,16 @@ ${cmt.lastError.slice(0, 9000)}`;
   });
 };
 
+// the push-flags menu now lives at <body> level while open (see cmt-push-caret
+// above) so it isn't clipped by .cmt-card's overflow:hidden — make sure it
+// doesn't survive the modal closing behind it
+function cmtCloseModal() {
+  cmtModal.classList.add('hidden');
+  cmtEl('cmt-push-menu').classList.add('hidden');
+}
 cmtEl('cmt-abort').onclick = () => { if (cmt.aiAgentId) stopAgent(cmt.aiAgentId); };
-cmtEl('cmt-close').onclick = () => cmtModal.classList.add('hidden');
-cmtEl('cmt-cancel').onclick = () => { if (!cmt.running && !cmt.aiAgentId) cmtModal.classList.add('hidden'); };
-cmtModal.addEventListener('click', e => { if (e.target === cmtModal && !cmt.running && !cmt.aiAgentId) cmtModal.classList.add('hidden'); });
+cmtEl('cmt-close').onclick = cmtCloseModal;
+cmtEl('cmt-cancel').onclick = () => { if (!cmt.running && !cmt.aiAgentId) cmtCloseModal(); };
 
 const commitMenu = document.getElementById('commit-menu');
 document.getElementById('git-commit').onclick = () => openCommitModal('plain');
