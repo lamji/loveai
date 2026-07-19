@@ -22,10 +22,14 @@ window.deck.onTermData(p => {
   if (p.exited) { t.dead = true; renderTermTabs(); }
 });
 
+// terminals belonging to the project currently on screen
+function wsTerms() { return termTabs.filter(t => t.wsId === activeWorkspaceId); }
+
 function renderTermTabs() {
-  tvTabs.style.display = termTabs.length ? '' : 'none';   // hide the list when empty
+  const mine = wsTerms();
+  tvTabs.style.display = mine.length ? '' : 'none';   // hide the list when empty
   tvTabs.innerHTML = '';
-  for (const t of termTabs) {
+  for (const t of mine) {
     const el = document.createElement('div');
     el.className = 'tv-tab' + (t.id === termActive ? ' active' : '') + (t.dead ? ' dead' : '');
     el.title = 'double-click or right-click to rename';
@@ -191,7 +195,10 @@ async function newTerm(shell, cwd) {
   }).observe(pane);
 
   const startCwd = cwd || gitRepo || projectDir || '';
-  const t = { id, shell, cwd: startCwd, title: '', xterm: xt, fit, pane, dead: false };
+  // the terminal belongs to the project that's active when it's opened, so it
+  // travels with that project when you switch workspaces
+  const t = { id, shell, cwd: startCwd, wsId: activeWorkspaceId,
+              title: '', xterm: xt, fit, pane, dead: false };
   termTabs.push(t);
   activateTerm(id);
   try { fit.fit(); } catch {}
@@ -220,7 +227,9 @@ function closeTerm(id) {
   t.pane.remove();
   termTabs.splice(i, 1);
   if (termActive === id) {
-    termActive = termTabs.length ? termTabs[Math.max(0, i - 1)].id : null;
+    // fall back to another terminal in the SAME project, not a random one
+    const mine = wsTerms();
+    termActive = mine.length ? mine[Math.max(0, Math.min(i - 1, mine.length - 1))].id : null;
     if (termActive) activateTerm(termActive);
   }
   renderTermTabs();
@@ -230,8 +239,9 @@ function closeTerm(id) {
 // / console above it (no longer swaps the center surface). See src/layout.js.
 function openTerminal() {
   panelShow('terminal');
-  if (!termTabs.length) newTerm('bash');
-  else activateTerm(termActive || termTabs[0].id);
+  const mine = wsTerms();
+  if (!mine.length) newTerm('bash');   // first terminal for this project
+  else activateTerm(mine.some(t => t.id === termActive) ? termActive : mine[0].id);
   setTermIconActive(true);
   renderConsoleChips();
 }
@@ -241,6 +251,31 @@ function closeTerminalView() {
   panelHide();
   setTermIconActive(false);
   renderConsoleChips();
+}
+
+// switching projects: hide every terminal, reveal the active project's — and
+// if its panel is open with no terminal yet, spawn one in its own cwd
+function syncTermsToWorkspace() {
+  termTabs.forEach(t => t.pane.classList.add('hidden'));
+  const mine = wsTerms();
+  if (mine.length) {
+    const keep = mine.find(t => t.id === termActive) || mine[0];
+    termActive = keep.id;
+    keep.pane.classList.remove('hidden');
+    try { keep.fit.fit(); } catch {}
+  } else {
+    termActive = null;
+    // open a shell in THIS project's folder. Pass projectDir explicitly — gitRepo
+    // is set asynchronously by gitDetect() and still holds the previous project's
+    // repo at this instant, which would open the terminal in the wrong directory.
+    if (termOpen() && projectDir) { newTerm('bash', projectDir); return; }
+  }
+  renderTermTabs();
+}
+
+// closing (or resetting) a project: tear down its terminals
+function killWorkspaceTerms(wsId) {
+  for (const t of termTabs.filter(t => t.wsId === wsId)) closeTerm(t.id);
 }
 
 // fit the visible terminal to the panel (called on resize / panel show)

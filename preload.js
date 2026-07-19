@@ -43,6 +43,7 @@ contextBridge.exposeInMainWorld('deck', {
   fsCreate: (root, dir, rel, isDir) => ipcRenderer.invoke('fs-create', { root, dir, rel, isDir }),
   fsRename: (root, from, to) => ipcRenderer.invoke('fs-rename', { root, from, to }),
   fsDelete: (root, target) => ipcRenderer.invoke('fs-delete', { root, target }),
+  fsCopy: (root, from, to) => ipcRenderer.invoke('fs-copy', { root, from, to }),
   fsHighlight: (content, lang, theme) => ipcRenderer.invoke('fs-highlight', { content, lang, theme }),
   mcpList: (projectDir) => ipcRenderer.invoke('mcp-list', projectDir),
   skillsList: (projectDir) => ipcRenderer.invoke('skills-list', projectDir),

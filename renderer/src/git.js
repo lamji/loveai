@@ -446,30 +446,75 @@ function askText({ title, placeholder = '', value = '', work = null, workingText
 }
 
 // ---------- branch switcher ----------
+// Local branches are the default and are NEVER blocked by the network: the menu
+// renders instantly from a per-repo cache (or a fast local `git branch`), while
+// `git fetch` runs in the background and the REMOTE section fills in when done.
 const branchMenu = document.getElementById('branch-menu');
 const branchFetchedRepos = new Set();   // repos already `git fetch`ed this session
+const branchFetching = new Set();       // repos with a fetch in flight right now
+const branchCache = {};                 // repo -> last gitBranches result
+let branchMenuRepo = null;              // repo the open menu belongs to
+
+function branchMenuOpenFor(repo) {
+  return !branchMenu.classList.contains('hidden') && branchMenuRepo === repo;
+}
+
+// re-query the (local, fast) branch list, update the cache, repaint if open
+async function refreshBranchCache(repo) {
+  const r = await window.deck.gitBranches(repo);
+  if (r && r.ok) branchCache[repo] = r;
+  if (branchMenuOpenFor(repo)) renderBranchMenu(branchCache[repo] || r);
+  return r;
+}
+
+// background remote fetch — once per repo per session, or forced via ⟳ fetch
+function startRemoteFetch(repo, force = false) {
+  if (!repo || branchFetching.has(repo)) return;
+  if (!force && branchFetchedRepos.has(repo)) return;
+  branchFetching.add(repo);
+  branchFetchedRepos.add(repo);
+  window.deck.gitCmd(repo, 'fetch')
+    .catch(() => {})
+    .then(() => {
+      branchFetching.delete(repo);
+      refreshBranchCache(repo);
+    });
+}
+
 document.getElementById('git-branch-btn').onclick = async (e) => {
   e.stopPropagation();
   if (!branchMenu.classList.contains('hidden')) { branchMenu.classList.add('hidden'); return; }
   if (!gitRepo) return;
-  // remotes only show up after a fetch — do it once per repo per session (or on
-  // demand via the ⟳ button), with a loading state so it never looks empty
-  if (!branchFetchedRepos.has(gitRepo)) {
-    branchMenu.innerHTML = '<div class="cm-item">⟳ fetching remotes…</div>';
-    branchMenu.classList.remove('hidden');
+  branchMenuRepo = gitRepo;
+  branchMenu.classList.remove('hidden');
+  if (branchCache[gitRepo]) {
+    renderBranchMenu(branchCache[gitRepo]);       // instant — cached list
+  } else {
+    branchMenu.innerHTML = '<div class="cm-item">⟳ loading branches…</div>';
     fitDropUp(branchMenu, document.getElementById('git-branch-btn'));
-    await window.deck.gitCmd(gitRepo, 'fetch');
-    branchFetchedRepos.add(gitRepo);
   }
-  const r = await window.deck.gitBranches(gitRepo);
+  startRemoteFetch(gitRepo);                      // remotes arrive when ready
+  await refreshBranchCache(gitRepo);              // fresh local list (fast)
+};
+
+function renderBranchMenu(r) {
+  // keep the user's filter/toggles across background repaints
+  const prevSearch = branchMenu.querySelector('.branch-search');
+  const prev = {
+    q: prevSearch ? prevSearch.value : '',
+    hideLocal: !!(branchMenu.querySelector('.bt-local') || {}).checked,
+    hideRemote: !!(branchMenu.querySelector('.bt-remote') || {}).checked,
+    hadFocus: prevSearch && document.activeElement === prevSearch
+  };
   branchMenu.innerHTML = '';
-  if (!r.ok) { branchMenu.innerHTML = `<div class="cm-item">${esc(r.error || 'failed')}</div>`; }
+  if (!r || !r.ok) { branchMenu.innerHTML = `<div class="cm-item">${esc((r && r.error) || 'failed')}</div>`; }
   else {
     // search box (pinned, doesn't scroll)
     const search = document.createElement('input');
     search.className = 'branch-search';
     search.placeholder = '🔎 filter branches…';
     search.spellcheck = false;
+    search.value = prev.q;
     branchMenu.appendChild(search);
 
     // checking a box filters OUT that category
@@ -482,11 +527,12 @@ document.getElementById('git-branch-btn').onclick = async (e) => {
     branchMenu.appendChild(toggles);
     const cbLocal = toggles.querySelector('.bt-local');
     const cbRemote = toggles.querySelector('.bt-remote');
-    toggles.querySelector('.bt-fetch').onclick = async (ev) => {
+    cbLocal.checked = prev.hideLocal;
+    cbRemote.checked = prev.hideRemote;
+    toggles.querySelector('.bt-fetch').onclick = (ev) => {
       ev.stopPropagation();
-      branchFetchedRepos.delete(gitRepo);          // force a fresh fetch
-      branchMenu.classList.add('hidden');
-      document.getElementById('git-branch-btn').click();   // reopen → refetch + rerender
+      startRemoteFetch(branchMenuRepo, true);      // background — menu stays usable
+      renderBranchMenu(r);                         // repaint to show the fetching row
     };
 
     const list = document.createElement('div');
@@ -508,15 +554,15 @@ document.getElementById('git-branch-btn').onclick = async (e) => {
       const it = document.createElement('div');
       it.className = 'cm-item' + (b.current ? ' cm-current' : '');
       it.innerHTML = `<span>${b.current ? '● ' : ''}${esc(b.name)}</span>${b.current ? '' : '<span class="cm-del" title="Delete">🗑</span>'}`;
-      it.querySelector('span').onclick = async () => {
+      it.querySelector('span').onclick = () => {
         branchMenu.classList.add('hidden');
-        if (!b.current) { await gitDo('checkout', b.name); refreshWorkspace(); }
+        if (!b.current) checkoutWithGuard(b.name);
       };
       const del = it.querySelector('.cm-del');
       if (del) del.onclick = async (ev) => {
         ev.stopPropagation();
         const ok = await showAlert({ title: 'DELETE BRANCH', message: `Delete branch "${b.name}"? Unmerged commits on it will be lost.`, okText: 'DELETE', cancelText: 'CANCEL', kind: 'danger' });
-        if (ok) { await gitDo('delete-branch', b.name); document.getElementById('git-branch-btn').click(); document.getElementById('git-branch-btn').click(); }
+        if (ok) { await gitDo('delete-branch', b.name); refreshBranchCache(branchMenuRepo); }
       };
       list.appendChild(it);
       rows.push({ name: b.name.toLowerCase(), el: it, kind: 'local' });
@@ -529,20 +575,26 @@ document.getElementById('git-branch-btn').onclick = async (e) => {
       .map(rb => ({ full: rb, short: rb.replace(/^[^/]+\//, '') }))
       .filter(rb => !localNames.has(rb.short))              // no dup of a local branch
       .sort((a, b) => a.full.localeCompare(b.full));
-    if (remotes.length) {
+    if (remotes.length || branchFetching.has(branchMenuRepo)) {
       addHeader('REMOTE');
       for (const rb of remotes) {
         const it = document.createElement('div');
         it.className = 'cm-item branch-remote';
         it.innerHTML = `<span>${esc(rb.full)}</span><span class="branch-co" title="Check out (creates a local tracking branch)">⤓</span>`;
         // selecting a remote branch auto-branches out: creates a local tracking branch
-        it.onclick = async () => {
+        it.onclick = () => {
           branchMenu.classList.add('hidden');
-          await gitDo('checkout', rb.short);
-          refreshWorkspace();
+          checkoutWithGuard(rb.short);
         };
         list.appendChild(it);
         rows.push({ name: rb.full.toLowerCase(), el: it, kind: 'remote' });
+      }
+      // remotes update in the background — locals above stay usable meanwhile
+      if (branchFetching.has(branchMenuRepo)) {
+        const busy = document.createElement('div');
+        busy.className = 'git-none';
+        busy.textContent = '⟳ fetching remotes…';
+        list.appendChild(busy);
       }
     }
 
@@ -574,21 +626,417 @@ document.getElementById('git-branch-btn').onclick = async (e) => {
     search.oninput = applyBranchFilter;
     cbLocal.onchange = applyBranchFilter;
     cbRemote.onchange = applyBranchFilter;
+    applyBranchFilter();   // re-apply a filter preserved across a repaint
     search.onkeydown = (ev) => { if (ev.key === 'Escape') { ev.stopPropagation(); branchMenu.classList.add('hidden'); } };
 
     const create = document.createElement('div');
     create.className = 'cm-item branch-create'; create.textContent = '＋ Create branch…';
     create.onclick = async () => {
       branchMenu.classList.add('hidden');
-      const name = await askText({ title: 'NEW BRANCH', placeholder: 'branch name' });
-      if (name) { await gitDo('create-branch', name); refreshWorkspace(); }
+      // create runs INSIDE the dialog — on failure the git error shows there
+      // and the dialog stays open; on success you're already on the new branch
+      // (git checkout -b), exactly like VS Code.
+      const req = await askNewBranch(r, async ({ name, from, liveEl }) => {
+        const current = (r.local.find(b => b.current) || {}).name || '';
+        const localBase = r.local.find(b => b.name === from);
+        const isRemoteEntry = !localBase && (r.remote || []).includes(from);
+
+        if (from === current) {
+          // branching off the branch you're already on — bring IT up to date
+          // first. Incoming (remote) wins any conflict.
+          if (localBase && localBase.upstream) {
+            const pr = await dlgGitStep(liveEl, 'pull-rebase-incoming');
+            if (!pr.ok) return pr;
+          }
+          return dlgGitStep(liveEl, 'create-branch', name);
+        }
+
+        // branching off a DIFFERENT existing branch: fetch, then start from
+        // its remote-tracking ref instead of the possibly-stale local copy —
+        // this is what actually fixes "the base was behind", with no merge/
+        // rebase step (and so no conflict) ever needed for this path.
+        const source = isRemoteEntry ? from : ((localBase && localBase.upstream) || from);
+        if (isRemoteEntry || (localBase && localBase.upstream)) {
+          const fr = await dlgGitStep(liveEl, 'fetch');
+          if (!fr.ok) return fr;
+        }
+        const arg = source !== current ? [name, source] : name;
+        return dlgGitStep(liveEl, 'create-branch', arg);
+      });
+      if (!req) return;
+      refreshBranchCache(branchMenuRepo);
+      refreshWorkspace();
     };
     branchMenu.appendChild(create);
   }
-  branchMenu.classList.remove('hidden');
   fitDropUp(branchMenu, document.getElementById('git-branch-btn'));
-  const sb = branchMenu.querySelector('.branch-search'); if (sb) sb.focus();
-};
+  const sb = branchMenu.querySelector('.branch-search');
+  // focus the search on open, but never steal focus from elsewhere on a
+  // background repaint (e.g. while typing a commit message)
+  if (sb && (prev.hadFocus || !document.activeElement
+      || document.activeElement === document.body
+      || document.activeElement.id === 'git-branch-btn')) sb.focus();
+}
+
+// ---- live git runner for the create/switch dialogs ----
+// Streams each step's stdout/stderr (incl. pre-commit hooks running tests)
+// into a console inside the dialog, so long operations are never a black box.
+let dlgStreamId = null;
+let dlgLiveEl = null;
+window.deck.onGitStream(p => {
+  if (p.streamId && p.streamId === dlgStreamId && dlgLiveEl) {
+    dlgLiveEl.textContent += String(p.data).replace(/\r(?!\n)/g, '\n');
+    dlgLiveEl.scrollTop = dlgLiveEl.scrollHeight;
+  }
+});
+async function dlgGitStep(liveEl, op, arg) {
+  const pretty = Array.isArray(arg) ? arg.join(' ') : (arg && arg !== '*' ? arg : '');
+  liveEl.classList.remove('hidden');
+  liveEl.textContent += `$ git ${op}${pretty ? ' ' + pretty : ''}\n`;
+  liveEl.scrollTop = liveEl.scrollHeight;
+  dlgLiveEl = liveEl;
+  dlgStreamId = uid();
+  const r = await window.deck.gitStream(gitRepo, op, arg, dlgStreamId);
+  dlgStreamId = null; dlgLiveEl = null;
+  liveEl.textContent += r.ok ? '✔ done\n' : '✗ failed\n';
+  liveEl.scrollTop = liveEl.scrollHeight;
+  gitRefresh();
+  return r;
+}
+
+// ---- new branch dialog — VS Code style: name + inline searchable base picker
+// with per-branch detail (tip hash · relative date, subject in the tooltip).
+// The list lives inside the dialog (no floating overlay), so it never clips.
+// work({name, from}) runs on CREATE with the dialog locked; a failure renders
+// the git error inside the dialog instead of closing it.
+function askNewBranch(r, work = null) {
+  return new Promise(res => {
+    const current = (r.local.find(b => b.current) || {}).name || '';
+    const locals = r.local.slice().sort((a, b) =>
+      (a.current ? -1 : b.current ? 1 : a.name.localeCompare(b.name)));
+    const remoteInfo = new Map((r.remoteInfo || []).map(x => [x.name, x]));
+    const remotes = (r.remote || [])
+      .filter(rb => !/\/HEAD$|->/.test(rb))
+      .sort((a, b) => a.localeCompare(b));
+    const entries = [
+      ...locals.map(b => ({ kind: 'LOCAL', ...b })),
+      ...remotes.map(n => ({ kind: 'REMOTE', name: n, ...(remoteInfo.get(n) || {}) }))
+    ];
+    let from = current || (entries[0] && entries[0].name) || '';
+
+    const ov = document.createElement('div');
+    ov.className = 'modal';
+    ov.innerHTML = `<div class="modal-card alert-card askb-card">
+      <div class="modal-title">NEW BRANCH</div>
+      <label>NAME</label>
+      <input class="ask-input" placeholder="branch name" spellcheck="false" />
+      <label>CREATE FROM <span class="askb-sel"></span></label>
+      <input class="branch-search askb-search" placeholder="🔎 search branches…" spellcheck="false" />
+      <div class="askb-list"></div>
+      <pre class="askb-live hidden"></pre>
+      <div class="askb-err hidden"></div>
+      <div class="askb-fix hidden">
+        <div class="askb-fix-label">FIX &amp; RETRY — one action at a time</div>
+        <button class="btn askb-fixbtn fix-bring"
+          title="git stash -u → create branch → stash pop — your edits follow you">
+          ⇄ BRING CHANGES — stash, create, unstash</button>
+        <button class="btn askb-fixbtn fix-stash"
+          title="git stash -u, then create — restore later with Pop Latest Stash">
+          🗃 STASH &amp; CREATE — changes stay stashed</button>
+        <button class="btn askb-fixbtn fix-commit"
+          title="git add -A → commit on the CURRENT branch → create the new one">
+          ✔ COMMIT &amp; CREATE — commit stays on this branch</button>
+        <button class="btn askb-fixbtn fix-discard"
+          title="Throw away ALL uncommitted changes, then create">
+          🗑 DISCARD CHANGES &amp; CREATE</button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn ask-cancel">CANCEL</button>
+        <button class="btn btn-launch ask-ok">＋ CREATE</button>
+      </div></div>`;
+    const inp = ov.querySelector('.ask-input');
+    const searchInp = ov.querySelector('.askb-search');
+    const listEl = ov.querySelector('.askb-list');
+    const selLabel = ov.querySelector('.askb-sel');
+
+    let visible = [];   // names currently shown, for arrow-key navigation
+    const renderList = () => {
+      const q = searchInp.value.trim().toLowerCase();
+      listEl.innerHTML = '';
+      visible = [];
+      let lastKind = null;
+      for (const en of entries) {
+        if (q && !en.name.toLowerCase().includes(q)) continue;
+        if (en.kind !== lastKind) {
+          const h = document.createElement('div');
+          h.className = 'branch-sec';
+          h.textContent = en.kind;
+          listEl.appendChild(h);
+          lastKind = en.kind;
+        }
+        const it = document.createElement('div');
+        it.className = 'askb-item' + (en.name === from ? ' sel' : '');
+        const detail = [en.hash, en.date].filter(Boolean).join(' · ');
+        it.innerHTML =
+          `<span class="askb-ico">${en.kind === 'REMOTE' ? '☁' : '⎇'}</span>` +
+          `<span class="askb-name"></span>` +
+          `<span class="askb-detail"></span>`;
+        it.querySelector('.askb-name').textContent =
+          en.name + (en.name === current ? ' (current)' : '');
+        it.querySelector('.askb-detail').textContent = detail;
+        if (en.subject) it.title = en.subject;
+        it.onclick = () => { from = en.name; renderList(); };
+        listEl.appendChild(it);
+        visible.push(en.name);
+      }
+      if (!visible.length) {
+        const none = document.createElement('div');
+        none.className = 'git-none';
+        none.textContent = 'no matching branch';
+        listEl.appendChild(none);
+      }
+      // if the filter hid the selection, snap it to the first visible branch
+      if (visible.length && !visible.includes(from)) { from = visible[0]; renderList(); return; }
+      selLabel.textContent = from ? `— base: ${from}` : '';
+      const sel = listEl.querySelector('.askb-item.sel');
+      if (sel) sel.scrollIntoView({ block: 'nearest' });
+    };
+
+    const move = (dir) => {
+      if (!visible.length) return;
+      const i = Math.max(0, visible.indexOf(from));
+      const next = Math.min(visible.length - 1, Math.max(0, i + dir));
+      from = visible[next];
+      renderList();
+    };
+
+    document.body.appendChild(ov);
+    renderList();
+    inp.focus();
+    const errEl = ov.querySelector('.askb-err');
+    const fixEl = ov.querySelector('.askb-fix');
+    const liveEl = ov.querySelector('.askb-live');
+    const okBtn = ov.querySelector('.ask-ok');
+    const allBtns = [...ov.querySelectorAll('button')];
+    let busy = false;
+    const done = (v) => { if (busy) return; ov.remove(); res(v); };
+    const setBusy = (on, label) => {
+      busy = on;
+      inp.disabled = on; searchInp.disabled = on;
+      allBtns.forEach(b => b.disabled = on);
+      okBtn.textContent = on ? (label || '⏳ CREATING…') : '＋ CREATE';
+      // while running, the action buttons give way to the live git console
+      if (on) { fixEl.classList.add('hidden'); liveEl.classList.remove('hidden'); }
+    };
+    const showErr = (msg) => {
+      errEl.textContent = msg;
+      errEl.classList.remove('hidden');
+      fixEl.classList.remove('hidden');   // offer the one-click ways out
+    };
+    // pre-steps → create → post-steps, each streamed live into the dialog;
+    // the first failure stops and shows here
+    const attempt = async (pre = [], post = [], label) => {
+      if (busy) return;
+      const name = inp.value.trim();
+      if (!name) { inp.focus(); return; }
+      if (!work) { done({ name, from }); return; }
+      errEl.classList.add('hidden');
+      setBusy(true, label);
+      liveEl.textContent = '';
+      let rr;
+      for (const [op, arg] of pre) {
+        rr = await dlgGitStep(liveEl, op, arg);
+        if (!rr.ok) { setBusy(false); showErr(rr.out || op + ' failed'); return; }
+      }
+      try { rr = await work({ name, from, liveEl }); }
+      catch (e) { rr = { ok: false, out: String(e && e.message ? e.message : e) }; }
+      if (!rr || !rr.ok) {
+        setBusy(false);
+        showErr((rr && (rr.out || rr.error)) || 'create branch failed');
+        return;
+      }
+      for (const [op, arg] of post) {
+        const pr = await dlgGitStep(liveEl, op, arg);
+        if (!pr.ok) {
+          // the branch exists and is checked out — only the post step (stash
+          // pop) failed. Close, but tell the user their changes are stashed.
+          busy = false;
+          ov.remove();
+          res({ name, from, res: rr });
+          showAlert({
+            title: 'BRANCH CREATED — STASH POP FAILED',
+            message: `"${esc(name)}" was created and checked out, but restoring your ` +
+              `stashed changes hit a problem:\n\n${esc(pr.out || 'stash pop failed')}` +
+              `\n\nYour changes are still safe in the stash (Commit ⌄ → Pop Latest Stash).`,
+            okText: 'OK', cancelText: 'CLOSE', kind: 'warn'
+          });
+          return;
+        }
+      }
+      busy = false;
+      done({ name, from, res: rr });
+    };
+    const submit = () => attempt();
+    ov.querySelector('.fix-bring').onclick = () =>
+      attempt([['stash']], [['stash-pop']], '⏳ MOVING…');
+    ov.querySelector('.fix-stash').onclick = () =>
+      attempt([['stash']], [], '⏳ STASHING…');
+    ov.querySelector('.fix-commit').onclick = async () => {
+      if (busy) return;
+      const msg = await askText({
+        title: 'COMMIT MESSAGE',
+        placeholder: 'message for the commit on the current branch'
+      });
+      if (!msg) return;
+      // stage EVERYTHING, commit it on the current branch, then branch off —
+      // the new branch starts from that commit, the old branch keeps it
+      attempt([['stage', '*'], ['commit', msg]], [], '⏳ COMMITTING…');
+    };
+    ov.querySelector('.fix-discard').onclick = async () => {
+      if (busy) return;
+      const ok = await showAlert({
+        title: 'DISCARD ALL CHANGES',
+        message: 'Permanently discard ALL uncommitted changes (tracked and untracked)? ' +
+          'This cannot be undone.',
+        okText: 'DISCARD', cancelText: 'CANCEL', kind: 'danger'
+      });
+      if (ok) attempt([['discard', '.'], ['clean', '.']], [], '⏳ DISCARDING…');
+    };
+    searchInp.oninput = renderList;
+    searchInp.onkeydown = (e) => {
+      if (e.key === 'ArrowDown') { e.preventDefault(); move(1); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); move(-1); }
+      else if (e.key === 'Enter') { e.preventDefault(); submit(); }
+      else if (e.key === 'Escape') done(null);
+    };
+    ov.querySelector('.ask-ok').onclick = submit;
+    ov.querySelector('.ask-cancel').onclick = () => done(null);
+    inp.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submit();
+      else if (e.key === 'Escape') done(null);
+    });
+    ov.addEventListener('click', (e) => { if (e.target === ov) done(null); });
+  });
+}
+
+// ---- guarded checkout — when git blocks the switch (uncommitted changes that
+// would be overwritten), keep the user in control: show git's error and offer
+// VS Code-style ways out instead of failing silently.
+async function checkoutWithGuard(name) {
+  const repo = gitRepo;
+  const r = await gitDo('checkout', name);
+  if (r.ok) { refreshBranchCache(repo); refreshWorkspace(); return; }
+  askCheckoutBlocked(name, r.out, repo);
+}
+
+function askCheckoutBlocked(name, errText, repo) {
+  const ov = document.createElement('div');
+  ov.className = 'modal';
+  ov.innerHTML = `<div class="modal-card alert-card askb-card">
+    <div class="modal-title">SWITCH TO ⎇ <span class="co-name"></span></div>
+    <pre class="askb-live hidden"></pre>
+    <div class="askb-err"></div>
+    <div class="askb-fix">
+      <div class="askb-fix-label">FIX &amp; SWITCH — one action at a time</div>
+      <button class="btn askb-fixbtn co-bring"
+        title="git stash -u → checkout → stash pop — your edits follow you">
+        ⇄ BRING CHANGES — stash, switch, unstash</button>
+      <button class="btn askb-fixbtn co-stash"
+        title="git stash -u, then switch — restore later with Pop Latest Stash">
+        🗃 STASH &amp; SWITCH — changes stay stashed</button>
+      <button class="btn askb-fixbtn co-commit"
+        title="git add -A → commit on the CURRENT branch → switch">
+        ✔ COMMIT &amp; SWITCH — commit stays on this branch</button>
+      <button class="btn askb-fixbtn co-discard"
+        title="Throw away ALL uncommitted changes, then switch">
+        🗑 DISCARD CHANGES &amp; SWITCH</button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ask-cancel">CANCEL</button>
+    </div></div>`;
+  ov.querySelector('.co-name').textContent = name;
+  const errEl = ov.querySelector('.askb-err');
+  const liveEl = ov.querySelector('.askb-live');
+  const fixEl = ov.querySelector('.askb-fix');
+  errEl.textContent = errText || 'checkout failed';
+  const btns = [...ov.querySelectorAll('button')];
+  let busy = false;
+  const done = () => { if (busy) return; ov.remove(); };
+  const setBusy = (on, btn, label) => {
+    busy = on;
+    btns.forEach(b => b.disabled = on);
+    if (btn) btn.textContent = on ? label : btn.dataset.label;
+    // while running, swap the action buttons for the live git console
+    if (on) {
+      fixEl.classList.add('hidden');
+      errEl.classList.add('hidden');
+      liveEl.classList.remove('hidden');
+    }
+  };
+  // run git ops in sequence, streamed live; the first failure stops and shows
+  const run = async (btn, workingLabel, steps) => {
+    btn.dataset.label = btn.textContent;
+    setBusy(true, btn, workingLabel);
+    liveEl.textContent = '';
+    for (const [op, arg] of steps) {
+      const rr = await dlgGitStep(liveEl, op, arg);
+      if (!rr.ok) {
+        setBusy(false, btn);
+        errEl.textContent = rr.out || `${op} failed`;
+        errEl.classList.remove('hidden');
+        fixEl.classList.remove('hidden');
+        return false;
+      }
+    }
+    setBusy(false, btn);
+    return true;
+  };
+  ov.querySelector('.co-bring').onclick = async (e) => {
+    // stash → switch → pop: the edits land on the target branch (a pop conflict
+    // stops here and shows in the dialog — the stash itself is never lost)
+    if (await run(e.currentTarget, '⏳ MOVING…', [['stash'], ['checkout', name], ['stash-pop']])) {
+      done(); refreshBranchCache(repo); refreshWorkspace();
+      toast(`switched to ${name} — changes came along`);
+    }
+  };
+  ov.querySelector('.co-stash').onclick = async (e) => {
+    if (await run(e.currentTarget, '⏳ STASHING…', [['stash'], ['checkout', name]])) {
+      done(); refreshBranchCache(repo); refreshWorkspace();
+      toast(`switched to ${name} — changes stashed (Commit ⌄ → Pop Latest Stash)`);
+    }
+  };
+  ov.querySelector('.co-commit').onclick = async (e) => {
+    const btn = e.currentTarget;
+    const msg = await askText({
+      title: 'COMMIT MESSAGE',
+      placeholder: 'message for the commit on the current branch'
+    });
+    if (!msg) return;
+    // stage EVERYTHING, commit it on the current branch, then switch — the
+    // commit stays behind on the branch you're leaving
+    if (await run(btn, '⏳ COMMITTING…', [['stage', '*'], ['commit', msg], ['checkout', name]])) {
+      done(); refreshBranchCache(repo); refreshWorkspace();
+      toast(`committed on the old branch — switched to ${name}`);
+    }
+  };
+  ov.querySelector('.co-discard').onclick = async (e) => {
+    const btn = e.currentTarget;
+    const ok = await showAlert({
+      title: 'DISCARD ALL CHANGES',
+      message: 'Permanently discard ALL uncommitted changes (tracked and untracked)? ' +
+        'This cannot be undone.',
+      okText: 'DISCARD', cancelText: 'CANCEL', kind: 'danger'
+    });
+    if (!ok) return;
+    if (await run(btn, '⏳ DISCARDING…', [['discard', '.'], ['clean', '.'], ['checkout', name]])) {
+      done(); refreshBranchCache(repo); refreshWorkspace();
+      toast(`switched to ${name} — local changes discarded`);
+    }
+  };
+  ov.querySelector('.ask-cancel').onclick = done;
+  ov.addEventListener('click', (e) => { if (e.target === ov) done(); });
+  document.body.appendChild(ov);
+}
 
 // Anchor a dropdown to its button using fixed positioning off the button's
 // on-screen rect — so it always hangs from the button (not some ancestor) and
@@ -1151,7 +1599,9 @@ ${(d.diff || '').slice(0, 55000)}`;
       aiState.resultText = (text || '').trim();
       const fw = document.getElementById('ai-final-wrap');
       document.getElementById('ai-final-label').textContent = aiState.mode === 'review' ? 'REVIEW RESULT' : 'FIX PLAN';
-      document.getElementById('ai-final').textContent = aiState.resultText || '(no text returned)';
+      const aiFinalEl = document.getElementById('ai-final');
+      aiFinalEl.classList.add('md-body');
+      aiFinalEl.innerHTML = renderMarkdown(aiState.resultText || '(no text returned)');
       fw.classList.remove('hidden');
       if (result === 'aborted') { aiLiveLine('■ aborted by operator.', 'err'); return; }
       if (result !== 'success' || !aiState.resultText) return;
@@ -1171,7 +1621,9 @@ const aiFullview = document.getElementById('ai-fullview');
 document.getElementById('aifv-back').onclick = () => aiFullview.classList.add('hidden');
 function openAiFullview() {
   document.getElementById('aifv-title').textContent = (aiState.mode === 'review' ? 'AI REVIEW' : 'FIX PLAN') + ` · PR #${aiState.pr.number}`;
-  document.getElementById('aifv-body').textContent = aiState.resultText || '(no result)';
+  const aifvBody = document.getElementById('aifv-body');
+  aifvBody.classList.add('md-body');
+  aifvBody.innerHTML = renderMarkdown(aiState.resultText || '(no result)');
   const acts = document.getElementById('aifv-actions');
   acts.innerHTML = aiState.mode === 'review'
     ? '<button class="mini-btn" data-a="post">💬 Post as comment</button><button class="mini-btn" data-a="approve">✓ Approve PR</button>'

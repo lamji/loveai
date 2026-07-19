@@ -179,36 +179,136 @@ const TOOL_ICON = {
 };
 
 // ===== State =====
-let agents = JSON.parse(localStorage.getItem('agents') || '[]');
-for (const d of DEFAULT_AGENTS) {
-  const existing = agents.find(a => a.id === d.id);
-  if (!existing) agents.push({ ...d });
-  else {
-    if (!existing.role) existing.role = d.role;
-    // def-* agents are app-managed: keep their rules current with this build
-    // (RULES gains new directives over time, e.g. IMPLEMENT-MODEL routing)
-    if (d.rules) existing.rules = d.rules;
-    if (existing.lean === undefined) existing.lean = d.lean;
+// ============================================================
+// WORKSPACES — each opened project is a workspace with its own
+// roster + path + sessions. Phase 1 always has exactly one active
+// workspace; the rail/switcher (Phase 2) lets you open more.
+// The legacy globals `agents` and `projectDir` are kept as live
+// references into the ACTIVE workspace, so the rest of the app reads
+// and writes them exactly as before — every access sees the active
+// project, and `save()` persists back through the workspace.
+// ============================================================
+const WS_COLORS = ['#6ea8fe', '#7ee787', '#ffa657', '#d2a8ff',
+                   '#ff7b9c', '#79c0ff', '#f0a020', '#56d4bc'];
+const WORKSPACES_KEY = 'workspaces';
+const ACTIVE_WS_KEY = 'activeWorkspaceId';
+
+// which built-in default an agent represents — matched by its stable `defId`
+// tag, an exact id, or an id that was suffixed off a default id (freshRoster).
+// Returns null for user-created (custom) agents.
+const DEFAULT_IDS = DEFAULT_AGENTS.map(d => d.id);
+function canonicalDefaultId(a) {
+  if (a.defId && DEFAULT_IDS.includes(a.defId)) return a.defId;
+  return DEFAULT_IDS.find(id => a.id === id || String(a.id).startsWith(id + '-')) || null;
+}
+
+// merge app-managed defaults into a roster + backfill flags. Reused when a new
+// workspace is opened so every project starts from the same baseline line-up.
+// De-duplicates managed defaults (heals the old clone-on-reload bug) and stamps
+// each with a stable `defId` so its identity survives id-suffixing.
+function normalizeRoster(roster) {
+  const list = Array.isArray(roster) ? roster : [];
+  const seen = new Map();   // canonical default id -> the kept agent
+  const kept = [];
+  for (const a of list) {
+    const canon = canonicalDefaultId(a);
+    if (canon) {
+      if (seen.has(canon)) continue;   // a duplicate of a default we already kept
+      a.defId = canon;                 // stamp identity for future loads
+      seen.set(canon, a);
+    }
+    kept.push(a);
   }
+  // ensure every default exists, and keep app-managed fields current
+  for (const d of DEFAULT_AGENTS) {
+    const existing = seen.get(d.id);
+    if (existing) {
+      if (!existing.role) existing.role = d.role;
+      // def-* agents are app-managed: keep their rules current with this build
+      // (RULES gains new directives over time, e.g. IMPLEMENT-MODEL routing)
+      if (d.rules) existing.rules = d.rules;
+      if (existing.lean === undefined) existing.lean = d.lean;
+    } else {
+      kept.push({ ...d, defId: d.id });
+    }
+  }
+  // agents saved by earlier builds have no lean flag — default by role
+  for (const a of kept) {
+    if (a.lean === undefined) {
+      a.lean = ['prompt', 'senior', 'uiux', 'reviewer', 'indexer'].includes(a.role);
+    }
+  }
+  return kept;
 }
-// agents saved by earlier builds have no lean flag — default by role
-for (const a of agents) {
-  if (a.lean === undefined) a.lean = ['prompt', 'senior', 'uiux', 'reviewer', 'indexer'].includes(a.role);
+
+function wsBaseName(p) {
+  if (!p) return 'Workspace';
+  const parts = String(p).replace(/[\\/]+$/, '').split(/[\\/]/);
+  return parts[parts.length - 1] || p;
 }
-// one-time migration: earlier builds saved agents with perm:'acceptEdits', which
-// hangs on the first Bash/exec (no permission-prompt UI to approve it). Upgrade
-// any still on that mode to bypassPermissions so shell steps run unattended.
-if (!localStorage.getItem('permMigrated')) {
-  for (const a of agents) if (a.perm === 'acceptEdits') a.perm = 'bypassPermissions';
-  localStorage.setItem('permMigrated', '1');
+
+// Load the workspaces, or migrate the old single-project globals
+// (`agents`, `projectDir`) into workspaces[0] the first time.
+function loadWorkspaces() {
+  let list = null;
+  try { list = JSON.parse(localStorage.getItem(WORKSPACES_KEY) || 'null'); } catch {}
+  if (Array.isArray(list) && list.length) {
+    for (const w of list) w.agents = normalizeRoster(w.agents);
+    return list;
+  }
+  // ---- one-time migration from the legacy single-project keys ----
+  let legacyAgents = [];
+  try { legacyAgents = JSON.parse(localStorage.getItem('agents') || '[]'); } catch {}
+  // earlier builds saved agents with perm:'acceptEdits', which hangs on the
+  // first Bash/exec (no permission-prompt UI). Upgrade to bypassPermissions.
+  if (!localStorage.getItem('permMigrated')) {
+    for (const a of legacyAgents) if (a.perm === 'acceptEdits') a.perm = 'bypassPermissions';
+    localStorage.setItem('permMigrated', '1');
+  }
+  // the INDEXER agent was retired — drop the app-managed default copy.
+  if (!localStorage.getItem('indexerRemoved')) {
+    legacyAgents = legacyAgents.filter(a => a.id !== 'def-indexer');
+    localStorage.setItem('indexerRemoved', '1');
+  }
+  const legacyPath = localStorage.getItem('projectDir') || '';
+  return [{
+    id: uid(),
+    name: wsBaseName(legacyPath),
+    path: legacyPath,
+    color: WS_COLORS[0],
+    order: 0,
+    agents: normalizeRoster(legacyAgents)
+  }];
 }
-// one-time migration: the INDEXER agent was retired. Drop the app-managed default
-// copy (the pipeline now skips the mapping stage gracefully when it's absent).
-if (!localStorage.getItem('indexerRemoved')) {
-  agents = agents.filter(a => a.id !== 'def-indexer');
-  localStorage.setItem('indexerRemoved', '1');
+
+let workspaces = loadWorkspaces();
+let activeWorkspaceId = localStorage.getItem(ACTIVE_WS_KEY) || workspaces[0].id;
+if (!workspaces.some(w => w.id === activeWorkspaceId)) activeWorkspaceId = workspaces[0].id;
+
+function ws() {
+  return workspaces.find(w => w.id === activeWorkspaceId) || workspaces[0];
 }
-localStorage.setItem('agents', JSON.stringify(agents));
+// persist all workspaces (ephemeral agents are never written to disk)
+function saveWorkspaces() {
+  try {
+    const serial = workspaces.map(w => ({
+      ...w,
+      agents: (w.agents || []).filter(a => !a.ephemeral)
+    }));
+    localStorage.setItem(WORKSPACES_KEY, JSON.stringify(serial));
+  } catch {}
+  localStorage.setItem(ACTIVE_WS_KEY, activeWorkspaceId);
+}
+// reassign the active roster AND write it back through the workspace,
+// so `agents = agents.filter(...)` style updates stay in sync.
+function setAgents(next) {
+  agents = next;
+  ws().agents = next;
+}
+
+// legacy live references into the ACTIVE workspace
+let agents = ws().agents;
+let projectDir = ws().path || '';
 
 // runtime per agent: { running, runId, sessionId, lastResult, status }
 const rt = {};
@@ -219,11 +319,56 @@ const runDoneCallbacks = {};  // runId -> one-shot (result, finalText) callback
 const runEventSinks = {};     // runId -> per-event sink (streams a run into a modal)
 
 const modal = document.getElementById('modal');
+// the VISIBLE console — always shows the active workspace's feed. Background
+// projects keep their .ev nodes in detached buffers (feedBuf) so their agents
+// can stream off-screen and be restored intact when you switch back.
 const consoleFeed = document.getElementById('console-feed');
+// the "SYSTEMS NOMINAL" empty state, captured before anything removes it
+const FEED_EMPTY_HTML = consoleFeed.innerHTML;
+
+// ---- Phase 3: route each run's output to the project that owns it ----
+const feedBuf = {};   // wsId -> detached <div> holding that project's .ev nodes
+const runWs = {};     // runId  -> wsId that started the run
+const agentWs = {};   // agentId -> wsId (set when a run starts; survives cleanup)
+
+// find an agent by id across ALL projects (the active `agents` array only
+// holds the current project's roster, but a background run needs its name)
+function findAgent(agentId) {
+  for (const w of workspaces) {
+    const a = (w.agents || []).find(x => x.id === agentId);
+    if (a) return a;
+  }
+  return null;
+}
+
+// which workspace owns this agent's output — set at run start, else found in a
+// roster, else the active project. Keeps a background agent's stream in its
+// own console instead of leaking into whatever project is on screen.
+function wsForAgent(agentId) {
+  if (agentWs[agentId] && workspaces.some(w => w.id === agentWs[agentId])) {
+    return agentWs[agentId];
+  }
+  const owner = workspaces.find(w => (w.agents || []).some(a => a.id === agentId));
+  return owner ? owner.id : activeWorkspaceId;
+}
+// the detached buffer div for a workspace (created on first use)
+function getFeedBuf(wsId) {
+  if (!feedBuf[wsId]) feedBuf[wsId] = document.createElement('div');
+  return feedBuf[wsId];
+}
+// the container an agent's output should append to: the visible feed when its
+// project is active, otherwise that project's off-screen buffer.
+function feedElFor(agentId) {
+  const wsId = wsForAgent(agentId);
+  return wsId === activeWorkspaceId ? consoleFeed : getFeedBuf(wsId);
+}
 
 function save() {
-  localStorage.setItem('agents',
-    JSON.stringify(agents.filter(a => !a.ephemeral)));
+  ws().agents = agents;   // re-link in case the roster was reassigned
+  saveWorkspaces();
+  // mirror the active roster to the legacy key for safe rollback to a
+  // single-project build (Phase 1 keeps both in sync)
+  localStorage.setItem('agents', JSON.stringify(agents.filter(a => !a.ephemeral)));
 }
 function uid() { return Math.random().toString(36).slice(2, 10); }
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
@@ -300,7 +445,7 @@ function renderRoster() {
     if (delBtn) delBtn.onclick = (e) => {
       e.stopPropagation();
       if (R(a.id).running) stopAgent(a.id);
-      agents = agents.filter(x => x.id !== a.id);
+      setAgents(agents.filter(x => x.id !== a.id));
       if (feedFilter === a.id) feedFilter = null;
       save(); render(); applyFilter();
     };
@@ -593,23 +738,26 @@ function hideFeedEmpty() {
 }
 
 function feed(agentId, cls, text, ico, sameLine = false) {
-  hideFeedEmpty();
+  const cont = feedElFor(agentId);
+  if (cont === consoleFeed) hideFeedEmpty();
   const s = streamEls[agentId];
-  if (sameLine && s && s.isConnected) {
+  // parentNode (not isConnected): the card is "live" even while its project is
+  // off-screen in a detached buffer, so background streams keep the same card
+  if (sameLine && s && s.parentNode) {
     s.querySelector('.body').textContent += text;
   } else {
-    const a = agents.find(x => x.id === agentId);
+    const a = findAgent(agentId);
     const el = document.createElement('div');
     el.className = 'ev';
     el.dataset.agent = agentId;
     el.innerHTML = `<span class="tag">${esc(a ? a.name : '?')}</span><span class="ico">${ico || ''}</span><span class="body ${cls}"></span>`;
     el.querySelector('.body').textContent = text;
     if (feedFilter && feedFilter !== agentId) el.style.display = 'none';
-    consoleFeed.appendChild(el);
+    cont.appendChild(el);
     if (sameLine) { streamEls[agentId] = el; el.classList.add('streaming'); }
     else delete streamEls[agentId];
   }
-  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  if (cont === consoleFeed) consoleFeed.scrollTop = consoleFeed.scrollHeight;
 }
 
 function endStream(agentId) {
@@ -623,10 +771,11 @@ function endStream(agentId) {
 // before first output). Reuses one element per agent and floats to the bottom.
 const thinkEls = {};
 function showThinking(agentId, label) {
-  hideFeedEmpty();
+  const cont = feedElFor(agentId);
+  if (cont === consoleFeed) hideFeedEmpty();
   let el = thinkEls[agentId];
-  if (!el || !el.isConnected) {
-    const a = agents.find(x => x.id === agentId);
+  if (!el || !el.parentNode) {
+    const a = findAgent(agentId);
     el = document.createElement('div');
     el.className = 'ev thinking-row';
     el.dataset.agent = agentId;
@@ -638,13 +787,31 @@ function showThinking(agentId, label) {
     thinkEls[agentId] = el;
   }
   el.querySelector('.think-label').textContent = label || 'thinking…';
-  consoleFeed.appendChild(el);                 // keep it as the last (current) line
-  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  cont.appendChild(el);                        // keep it as the last (current) line
+  if (cont === consoleFeed) consoleFeed.scrollTop = consoleFeed.scrollHeight;
 }
 function hideThinking(agentId) {
   const el = thinkEls[agentId];
   if (el && el.parentNode) el.parentNode.removeChild(el);
   delete thinkEls[agentId];
+}
+
+// REASSIGN indicator — bridges the dead air between a REJECTED verdict and the
+// next engineer's TASK line while pickFixerByAI() (a real AI call) resolves.
+let reassignEl = null;
+function showReassigning() {
+  hideFeedEmpty();
+  reassignEl = document.createElement('div');
+  reassignEl.className = 'ev thinking-row';
+  reassignEl.innerHTML = `<span class="tag">PIPELINE</span>` +
+    `<span class="ico think-dots"><i></i><i></i><i></i></span>` +
+    `<span class="body think-label">REJECTED — reassigning to the right engineer…</span>`;
+  consoleFeed.appendChild(reassignEl);
+  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+}
+function hideReassigning() {
+  if (reassignEl && reassignEl.parentNode) reassignEl.parentNode.removeChild(reassignEl);
+  reassignEl = null;
 }
 
 // line-level diff: trim the shared head/tail, mark the rest removed/added.
@@ -666,8 +833,9 @@ function diffLines(oldStr, newStr) {
 
 // collapsible diff card in the console feed for an edit tool call
 function feedDiff(agentId, tool, inp) {
-  hideFeedEmpty();
-  const a = agents.find(x => x.id === agentId);
+  const cont = feedElFor(agentId);
+  if (cont === consoleFeed) hideFeedEmpty();
+  const a = findAgent(agentId);
   const file = inp.file_path || inp.path || '';
   const name = file ? file.split(/[\\/]/).pop() : tool;
   let rows = [];
@@ -704,8 +872,8 @@ function feedDiff(agentId, tool, inp) {
   const inner = card.querySelector('.diff-card');
   card.querySelector('.diff-head').onclick = () => inner.classList.toggle('open');
   if (feedFilter && feedFilter !== agentId) card.style.display = 'none';
-  consoleFeed.appendChild(card);
-  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  cont.appendChild(card);
+  if (cont === consoleFeed) consoleFeed.scrollTop = consoleFeed.scrollHeight;
 }
 
 // After a plan-mode run finishes, drop an inline action card into the console.
@@ -714,8 +882,9 @@ function feedDiff(agentId, tool, inp) {
 // Both exit plan mode (uncheck the toggle) and resume the planner's session so
 // the full plan is already in context.
 function feedImplementCard(plannerId, planSessionId) {
-  hideFeedEmpty();
-  const planner = agents.find(x => x.id === plannerId);
+  const cont = feedElFor(plannerId);
+  if (cont === consoleFeed) hideFeedEmpty();
+  const planner = findAgent(plannerId);
   // UI-related plans hand off to the UI/UX engineer instead of a generic senior
   const planText = R(plannerId).lastText || '';
   const senior = (isUiTask(planText) && uiuxAgent()) || byRole('senior')[0];
@@ -745,8 +914,8 @@ function feedImplementCard(plannerId, planSessionId) {
     lockImplCard(btn, hint, senior ? `handing off to ${senior.name}…` : 'implementing…');
     implementPlan(runnerId, plannerId, planSessionId, routeModel);
   };
-  consoleFeed.appendChild(el);
-  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+  cont.appendChild(el);
+  if (cont === consoleFeed) consoleFeed.scrollTop = consoleFeed.scrollHeight;
 }
 
 function lockImplCard(btn, hint, label) {
@@ -865,6 +1034,8 @@ let lastBusy = null;
 function anyBusy() { return pipe.active || agents.some(a => R(a.id).running); }
 
 function syncPane() {
+  // the ticket workspace owns the center area while it's open
+  if (window.tkIsOpen && tkIsOpen()) return;
   // terminal now lives in the bottom panel and no longer owns the center —
   // console/editor swap independently of whether the panel is open
   // split mode: editor and console are shown side by side, so don't hide either
@@ -956,6 +1127,10 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   const model = (opts.model && MODEL_LABELS[opts.model]) ? opts.model : a.model;
   r.running = true;
   r.runId = uid();
+  // pin this run + agent to the project that owns them, so their output streams
+  // into that project's console even if you switch away while it runs
+  agentWs[agentId] = wsForAgent(agentId);
+  runWs[r.runId] = agentWs[agentId];
   r.planMode = plan;
   r.noShare = !!opts.fresh;
   // optional one-shot completion callback, fired with (result, finalText) on done
@@ -968,7 +1143,8 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   ticker(agentId, 'initializing session...');
   feed(agentId, 'sys', (plan ? 'PLAN ▸ ' : 'TASK ▸ ') + prompt, plan ? '🗺' : '🎯');
   if (model !== a.model) feed(agentId, 'sys', `model routed by complexity → ${MODEL_LABELS[model]}`, '⚖');
-  const effort = getEffort();
+  // opts.effort overrides the global session setting (e.g. a per-ticket choice)
+  const effort = opts.effort || getEffort();
   if (effort !== 'auto') {
     feed(agentId, 'sys', `reasoning effort → ${effort.toUpperCase()}`, '🧠');
   }
@@ -1054,6 +1230,7 @@ function setRunningUI(agentId, running) {
   if (!running) ticker(agentId, 'standing by', true);
   renderRoster();
   renderActivity();
+  renderRail();          // keep the rail's per-project running badges live
   updateChatModal();
 }
 
@@ -1134,8 +1311,9 @@ window.deck.onAgentEvent(ev => {
       if (ev.sessionId && !r.noShare) setSession(ev.sessionId);
       r.lastResult = ev.subtype;
       trackUsage(ev);
-      const doneAgent = agents.find(x => x.id === ev.agentId);
+      const doneAgent = findAgent(ev.agentId);
       if (ev.sessionId && doneAgent && doneAgent.role === 'prompt' && pipe.cwd) savePESession(pipe.cwd, ev.sessionId);
+      if (ev.sessionId && doneAgent && doneAgent.role === 'reviewer' && pipe.active) pipe.reviewerSessionId = ev.sessionId;
       // background learner: outcome per model + turn-cap kills per role
       learnMark(r.curModel, ev.subtype !== 'success');
       if (/max_turns/i.test(ev.subtype || '') && doneAgent) {
@@ -1170,7 +1348,7 @@ window.deck.onAgentEvent(ev => {
       hideThinking(ev.agentId);
       // any agent may have written/updated topic memories — capture fingerprints
       // of their covered files so staleness detection works next time.
-      const finishedAgent = agents.find(x => x.id === ev.agentId);
+      const finishedAgent = findAgent(ev.agentId);
       const memCwd = (finishedAgent && finishedAgent.cwd) || projectDir;
       if (finishedAgent && finishedAgent.role !== 'indexer' && memCwd) {
         window.deck.memoryReindex(memCwd).catch(() => {});
@@ -1192,8 +1370,13 @@ window.deck.onAgentEvent(ev => {
       // a MANUAL Prompt Engineer run (outside the pipeline) that produced task
       // files → offer to deploy engineers, so the work doesn't just stop
       if (!pipe.active && r.lastResult === 'success') {
-        const da = agents.find(x => x.id === ev.agentId);
-        if (da && da.role === 'prompt' && da.cwd) maybeOfferDeploy(da.cwd);
+        const da = findAgent(ev.agentId);
+        // only prompt the deploy offer when its project is on screen — don't
+        // pop a card into whatever project the operator is currently viewing
+        if (da && da.role === 'prompt' && da.cwd
+            && wsForAgent(ev.agentId) === activeWorkspaceId) {
+          maybeOfferDeploy(da.cwd);
+        }
       }
       onPipelineAgentDone(ev.agentId, r.lastResult)
         .then(() => { if (!pipe.active) cleanupSeniors(); });
@@ -1206,7 +1389,18 @@ window.deck.onAgentEvent(ev => {
 // AUTO PIPELINE ORCHESTRATOR
 // prompt -> PLAN REVIEW (operator gate) -> build -> review -> loop
 // ============================================================
-const pipe = { active: false, stage: null, cwd: '', iteration: 0, maxIter: 5, pending: new Set(), taskAssign: new Map(), planTasks: [], taskModels: new Map(), reviewModel: null };
+const pipe = {
+  active: false, stage: null, cwd: '', iteration: 0, maxIter: 5,
+  pending: new Set(), taskAssign: new Map(), planTasks: [], taskModels: new Map(),
+  reviewModel: null,
+  // per-run reasoning-effort override (e.g. a workspace ticket's REASONING
+  // choice) — null means "use the global session setting" as before
+  effort: null,
+  // Reviewer's own session for THIS run — resumed (not forked) on re-review
+  // passes so it keeps everything it already read/validated in context instead
+  // of re-reading unchanged files from scratch on every rejection loop.
+  reviewerSessionId: null
+};
 
 // "MODEL: <id>" line written by the Prompt Engineer — routes each task to the
 // cheapest model that fits its complexity
@@ -1228,7 +1422,7 @@ function setStage(stage) {
 
 function byRole(role) { return agents.filter(a => a.role === role); }
 
-async function launchPipeline(issue) {
+async function launchPipeline(issue, effort) {
   const pe = byRole('prompt')[0];
   if (!pe) { plog('err', 'no Prompt Engineer agent on roster.'); return; }
   if (!pe.cwd) { plog('err', 'set a working directory on PROMPT-ENGINEER first (⚙), or import a project.'); return; }
@@ -1236,6 +1430,8 @@ async function launchPipeline(issue) {
   pipe.active = true;
   pipe.cwd = pe.cwd;
   pipe.iteration = 0;
+  pipe.effort = effort || null;
+  pipe.reviewerSessionId = null;
   pipe.pending.clear();
   pipe.taskAssign.clear();
   document.getElementById('btn-pipeline-stop').classList.remove('hidden');
@@ -1263,7 +1459,7 @@ async function launchPipeline(issue) {
     ? `These files changed since the last index: ${st.changedFiles.join(', ')}\nUpdate only the affected sections of .loveai/index/PROJECT-MAP.md per your rules.`
     : 'Index this project per your rules.';
   plog('info', st.exists ? 'project index stale — Stage 0: INDEXER updating map...' : 'no project index — Stage 0: INDEXER mapping project...');
-  runAgent(indexer.id, prompt, false, false, { fresh: true });
+  runAgent(indexer.id, prompt, false, false, { fresh: true, effort: pipe.effort });
 }
 
 function startStage1(issue) {
@@ -1271,9 +1467,24 @@ function startStage1(issue) {
   plog('info', 'Stage 1: PROMPT ENGINEER analyzing...');
   setStage('prompt');
   const resume = getPESession(pipe.cwd);
-  const opts = resume ? { resume, fork: true } : {};
+  const opts = resume ? { resume, fork: true, effort: pipe.effort } : { effort: pipe.effort };
   if (resume) plog('info', `resuming Prompt Engineer session ${resume.slice(0, 8)} (warm context)`);
   runAgent(pe.id, `ISSUE: ${issue}\n\nAnalyze the codebase and produce the executable task prompt file(s) and review-brief.md per your pipeline rules.`, false, false, opts);
+}
+
+// BRIDGE — hand the pipeline's own context to whatever you chat with next
+// (bare model or a roster agent's follow-up), so asking a question right after
+// a run doesn't land in an empty session. The Reviewer read the fullest picture
+// of what changed (falls back to the Prompt Engineer's session); it's ONLY the
+// shared-session pointer that moves — no pipeline agent's own run is touched,
+// so every stage still runs exactly as fresh/token-lean as before.
+function bridgePipelineSession() {
+  const sid = pipe.reviewerSessionId || getPESession(pipe.cwd);
+  if (!sid) return;
+  setSession(sid);
+  feedRaw('SESSION', 'sys',
+    'follow-up context bridged — chat with a model or agent below to continue from what the pipeline just did (↺ New session to start fresh instead).',
+    '🔗');
 }
 
 function abortPipeline(msg) {
@@ -1281,11 +1492,14 @@ function abortPipeline(msg) {
   setStage(null);
   document.getElementById('btn-pipeline-stop').classList.add('hidden');
   hidePlanReview();
+  hideReassigning();
   for (const id of pipe.pending) stopAgent(id);
   const pr = byRole('prompt')[0]; if (pr && R(pr.id).running) stopAgent(pr.id);
   const rv = byRole('reviewer')[0]; if (rv && R(rv.id).running) stopAgent(rv.id);
   if (msg) plog('err', msg);
   cleanupSeniors();
+  bridgePipelineSession();
+  if (window.wsPipelineEnded) window.wsPipelineEnded();
 }
 
 function finishPipeline(msg) {
@@ -1294,6 +1508,8 @@ function finishPipeline(msg) {
   document.getElementById('btn-pipeline-stop').classList.add('hidden');
   plog('ok', msg);
   cleanupSeniors();
+  bridgePipelineSession();
+  if (window.wsPipelineEnded) window.wsPipelineEnded();
 }
 
 // the pipeline may clone extra SENIOR-ENG agents for parallel builds — once the
@@ -1301,13 +1517,13 @@ function finishPipeline(msg) {
 function cleanupSeniors() {
   const keep = agents.find(a => a.id === 'def-senior-eng-01') || byRole('senior')[0];
   let removed = 0;
-  agents = agents.filter(a => {
+  setAgents(agents.filter(a => {
     if (a.role !== 'senior' || (keep && a.id === keep.id)) return true;
     if (R(a.id).running) return true;   // retired later, on its done event
     if (feedFilter === a.id) feedFilter = null;
     removed++;
     return false;
-  });
+  }));
   if (removed) {
     save(); render(); applyFilter();
     plog('info', `auto-retired ${removed} extra senior engineer(s) — roster back to default.`);
@@ -1520,7 +1736,7 @@ function startBuild(taskCmd) {
     const model = learnedModel(pipe.taskModels.get(taskFile));   // learner may bump an unreliable model
     const a = agents.find(x => x.id === agentId);
     if (model) plog('info', `${a ? a.name : agentId} ▸ ${taskFile} on ${MODEL_LABELS[model]} (complexity-routed)`);
-    runAgent(agentId, prompt, false, false, { model, fresh: true });
+    runAgent(agentId, prompt, false, false, { model, fresh: true, effort: pipe.effort });
   }
 }
 
@@ -1570,6 +1786,7 @@ async function startFixRound() {
   const files = await window.deck.pipelineRead(pipe.cwd);
   const findings = (files.find(f => f.name === 'review-findings.md') || {}).content || '';
   const fixer = await pickFixerByAI(findings);
+  hideReassigning();
   if (!fixer) { abortPipeline('no engineer available to fix findings — halted.'); return; }
   if (!fixer.cwd) { fixer.cwd = pipe.cwd; save(); }
   pipe.pending = new Set([fixer.id]);
@@ -1580,7 +1797,7 @@ async function startFixRound() {
 IMPORTANT: findings that say a file is "untouched", a component/prop/filter/badge is "missing", or a criterion "doesn't exist" mean that work was NEVER DONE — you must IMPLEMENT it now (edit the real component/source files named in the findings; create code where it's missing). Do not just tweak what already changed.
 
 For each finding: implement the fix in the actual files, OR — only if you are certain it is a FALSE POSITIVE — leave it and write an evidence-backed justification in changes-log.md. Then append everything you did to .loveai/pipeline/changes-log.md. Verify against the acceptance criteria before finishing.`;
-  runAgent(fixer.id, prompt, false, false, { fresh: true });
+  runAgent(fixer.id, prompt, false, false, { fresh: true, effort: pipe.effort });
 }
 
 // the Prompt Engineer is supposed to write review-brief.md. If a run skipped it
@@ -1621,11 +1838,18 @@ async function startReview() {
   if (!rv.cwd) { rv.cwd = pipe.cwd; save(); }
   await ensureReviewBrief(pipe.cwd);   // guarantee the Reviewer has a brief
   plog('info', `Stage 4: REVIEWER validating (pass ${pipe.iteration + 1})...`);
-  // fresh + routed: the brief/changes-log on disk carry all needed context
+  // Resume (never fork) the reviewer's OWN session from the previous pass so it
+  // keeps every file it already read/validated in context — a fresh session
+  // every pass forced a full from-scratch re-read even when only one file
+  // changed. Only the very first pass runs fresh (nothing to resume yet).
+  const resume = pipe.reviewerSessionId;
+  const opts = resume
+    ? { model: pipe.reviewModel, fresh: true, resume, fork: false, effort: pipe.effort }
+    : { model: pipe.reviewModel, fresh: true, effort: pipe.effort };
   runAgent(rv.id, pipe.iteration === 0
     ? 'Review the pipeline changes per your rules. Write validation-plan.md first, then review-findings.md with a VERDICT first line.'
-    : 'The Senior Engineers applied fixes for your previous findings. Re-review per your rules and write a fresh review-findings.md with a VERDICT first line.',
-    false, false, { model: pipe.reviewModel, fresh: true });
+    : 'The Senior Engineers applied fixes for the findings you listed last round (see the newest entries in changes-log.md). You already have full context from your last review still loaded — do NOT re-read files you already validated and found fine; re-check ONLY the files touched by this fix round against those specific findings, then write a fresh review-findings.md with a VERDICT first line.',
+    false, false, opts);
 }
 
 async function onPipelineAgentDone(agentId, result) {
@@ -1676,6 +1900,7 @@ async function onPipelineAgentDone(agentId, result) {
       } else {
         // learner: a rejection counts against the model that produced each task
         for (const [, taskFile] of pipe.taskAssign) learnMark(pipe.taskModels.get(taskFile), true);
+        showReassigning();       // bridge the gap while pickFixerByAI() resolves
         await startFixRound();   // reassign ALL findings to the right agent (UI/UX for UI)
       }
     } else {
@@ -1689,8 +1914,17 @@ document.getElementById('btn-pipeline-stop').onclick = () => stopEverything();
 // ============================================================
 // Chatbox — routes to pipeline or a single agent
 // ============================================================
+// Infrastructure/status chatter that should NOT clutter the console — the
+// central console is reserved for AI activity. These still go to devtools for
+// debugging, and live status is shown in the activity strip instead.
+const SILENT_FEED_TAGS = new Set(['PIPELINE', 'EXPLORER', 'EDITOR']);
+
 // raw console line not tied to an agent (operator/shell output)
 function feedRaw(tag, cls, text, ico) {
+  if (SILENT_FEED_TAGS.has(tag)) {
+    (cls === 'err' ? console.warn : console.debug)(`[${tag}] ${text}`);
+    return;
+  }
   hideFeedEmpty();
   const el = document.createElement('div');
   el.className = 'ev';
@@ -1803,10 +2037,18 @@ async function loadSlashItems() {
 
 function setupSlash(textarea, menu) {
   let matches = [], sel = 0;
+  // trigger on the CURRENT LINE, not the whole field — a single-line chat
+  // message has only one line so this behaves exactly as before there, but it
+  // also makes "/skill" work inside a multi-line field (e.g. a ticket's
+  // acceptance criteria list), where "/" is never at position 0 of the value.
+  const lineStart = () => {
+    const v = textarea.value;
+    return v.lastIndexOf('\n', textarea.selectionStart - 1) + 1;
+  };
   const query = () => {
     const v = textarea.value;
-    const m = /^\/([\w-]*)$/.exec(v.slice(0, textarea.selectionStart));
-    return v.startsWith('/') && m ? m[1] : null;
+    const m = /^\/([\w-]*)$/.exec(v.slice(lineStart(), textarea.selectionStart));
+    return m ? m[1] : null;
   };
   const hide = () => { menu.classList.add('hidden'); matches = []; };
   function render() {
@@ -1836,8 +2078,12 @@ function setupSlash(textarea, menu) {
   }
   function pick(i) {
     const it = matches[i]; if (!it) return;
-    textarea.value = '/' + it.name + ' ' + textarea.value.replace(/^\/[\w-]*\s*/, '');
-    const pos = it.name.length + 2; textarea.setSelectionRange(pos, pos); hide(); textarea.focus();
+    const start = lineStart();
+    const before = textarea.value.slice(0, start);
+    const rest = textarea.value.slice(start).replace(/^\/[\w-]*\s*/, '/' + it.name + ' ');
+    textarea.value = before + rest;
+    const pos = start + it.name.length + 2;
+    textarea.setSelectionRange(pos, pos); hide(); textarea.focus();
   }
   textarea.addEventListener('input', () => { sel = 0; render(); });
   textarea.addEventListener('blur', () => setTimeout(hide, 150));
@@ -1884,9 +2130,12 @@ async function sendChat() {
     if (pipe.active) { plog('err', 'pipeline already running — abort it first.'); return; }
     launchPipeline(full);
   } else if (target.startsWith('model:')) {
-    // run a bare Claude model, no agent persona
+    // run a bare Claude model, no agent persona. Unlike a roster agent (which
+    // gets a real follow-up composer in the agent dock), a bare model has no
+    // such UI — repeat sends here ARE its only "keep chatting" path, so they
+    // must continue the shared session, not silently start fresh each time.
     const id = ensureModelAgent(target.slice('model:'.length));
-    runAgent(id, full, false, plan);
+    runAgent(id, full, false, plan, { cont: true });
   } else {
     // background learner: manual UI/UX sends grow the UI vocabulary; a quick
     // corrective follow-up counts against the model of the previous run
@@ -2376,36 +2625,285 @@ document.addEventListener('keydown', e => {
 // ============================================================
 // PROJECT IMPORT — one directory applied to all agents
 // ============================================================
-let projectDir = localStorage.getItem('projectDir') || '';
+// projectDir is declared in the workspace block above (mirrors ws().path)
 
 function renderProject() {
   const el = document.getElementById('project-path');
   el.textContent = projectDir || 'no project imported';
   el.classList.toggle('none', !projectDir);
   el.title = projectDir;
+  // the close button only makes sense once a folder is open
+  const closeBtn = document.getElementById('btn-close-project');
+  if (closeBtn) closeBtn.classList.toggle('hidden', !projectDir);
 }
 
-document.getElementById('btn-import').onclick = async () => {
-  const dir = await window.deck.pickFolder();
+// ============================================================
+// WORKSPACE RAIL (Phase 2) — open / switch / close projects
+// ============================================================
+// clone the default line-up with unique ids for a NEW workspace, so runtime
+// state (rt, streamEls, feed) never collides across projects. Ids keep the
+// `def-` prefix so the agents stay permanent + app-managed.
+function freshRoster(cwd) {
+  return DEFAULT_AGENTS.map(d =>
+    ({ ...d, id: d.id + '-' + uid(), defId: d.id, cwd: cwd || '' }));
+}
+
+function wsRunningCount(w) {
+  let n = 0;
+  for (const a of (w.agents || [])) if (rt[a.id] && rt[a.id].running) n++;
+  return n;
+}
+
+// ---- per-workspace console feed (move nodes between the visible feed and
+// each project's detached buffer, so background streams survive a switch) ----
+function showFeedEmpty() {
+  if (!document.getElementById('feed-empty')) {
+    consoleFeed.insertAdjacentHTML('afterbegin', FEED_EMPTY_HTML);
+  }
+}
+// active project → move its live nodes into its buffer (keeps streaming there)
+function stashFeed(wsId) {
+  const buf = getFeedBuf(wsId);
+  consoleFeed.querySelectorAll('.ev').forEach(n => buf.appendChild(n));
+}
+// incoming project → pull its buffered nodes into the visible feed
+function restoreFeed(wsId) {
+  consoleFeed.querySelectorAll('.ev').forEach(n => n.remove());
+  const buf = feedBuf[wsId];
+  if (buf && buf.children.length) {
+    hideFeedEmpty();
+    while (buf.firstChild) consoleFeed.appendChild(buf.firstChild);
+  } else {
+    showFeedEmpty();
+  }
+  consoleFeed.scrollTop = consoleFeed.scrollHeight;
+}
+
+function renderRail() {
+  const rail = document.getElementById('ws-rail');
+  if (!rail) return;
+  rail.innerHTML = '';
+  workspaces.forEach((w, i) => {
+    const tile = document.createElement('button');
+    tile.className = 'ws-tile' + (w.id === activeWorkspaceId ? ' active' : '');
+    tile.style.setProperty('--ws-color', w.color || WS_COLORS[i % WS_COLORS.length]);
+    const initial = ((w.name || '?').trim().charAt(0) || '?').toUpperCase();
+    const running = wsRunningCount(w);
+    tile.innerHTML =
+      `<span class="ws-tile-badge">${esc(initial)}</span>` +
+      (running ? `<span class="ws-run-dot" title="${running} agent(s) running">${running}</span>` : '') +
+      ((workspaces.length > 1 || w.path)
+        ? '<span class="ws-close" title="Close project">✕</span>' : '');
+    tile.title = w.name + (w.path ? ' — ' + w.path : ' (no folder yet)');
+    tile.onclick = (e) => {
+      if (e.target.classList.contains('ws-close')) {
+        e.stopPropagation(); closeWorkspace(w.id); return;
+      }
+      switchWorkspace(w.id);
+    };
+    rail.appendChild(tile);
+  });
+  // + open another project
+  const add = document.createElement('button');
+  add.className = 'ws-tile ws-add';
+  add.innerHTML = '<span class="ws-tile-badge">+</span>';
+  add.title = 'Open another project';
+  add.onclick = newWorkspace;
+  rail.appendChild(add);
+  // ★ Mission Control (Phase 4 — placeholder for the all-projects dashboard)
+  const spacer = document.createElement('div');
+  spacer.className = 'ws-rail-spacer';
+  rail.appendChild(spacer);
+  const mc = document.createElement('button');
+  mc.className = 'ws-tile ws-mc';
+  mc.innerHTML = '<span class="ws-tile-badge">★</span>';
+  mc.title = 'Mission Control — all agents across projects (Phase 4)';
+  mc.onclick = () =>
+    plog('info', 'Mission Control lands in Phase 4 — the all-projects live dashboard.');
+  rail.appendChild(mc);
+}
+
+// re-bind every project-scoped view to the active workspace
+function refreshProjectBindings() {
+  render();          // roster + composer targets
+  renderProject();   // project header path
+  renderWelcome();   // Get Started screen when there's no folder
+  applyFilter();     // console filter
+  gitDetect();       // source control for this repo
+  exReset();         // file explorer
+  loadSlashItems();  // project skills / commands
+  // ticket workspace is per-project — rebind (or close if no folder)
+  if (window.tkProjectChanged) tkProjectChanged();
+  // terminals are per-project too — show this project's, hide the others
+  if (typeof syncTermsToWorkspace === 'function') syncTermsToWorkspace();
+  if (projectDir) {
+    window.deck.symbolEnsure(projectDir)
+      .then(r => { if (r && r.ok) window.deck.symbolWatch(projectDir).catch(() => {}); })
+      .catch(() => {});
+  }
+}
+
+function switchWorkspace(id) {
+  if (id === activeWorkspaceId) return;
+  const target = workspaces.find(w => w.id === id);
+  if (!target) return;
+  stashFeed(activeWorkspaceId);            // keep the old project's console
+  activeWorkspaceId = id;
+  agents = ws().agents;                    // re-point the live references
+  projectDir = ws().path || '';
+  feedFilter = null;
+  document.getElementById('agent-dock').classList.add('hidden');
+  saveWorkspaces();
+  restoreFeed(id);                         // show the new project's console
+  renderRail();
+  refreshProjectBindings();
+}
+
+// open a fresh blank project tab — the Welcome screen takes it from here
+function newWorkspace() {
+  const w = {
+    id: uid(),
+    name: 'New Project',
+    path: '',
+    color: WS_COLORS[workspaces.length % WS_COLORS.length],
+    order: workspaces.length,
+    agents: freshRoster('')
+  };
+  workspaces.push(w);
+  saveWorkspaces();
+  switchWorkspace(w.id);   // path is empty → Welcome shows
+}
+
+// ---- recent folders (VS Code style) ----
+const RECENT_KEY = 'recentFolders';
+function getRecentFolders() {
+  try { return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); } catch { return []; }
+}
+function addRecentFolder(dir) {
   if (!dir) return;
+  let list = getRecentFolders().filter(d => d && d !== dir);
+  list.unshift(dir);
+  localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, 12)));
+}
+function removeRecentFolder(dir) {
+  localStorage.setItem(RECENT_KEY,
+    JSON.stringify(getRecentFolders().filter(d => d && d !== dir)));
+}
+
+// point the ACTIVE (blank) workspace at a folder — from Open Folder or a recent
+function setWorkspaceFolder(dir) {
+  if (!dir) return;
+  // already open in another tab? switch there and drop the blank one we're on
+  const existing = workspaces.find(w => w.path === dir && w.id !== activeWorkspaceId);
+  if (existing) {
+    const blankId = ws().path ? null : activeWorkspaceId;
+    switchWorkspace(existing.id);
+    addRecentFolder(dir);
+    if (blankId && blankId !== existing.id) {
+      workspaces = workspaces.filter(w => w.id !== blankId);
+      delete feedBuf[blankId];
+      saveWorkspaces(); renderRail();
+    }
+    return;
+  }
+  ws().path = dir;
+  ws().name = wsBaseName(dir);
+  for (const a of ws().agents) a.cwd = dir;
+  agents = ws().agents;
   projectDir = dir;
-  localStorage.setItem('projectDir', dir);
-  for (const a of agents) a.cwd = dir;
-  save(); render(); renderProject();
-  gitDetect();
-  exReset();
-  loadSlashItems();   // project skills/commands may differ per project
-  plog('info', 'project imported: all agents now work in ' + dir);
-  // project map: use the cached one under .loveai if present, else build it —
-  // then watch for new/removed files and keep it fresh through the session
-  window.deck.symbolEnsure(dir).then(r => {
-    if (!r || !r.ok) return;
-    plog('info', r.cached
-      ? `project map loaded from cache: ${r.files} files.`
-      : `project map built: ${r.files} files ranked for fast retrieval.`);
-    window.deck.symbolWatch(dir).catch(() => {});
-  }).catch(() => {});
+  addRecentFolder(dir);
+  localStorage.setItem('projectDir', dir);   // legacy mirror
+  saveWorkspaces();
+  renderRail();
+  refreshProjectBindings();
+  plog('info', 'folder opened: ' + dir);
+}
+
+// Welcome / Get Started — shown whenever the active project has no folder
+function renderWelcome() {
+  const wel = document.getElementById('welcome');
+  if (!wel) return;
+  wel.classList.toggle('hidden', !!projectDir);
+  if (projectDir) return;
+  const recents = getRecentFolders().filter(Boolean);
+  const wrap = document.getElementById('wel-recent-wrap');
+  const list = document.getElementById('wel-recent');
+  if (!recents.length) { wrap.classList.add('hidden'); list.innerHTML = ''; return; }
+  wrap.classList.remove('hidden');
+  list.innerHTML = recents.map(d =>
+    `<div class="wel-recent-item" data-dir="${esc(d)}">
+       <span class="wel-rec-name">${esc(wsBaseName(d))}</span>
+       <span class="wel-rec-path">${esc(d)}</span>
+       <span class="wel-rec-x" data-x="1" title="Remove from recent">✕</span>
+     </div>`).join('');
+  list.querySelectorAll('.wel-recent-item').forEach(el => {
+    el.onclick = (e) => {
+      if (e.target.dataset.x) {
+        e.stopPropagation(); removeRecentFolder(el.dataset.dir); renderWelcome(); return;
+      }
+      setWorkspaceFolder(el.dataset.dir);
+    };
+  });
+}
+
+async function closeWorkspace(id) {
+  const w = workspaces.find(x => x.id === id);
+  if (!w) return;
+  const running = wsRunningCount(w);
+  const isLast = workspaces.length <= 1;
+  const ok = await showAlert({
+    title: 'CLOSE PROJECT',
+    message: `Close "${esc(w.name)}"?` +
+      (running ? ` ${running} running agent(s) will be stopped.` : '') +
+      (isLast ? " You'll return to the Welcome screen." : ''),
+    okText: 'CLOSE', cancelText: 'CANCEL', kind: 'warn'
+  });
+  if (!ok) return;
+  for (const a of (w.agents || [])) {
+    if (rt[a.id] && rt[a.id].running) stopAgent(a.id);
+  }
+  delete feedBuf[id];
+  if (typeof killWorkspaceTerms === 'function') killWorkspaceTerms(id);
+
+  if (isLast) {
+    // the only project — reset it in place back to a blank Welcome state
+    w.path = '';
+    w.name = 'New Project';
+    w.agents = freshRoster('');
+    agents = w.agents;
+    projectDir = '';
+    feedFilter = null;
+    localStorage.removeItem('projectDir');
+    restoreFeed(w.id);
+    saveWorkspaces();
+    renderRail();
+    refreshProjectBindings();   // shows the Welcome screen
+    return;
+  }
+
+  workspaces = workspaces.filter(x => x.id !== id);
+  if (activeWorkspaceId === id) {
+    activeWorkspaceId = workspaces[0].id;
+    agents = ws().agents;
+    projectDir = ws().path || '';
+    feedFilter = null;
+    restoreFeed(activeWorkspaceId);
+    refreshProjectBindings();
+  }
+  saveWorkspaces();
+  renderRail();
+}
+
+// close the current project (used by the command palette)
+function closeActiveWorkspace() { closeWorkspace(activeWorkspaceId); }
+
+// Welcome screen actions (project import now lives here — no toolbar button)
+document.getElementById('wel-open').onclick = async () => {
+  const dir = await window.deck.pickFolder();
+  if (dir) setWorkspaceFolder(dir);
 };
+document.getElementById('wel-new').onclick = newWorkspace;
+document.getElementById('btn-close-project').onclick = closeActiveWorkspace;
 
 // ============================================================
 // ACCOUNT / USAGE

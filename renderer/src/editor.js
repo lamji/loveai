@@ -609,6 +609,11 @@ refreshAuth().then(on => {
 });
 
 render();
+// seed recent folders from any projects already open, then paint the rail
+// and the Welcome screen (shown when the active project has no folder yet)
+[...workspaces].reverse().forEach(w => { if (w.path) addRecentFolder(w.path); });
+renderRail();
+renderWelcome();
 setStage(null);
 
 // on load: if a project is already imported, ensure its map (cached under

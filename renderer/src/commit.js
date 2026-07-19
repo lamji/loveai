@@ -15,6 +15,73 @@ function cmtStepMark(step, cls) {
   if (el) el.className = 'cmt-step ' + (cls || '');
 }
 
+// ===== PUSH FLAGS — searchable multi-select menu next to the PUSH button =====
+const PUSH_FLAGS = [
+  { flag: '--force-with-lease', label: 'Force (safe)', hint: 'Overwrite the remote, but fail if it has commits you have not fetched yet' },
+  { flag: '--force', label: 'Force', hint: 'Overwrite the remote branch unconditionally — can destroy other people’s work' },
+  { flag: '--force-if-includes', label: 'Force if includes', hint: 'With Force (safe): also require the remote tip is already integrated locally' },
+  { flag: '--no-verify', label: 'Skip hooks', hint: 'Bypass the pre-push hook' },
+  { flag: '--tags', label: 'Push tags', hint: 'Push all local tags along with this push' },
+  { flag: '--follow-tags', label: 'Follow tags', hint: 'Push annotated tags reachable from the pushed commits' },
+  { flag: '--atomic', label: 'Atomic', hint: 'All refs update together, or none do' },
+  { flag: '--prune', label: 'Prune', hint: 'Remove remote branches that no longer exist locally' },
+  { flag: '--dry-run', label: 'Dry run', hint: 'Show what would be pushed without actually pushing anything' },
+  { flag: '--no-thin', label: 'No thin pack', hint: 'Disable the thin-pack transfer optimization' },
+  { flag: '-v', label: 'Verbose', hint: 'Verbose push output' }
+];
+const cmtPushFlags = new Set();   // extra flags selected for the NEXT push — reset per modal open
+
+function cmtPushBadgeSync() {
+  const badge = cmtEl('cmt-push-badge');
+  badge.textContent = cmtPushFlags.size;
+  badge.classList.toggle('hidden', !cmtPushFlags.size);
+}
+
+function cmtRenderPushFlags(filter) {
+  const box = cmtEl('cmt-push-flaglist');
+  box.innerHTML = '';
+  const q = (filter || '').trim().toLowerCase();
+  const rows = PUSH_FLAGS.filter(f => !q ||
+    f.flag.toLowerCase().includes(q) || f.label.toLowerCase().includes(q));
+  if (!rows.length) { box.innerHTML = '<div class="git-none">no matching flag</div>'; return; }
+  for (const f of rows) {
+    const row = document.createElement('label');
+    row.className = 'cm-item cmt-push-flag-row';
+    row.title = f.hint;
+    row.innerHTML = '<input type="checkbox" />' +
+      '<span class="cmt-push-flag-name"></span><code class="cmt-push-flag-code"></code>';
+    row.querySelector('input').checked = cmtPushFlags.has(f.flag);
+    row.querySelector('.cmt-push-flag-name').textContent = f.label;
+    row.querySelector('.cmt-push-flag-code').textContent = f.flag;
+    row.querySelector('input').onchange = (e) => {
+      if (e.target.checked) cmtPushFlags.add(f.flag); else cmtPushFlags.delete(f.flag);
+      cmtPushBadgeSync();
+    };
+    box.appendChild(row);
+  }
+}
+
+document.getElementById('cmt-push-caret').onclick = (e) => {
+  e.stopPropagation();
+  const menu = cmtEl('cmt-push-menu');
+  if (menu.classList.contains('hidden')) {
+    cmtEl('cmt-push-search').value = '';
+    cmtRenderPushFlags('');
+    menu.classList.remove('hidden');
+    cmtEl('cmt-push-search').focus();
+  } else {
+    menu.classList.add('hidden');
+  }
+};
+document.getElementById('cmt-push-search').oninput = (e) => cmtRenderPushFlags(e.target.value);
+document.getElementById('cmt-push-search').addEventListener('keydown', e => e.stopPropagation());
+document.addEventListener('click', (e) => {
+  const menu = cmtEl('cmt-push-menu');
+  if (!menu.classList.contains('hidden') && !menu.contains(e.target) && e.target.id !== 'cmt-push-caret') {
+    menu.classList.add('hidden');
+  }
+});
+
 // pull a diff to feed the message/PR generators (staged first, else all changes)
 async function cmtChangeDiff() {
   let d = await window.deck.gitDiff(gitRepo, { staged: true });
@@ -47,6 +114,8 @@ document.getElementById('cmt-gen-msg').onclick = cmtGenMessage;
 async function openCommitModal(kind) {
   cmt.kind = kind; cmt.running = false; cmt.lastError = ''; cmt.gitEl = null;
   cmt.autoPush = (kind === 'push' || kind === 'sync');
+  cmtPushFlags.clear(); cmtPushBadgeSync();   // never carry a flag like --force silently into a new push
+  cmtEl('cmt-push-menu').classList.add('hidden');
   const st = await window.deck.gitStatus(gitRepo);
   cmt.willStageAll = st.ok && !st.staged.length && (st.unstaged.length || st.untracked.length);
   cmt.branch = st.branch || '';
@@ -96,7 +165,7 @@ function cmtSetState(state) {
   cmtEl('cmt-msg-block').classList.toggle('hidden', !composing);
   cmtEl('cmt-commit').classList.remove('btn-working');
   show('cmt-commit', state === 'compose' || state === 'error');
-  show('cmt-push', state === 'committed');
+  show('cmt-push-wrap', state === 'committed');
   show('cmt-pr', state === 'pushed');
   show('cmt-close', state === 'done');
   show('cmt-fix', state === 'error');
@@ -126,7 +195,10 @@ function cmtShowLive(label) {
 // stream a git op's stdout/stderr live into the panel
 async function cmtGitStream(op, arg) {
   cmt.streamId = uid(); cmt.gitEl = null;
-  cmtLive(`$ git ${op}${arg && arg !== '*' ? ' ' + arg : ''}`, 'sys');
+  const pretty = Array.isArray(arg) ? arg.join(' ')
+    : (arg && typeof arg === 'object') ? [arg.branch, ...(arg.flags || [])].join(' ')
+    : (arg && arg !== '*' ? arg : '');
+  cmtLive(`$ git ${op}${pretty ? ' ' + pretty : ''}`, 'sys');
   const r = await window.deck.gitStream(gitRepo, op, arg, cmt.streamId);
   cmt.streamId = null; cmt.gitEl = null;
   return r;
@@ -190,14 +262,18 @@ cmtEl('cmt-commit').onclick = async () => {
 cmtEl('cmt-push').onclick = async () => {
   if (cmt.running) return;
   cmt.running = true;
+  cmtEl('cmt-push-menu').classList.add('hidden');
   cmtEl('cmt-error-wrap').classList.add('hidden');   // stale commit-step errors
   cmtEl('cmt-live').innerHTML = '';
   cmtShowLive('PUSH PROCESS');
   cmtStepMark('push', 'active');
   cmtSetState('pushing');
   if (cmt.kind === 'sync') await cmtGitStream('pull');
-  let r = await cmtGitStream('push');
-  if (!r.ok && /no upstream branch|set-upstream/i.test(r.out)) r = await cmtGitStream('publish', cmt.branch || 'HEAD');
+  const flags = [...cmtPushFlags];
+  let r = await cmtGitStream('push', flags.length ? flags : undefined);
+  if (!r.ok && /no upstream branch|set-upstream/i.test(r.out)) {
+    r = await cmtGitStream('publish', { branch: cmt.branch || 'HEAD', flags });
+  }
   cmt.running = false;
   if (!r.ok) {
     // the live panel already streamed the full output — no duplicate error pane

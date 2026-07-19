@@ -34,11 +34,17 @@
       { title: 'Go to File…', hint: 'Ctrl+P', run: () => open('file') },
       { title: 'Go to Line…', hint: 'Ctrl+G', run: () => open('line') },
       { title: 'Toggle Theme (Light / Dark)', hint: 'View', run: () => click('btn-theme') },
+      { title: 'Open Workspace (Tickets)', hint: 'View', run: () => click('btn-tickets') },
       { title: 'Open Terminal', hint: 'View', run: () => openTerminal() },
       { title: 'Show Console', hint: 'View', run: () => showSurface('console') },
       { title: 'Show Editor', hint: 'View', run: () => { if (openFiles.length) showSurface('editor'); } },
       { title: 'Toggle Split (Editor | Console)', hint: 'View', run: () => { if (window.toggleSplit) toggleSplit(); } },
-      { title: 'Import Project…', hint: 'Project', run: () => click('btn-import') },
+      { title: 'Open Folder…', hint: 'Project', run: async () => {
+          const dir = await window.deck.pickFolder();
+          if (dir && window.setWorkspaceFolder) window.setWorkspaceFolder(dir);
+        } },
+      { title: 'New Project Tab', hint: 'Project', run: () => window.newWorkspace && window.newWorkspace() },
+      { title: 'Close Folder', hint: 'Project', run: () => window.closeActiveWorkspace && window.closeActiveWorkspace() },
       { title: 'Deploy New Agent…', hint: 'Agents', run: () => click('btn-new-agent') },
       { title: 'Commit…', hint: 'Git', run: () => openCommitModal('plain') },
       { title: 'Commit & Push…', hint: 'Git', run: () => openCommitModal('push') },

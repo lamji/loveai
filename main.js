@@ -740,7 +740,7 @@ function insideRoot(root, target) {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
-ipcMain.handle('fs-list', (_e, { root, dir }) => {
+ipcMain.handle('fs-list', async (_e, { root, dir }) => {
   try {
     if (!root || !dir || !insideRoot(root, dir)) return { ok: false, error: 'outside the project root' };
     const items = [];
@@ -750,6 +750,36 @@ ipcMain.handle('fs-list', (_e, { root, dir }) => {
     }
     // directories first, then files — each alphabetical, like VS Code
     items.sort((a, b) => (a.dir !== b.dir ? (a.dir ? -1 : 1) : a.name.localeCompare(b.name)));
+    // flag gitignored entries so the explorer can render them distinctly. Safe
+    // to ignore any failure here (not a git repo, git missing, etc.) — the
+    // listing itself still works, just without the ignored decoration.
+    if (items.length) {
+      try {
+        // -C dir (not root): git auto-discovers the nearest .git upward from
+        // there, which still resolves correctly even when `root` itself is
+        // just a parent folder (multi-repo workspace) rather than a repo —
+        // and it correctly picks up nested .gitignore files per app folder
+        // too (that's just how git resolves ignores, nothing extra needed).
+        //
+        // Pass bare NAMES (relative to -C dir), never the absolute Windows
+        // path: a backslash is git's own quoting escape character, so an
+        // absolute "C:\foo\bar" argument makes git echo it back wrapped in
+        // quotes with every backslash doubled ("C:\\foo\\bar") — no amount
+        // of slash/case normalization matches that against the original
+        // path, so this silently flagged nothing before, every time.
+        const r = await git(dir, ['check-ignore', '-v', '--no-index', ...items.map(i => i.name)]);
+        const ignored = new Set();
+        for (const line of (r.out || '').split('\n')) {
+          const t = line.trim();
+          if (!t || /^fatal:/i.test(t)) continue;
+          // -v format: <source>:<line>:<pattern>\t<pathname> — name is after the last tab
+          let p = t.includes('\t') ? t.split('\t').pop() : t;
+          p = p.replace(/^"|"$/g, '');   // git may still quote a name with odd characters
+          if (p) ignored.add(p);
+        }
+        for (const it of items) if (ignored.has(it.name)) it.ignored = true;
+      } catch {}
+    }
     return { ok: true, items };
   } catch (e) {
     return { ok: false, error: String(e && e.message ? e.message : e) };
@@ -946,6 +976,18 @@ ipcMain.handle('fs-delete', (_e, { root, target }) => {
     if (!root || !insideRoot(root, target) || target === root) return { ok: false, error: 'not allowed' };
     fs.rmSync(target, { recursive: true, force: true });
     return { ok: true };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+
+// copy a file or folder (recursive) — used by Explorer's Copy/Paste and Duplicate
+ipcMain.handle('fs-copy', (_e, { root, from, to }) => {
+  try {
+    if (!root || !insideRoot(root, from) || !insideRoot(root, to)) return { ok: false, error: 'outside the project root' };
+    if (!fs.existsSync(from)) return { ok: false, error: 'source no longer exists' };
+    if (fs.existsSync(to)) return { ok: false, error: 'target already exists' };
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.cpSync(from, to, { recursive: true });
+    return { ok: true, path: to };
   } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
 });
 
@@ -1165,7 +1207,34 @@ ipcMain.handle('session-load', (_e, sessionId) => {
 });
 
 // ===== Git integration (VS Code-style source control) =====
-function git(repo, args) {
+// Every app-issued git command for a repo runs through a per-repo queue, so the
+// app can never race itself into "Unable to create .git/index.lock". Locks held
+// by OTHER processes (an agent's shell, an editor, a crashed git) are handled
+// by retrying with backoff and removing a lock that's provably stale.
+const gitQueues = new Map();   // repo -> tail of that repo's command chain
+const GIT_LOCK_RE = /index\.lock['"]?: File exists|Another git process seems to be running/i;
+
+function enqueueGit(repo, fn) {
+  const key = String(repo || '');
+  const tail = gitQueues.get(key) || Promise.resolve();
+  const p = tail.then(fn, fn);
+  gitQueues.set(key, p.then(() => {}, () => {}));
+  return p;
+}
+
+// a lock untouched for 15s while git already errored on it = crashed leftover
+function clearStaleGitLock(repo) {
+  try {
+    const lock = path.join(repo, '.git', 'index.lock');
+    if (Date.now() - fs.statSync(lock).mtimeMs > 15000) {
+      fs.unlinkSync(lock);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function gitExec(repo, args) {
   return new Promise((resolve) => {
     // 90s: commit/push can run pre-commit hooks (lint, tests) that exceed 30s.
     // GIT_TERMINAL_PROMPT=0 + core.editor=true: any auth or editor prompt fails
@@ -1178,6 +1247,26 @@ function git(repo, args) {
       resolve({ ok: !err, out: out || (err && err.killed ? 'timed out after 90s (interactive prompt or slow hook?)' : out) });
     });
   });
+}
+
+async function gitWithLockRetry(repo, args) {
+  let r = await gitExec(repo, args);
+  for (let i = 0; i < 3 && !r.ok && GIT_LOCK_RE.test(r.out); i++) {
+    if (!clearStaleGitLock(repo)) {
+      // someone is genuinely mid-operation — give them a moment to finish
+      await new Promise(res => setTimeout(res, 500 * (i + 1)));
+    }
+    r = await gitExec(repo, args);
+  }
+  if (!r.ok && GIT_LOCK_RE.test(r.out)) {
+    r.out += '\n\n(LoveAi retried 3× — the repo stayed locked by another git ' +
+      'process. Close other git tools, or delete .git/index.lock if nothing is running.)';
+  }
+  return r;
+}
+
+function git(repo, args) {
+  return enqueueGit(repo, () => gitWithLockRetry(repo, args));
 }
 
 // detect repo(s): the folder itself, or first-level subfolders (multi-repo workspaces).
@@ -1236,15 +1325,28 @@ function gitArgs(op, arg) {
     unstage: arg === '*' ? ['reset'] : ['reset', '--', arg],
     commit: ['commit', '-m', arg || 'update'],
     amend: arg ? ['commit', '--amend', '-m', arg] : ['commit', '--amend', '--no-edit'],
-    push: ['push'],
-    // first push of a new branch needs an upstream; arg = branch name
-    publish: ['push', '-u', 'origin', arg || 'HEAD'],
+    // arg: an array of extra flags picked from the push-flags menu (e.g.
+    // ['--force-with-lease', '--no-verify']), or undefined for a plain push
+    push: ['push', ...(Array.isArray(arg) ? arg : [])],
+    // first push of a new branch needs an upstream; arg = branch name string,
+    // or { branch, flags } to carry the same push-flags selection through
+    // this auto-upstream fallback
+    publish: ['push', '-u', 'origin',
+      (arg && typeof arg === 'object') ? (arg.branch || 'HEAD') : (arg || 'HEAD'),
+      ...((arg && typeof arg === 'object' && Array.isArray(arg.flags)) ? arg.flags : [])
+    ],
     pull: ['pull'],
     'pull-rebase': ['pull', '--rebase'],
+    // rebase conflict strategy is inverted from merge's: "ours" during a
+    // rebase means the branch being rebased ONTO (the incoming/remote side),
+    // "theirs" means the commits being replayed (the local side). -X ours
+    // here is what actually makes the incoming/remote content win.
+    'pull-rebase-incoming': ['pull', '--rebase', '-X', 'ours'],
     fetch: ['fetch', '--all', '--prune'],
     // branches
     checkout: ['checkout', arg],
-    'create-branch': ['checkout', '-b', arg],
+    // arg: 'name' or [name, startPoint] — create from a chosen base branch
+    'create-branch': Array.isArray(arg) ? ['checkout', '-b', ...arg] : ['checkout', '-b', arg],
     'delete-branch': ['branch', '-D', arg],
     merge: ['merge', '--no-edit', arg],
     'merge-abort': ['merge', '--abort'],
@@ -1259,7 +1361,7 @@ function gitArgs(op, arg) {
   };
   return ops[op] || null;
 }
-const NET_OPS = new Set(['pull', 'pull-rebase', 'push', 'publish', 'fetch']);
+const NET_OPS = new Set(['pull', 'pull-rebase', 'pull-rebase-incoming', 'push', 'publish', 'fetch']);
 const NET_ERR = /could not resolve hostname|connection timed out|could not read from remote|unable to access|early eof|connection reset/i;
 
 ipcMain.handle('git-cmd', async (_e, { repo, op, arg }) => {
@@ -1281,7 +1383,9 @@ ipcMain.handle('git-cmd', async (_e, { repo, op, arg }) => {
 ipcMain.handle('git-stream', (_e, { repo, op, arg, streamId }) => {
   const args = gitArgs(op, arg);
   if (!args) return Promise.resolve({ ok: false, out: 'unknown git op' });
-  return new Promise((resolve) => {
+  // same per-repo queue as git() — a streamed commit/push can't race a status
+  // poll (or another command) into an index.lock collision
+  return enqueueGit(repo, () => new Promise((resolve) => {
     let out = '';
     const p = spawn('git', ['-c', 'core.editor=true', '-C', repo, ...args], {
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_EDITOR: 'true' }
@@ -1292,24 +1396,35 @@ ipcMain.handle('git-stream', (_e, { repo, op, arg, streamId }) => {
     p.on('error', (e) => { const s = String(e && e.message ? e.message : e); out += s; send('git-stream-data', { streamId, data: s + '\n' }); });
     const to = setTimeout(() => { try { p.kill(); } catch {} send('git-stream-data', { streamId, data: '\n[timed out after 180s]\n' }); }, 180000);
     p.on('close', (code) => { clearTimeout(to); resolve({ ok: code === 0, out: out.trim(), code }); });
-  });
+  }));
 });
 
-// list local + remote branches, marking the current one
+// list local + remote branches, marking the current one. Each ref also carries
+// its tip commit (short hash, relative date, subject) for VS Code-style pickers.
 ipcMain.handle('git-branches', async (_e, repo) => {
-  const r = await git(repo, ['branch', '-a', '--format=%(HEAD)\t%(refname:short)\t%(upstream:short)']);
+  const SEP = '\x1f';
+  // NOTE: %(refname:short) strips remotes/ (origin/x), so local-vs-remote must
+  // be decided from the FULL %(refname) (refs/heads/ vs refs/remotes/)
+  const fmt = ['%(HEAD)', '%(refname)', '%(refname:short)', '%(upstream:short)',
+    '%(objectname:short)', '%(committerdate:relative)', '%(subject)'].join(SEP);
+  const r = await git(repo, ['branch', '-a', `--format=${fmt}`]);
   if (!r.ok) return { ok: false, error: r.out };
-  const local = [], remote = [];
+  const local = [], remote = [], remoteInfo = [];
   let current = '';
   for (const l of r.out.split('\n')) {
     if (!l.trim()) continue;
-    const [head, name, upstream] = l.split('\t');
+    const [head, ref, name, upstream, hash, date, subject] = l.split(SEP);
     if (!name) continue;
-    if (name.startsWith('remotes/')) { remote.push(name.replace('remotes/', '')); continue; }
+    if ((ref || '').startsWith('refs/remotes/')) {
+      remote.push(name);    // kept as strings — existing consumers rely on it
+      remoteInfo.push({ name, hash: hash || '', date: date || '', subject: subject || '' });
+      continue;
+    }
     if (head === '*') current = name;
-    local.push({ name, upstream: upstream || '', current: head === '*' });
+    local.push({ name, upstream: upstream || '', current: head === '*',
+      hash: hash || '', date: date || '', subject: subject || '' });
   }
-  return { ok: true, current, local, remote };
+  return { ok: true, current, local, remote, remoteInfo };
 });
 
 // recent commit history (compact, machine-parseable)
