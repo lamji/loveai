@@ -326,7 +326,7 @@ function termTheme() {
   const v = n => css.getPropertyValue(n).trim();
   return {
     background: v('--editor-bg'), foreground: v('--editor-fg'),
-    cursor: v('--fg'), selectionBackground: v('--editor-sel')
+    cursor: v('--editor-fg'), selectionBackground: v('--editor-sel')
   };
 }
 

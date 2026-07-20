@@ -39,6 +39,18 @@ function cpBeginTask(cwd, label) {
   })();
 }
 
+// peek the active checkpoint's ref/repo for a cwd WITHOUT closing it — lets
+// the Reviewer scope its diff to only what THIS task changed (git diff <ref>)
+// instead of the raw working tree, which can still carry unrelated uncommitted
+// edits left over from an earlier, unrelated session.
+async function cpActiveRef(cwd) {
+  const entry = cwd && cpOpen.get(cwd);
+  if (!entry) return null;
+  await entry.ready;
+  if (!entry.repo || !entry.ref) return null;
+  return { repo: entry.repo, ref: entry.ref };
+}
+
 async function cpEndTask(cwd) {
   const entry = cwd && cpOpen.get(cwd);
   if (!entry) return;

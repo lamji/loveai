@@ -113,7 +113,9 @@
 :root[data-theme="light"] input,
 :root[data-theme="light"] [contenteditable],
 :root[data-theme="light"] .vw-input,
-:root[data-theme="light"] .vw-code {
+:root[data-theme="light"] .vw-code,
+:root[data-theme="light"] .xterm,
+:root[data-theme="light"] .xterm-screen {
   cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><path d="M12 4 V20 M9 4 H15 M9 20 H15" stroke="white" stroke-width="3.4" fill="none" stroke-linecap="round"/><path d="M12 4 V20 M9 4 H15 M9 20 H15" stroke="black" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg>') 12 12, text;
 }
 :root textarea,
@@ -132,7 +134,9 @@
 :root:not([data-theme="light"]) input,
 :root:not([data-theme="light"]) [contenteditable],
 :root:not([data-theme="light"]) .vw-input,
-:root:not([data-theme="light"]) .vw-code {
+:root:not([data-theme="light"]) .vw-code,
+:root:not([data-theme="light"]) .xterm,
+:root:not([data-theme="light"]) .xterm-screen {
   cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><path d="M12 4 V20 M9 4 H15 M9 20 H15" stroke="black" stroke-width="3.4" fill="none" stroke-linecap="round"/><path d="M12 4 V20 M9 4 H15 M9 20 H15" stroke="white" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg>') 12 12, text;
 }
 
@@ -1006,6 +1010,161 @@ body {
   padding: 5px 9px 3px; border-top: 1px solid var(--border); margin-top: 3px;
   font-family: var(--mono); font-size: 9px; color: var(--fg-dim); letter-spacing: .5px;
 }
+
+/* ================= Notes (Notion-style) ================= */
+.notes-card {
+  width: 900px; height: 82vh; max-width: 94vw;
+  padding: 0; overflow: hidden; position: relative;
+  display: flex; flex-direction: column; gap: 0;
+}
+.notes-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 18px 26px 12px; border-bottom: 1px solid var(--border);
+}
+.notes-title {
+  flex: 1; background: transparent !important; border: none !important;
+  padding: 0 !important; color: var(--fg);
+  font-family: var(--sans); font-size: 24px; font-weight: 700; letter-spacing: -.2px;
+}
+.notes-title:focus { outline: none; }
+.notes-close {
+  flex: none; width: 30px; height: 30px; border-radius: 8px; cursor: pointer;
+  background: transparent; border: 1px solid var(--border); color: var(--fg-dim);
+  font-size: 14px; line-height: 1;
+}
+.notes-close:hover { color: var(--fg); border-color: var(--border-hi); background: var(--hover); }
+.notes-body {
+  flex: 1; overflow-y: auto; padding: 16px 26px 60px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+
+/* one row per block: optional prefix/checkbox + growing textarea */
+.notes-block { display: flex; align-items: flex-start; gap: 6px; padding: 1px 0; }
+.nb-prefix {
+  flex: none; color: var(--fg-dim); font-family: var(--sans);
+  font-size: 15px; line-height: 1.5; padding-top: 2px; min-width: 14px;
+  text-align: right; user-select: none;
+}
+.nb-check {
+  flex: none; margin: 2px 0 0; cursor: pointer;
+  width: 15px; height: 15px; padding: 0 !important;
+  background: transparent !important; border: none !important;
+  border-radius: 0 !important; accent-color: var(--accent);
+}
+.nb-input {
+  flex: 1; min-width: 0;
+  background: transparent !important; border: none !important;
+  box-shadow: none !important; resize: none; overflow: hidden;
+  padding: 2px 0 !important; margin: 0; color: var(--fg);
+  font-family: var(--sans); font-size: 15px; line-height: 1.5;
+}
+.nb-input:focus { outline: none; }
+.nb-input::placeholder { color: var(--fg-dim); }
+
+/* per-type visuals */
+.nb-h1 .nb-input { font-size: 26px; font-weight: 700; line-height: 1.25; }
+.nb-h2 .nb-input { font-size: 21px; font-weight: 700; line-height: 1.3; }
+.nb-h3 .nb-input { font-size: 17px; font-weight: 600; line-height: 1.35; }
+.nb-h1 .nb-prefix, .nb-h2 .nb-prefix, .nb-h3 .nb-prefix { padding-top: 0; }
+.nb-quote {
+  border-left: 3px solid var(--accent); padding-left: 12px; margin: 3px 0;
+}
+.nb-quote .nb-input { color: var(--fg-dim); font-style: italic; }
+.nb-code {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 12px; margin: 4px 0;
+}
+.nb-code .nb-input {
+  font-family: var(--mono); font-size: 13px; line-height: 1.55; white-space: pre;
+}
+.nb-todo.nb-done .nb-input { color: var(--fg-dim); text-decoration: line-through; }
+.nb-divider { padding: 6px 0; }
+.nb-divider hr {
+  width: 100%; border: none; border-top: 1px solid var(--border); margin: 0;
+}
+.notes-slash { max-height: 260px; }
+
+/* ---- Notes gallery: a center SCREEN (mirrors the ticket board .tkws) ---- */
+.notes-view {
+  position: absolute; inset: 0; z-index: 5;
+  background: var(--bg);
+  display: flex; flex-direction: column; min-height: 0;
+}
+.notes-view.hidden { display: none; }
+.notes-view-head {
+  flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.notes-view-title {
+  flex: none; font-family: var(--mono); font-size: 12px; letter-spacing: 2px;
+  color: var(--fg-dim); font-weight: 600;
+}
+.notes-search {
+  flex: 1; min-width: 0; background: var(--surface-2) !important;
+  border: 1px solid var(--border) !important; border-radius: 8px;
+  padding: 7px 12px !important; color: var(--fg);
+  font-family: var(--sans); font-size: 13px;
+}
+.notes-search:focus { outline: none; border-color: var(--border-hi) !important; }
+.notes-search::placeholder { color: var(--fg-dim); }
+.notes-sort {
+  flex: none; background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 8px; color: var(--fg-dim);
+  font-family: var(--mono); font-size: 11px; cursor: pointer;
+}
+.notes-sort:focus { outline: none; }
+.notes-new {
+  flex: none; background: var(--accent); border: none; border-radius: 8px;
+  padding: 7px 12px; color: #fff; cursor: pointer;
+  font-family: var(--sans); font-size: 12.5px; font-weight: 600;
+}
+.notes-new:hover { filter: brightness(1.08); }
+
+.notes-grid {
+  flex: 1; overflow-y: auto; padding: 18px 22px;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 14px; align-content: start;
+}
+.notes-card-item {
+  display: flex; flex-direction: column; gap: 6px; cursor: pointer;
+  min-height: 118px; padding: 14px; border-radius: 12px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  transition: transform .12s ease, border-color .12s ease, box-shadow .12s ease;
+}
+.notes-card-item:hover {
+  transform: translateY(-2px); border-color: var(--border-hi);
+  box-shadow: var(--shadow);
+}
+.nc-title {
+  font-family: var(--sans); font-size: 14.5px; font-weight: 700; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nc-preview {
+  flex: 1; font-size: 12px; line-height: 1.5; color: var(--fg-dim);
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+.nc-foot { display: flex; align-items: center; justify-content: space-between; }
+.nc-date { font-family: var(--mono); font-size: 10px; color: var(--fg-dim); }
+.nc-del {
+  flex: none; background: transparent; border: none; cursor: pointer;
+  color: var(--fg-dim); font-size: 12px; opacity: 0; transition: opacity .12s ease;
+  padding: 2px 4px; border-radius: 6px;
+}
+.notes-card-item:hover .nc-del { opacity: .7; }
+.nc-del:hover { opacity: 1 !important; background: var(--hover); color: var(--err); }
+
+.notes-empty {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 14px; color: var(--fg-dim);
+}
+.notes-empty-mark {
+  width: 40px; height: 40px; border-radius: 13px; background: var(--accent);
+  opacity: .8;
+}
+.notes-empty-title { font-size: 15px; font-weight: 600; color: var(--fg); }
+.notes-empty-text { font-size: 13px; text-align: center; max-width: 260px; }
 
 /* ================= Skill editor page ================= */
 .skill-page {
@@ -2365,6 +2524,11 @@ textarea.dropping { border-color: var(--accent) !important; background: var(--ac
 .tv-pane { position: absolute; inset: 0; padding: 2px 10px 0; }
 .tv-pane.hidden { display: none; }
 .tv-pane .xterm { height: 100%; }
+/* xterm.css hardcodes .xterm-viewport to #000 — in dark theme that's close
+   enough to --editor-bg to go unnoticed, but in light theme it shows as a
+   black strip behind/around the canvas. Match the panel's own background
+   (same token #term-view/#panel already use) so it's seamless in both. */
+.tv-pane .xterm-viewport { background-color: var(--editor-bg) !important; }
 
 
 /* ============================================================
@@ -2407,6 +2571,7 @@ body.onboarding #main { visibility: hidden; }
   overflow: hidden;
 }
 .ob-term .xterm { height: 100%; }
+.ob-term .xterm-viewport { background-color: var(--editor-bg) !important; }
 .ob-hint { color: var(--fg-dim); font-size: 11.5px; text-align: center; }
 .ob-spinner {
   width: 28px; height: 28px;
@@ -2605,6 +2770,18 @@ button[disabled] .ob-btn-spin { opacity: 0.9; }
 .sb-item:hover { background: var(--hover); color: var(--fg); }
 .sb-item.hidden { display: none; }
 .sb-ico { font-size: 12px; opacity: 0.9; }
+/* code-graph status item + its determinate recompute progress bar */
+#sb-graph.building { color: var(--accent); }
+.sb-graph-bar {
+  display: inline-block; width: 42px; height: 4px; margin-left: 4px;
+  background: var(--border); border-radius: 3px; overflow: hidden;
+  vertical-align: middle;
+}
+.sb-graph-bar.hidden { display: none; }
+.sb-graph-bar > i {
+  display: block; height: 100%; width: 0%;
+  background: var(--accent); transition: width .2s ease;
+}
 .sb-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--fg-dim); }
 .sb-dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
 .sb-dot.off { background: var(--err); }

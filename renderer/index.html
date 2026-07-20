@@ -190,6 +190,12 @@
           <path d="M9 3v18M15 3v10"/>
         </svg>
       </button>
+      <button id="btn-notes" class="git-badge head-ico" title="Notes">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 4.5A1.5 1.5 0 0 1 5.5 3H16l4 4v12.5A1.5 1.5 0 0 1 18.5 21h-13A1.5 1.5 0 0 1 4 19.5z"/>
+          <path d="M15 3v4.5H20M8 12h8M8 16h5"/>
+        </svg>
+      </button>
       <button id="btn-theme" class="git-badge head-ico" title="Toggle light / dark">
         <svg id="theme-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <circle cx="12" cy="12" r="4.2"/>
@@ -439,6 +445,31 @@
       <div id="tk-listview" class="tk-listview hidden"></div>
     </div>
 
+    <!-- Notes gallery — a center screen like the ticket board (editor is a modal) -->
+    <div id="notes-view" class="notes-view hidden">
+      <div class="notes-view-head">
+        <div class="notes-view-title">▤ NOTES</div>
+        <input id="notes-search" class="notes-search" type="text"
+               placeholder="Search notes…" />
+        <select id="notes-sort" class="notes-sort" title="Sort">
+          <option value="updated">Updated</option>
+          <option value="created">Created</option>
+          <option value="title">Title</option>
+        </select>
+        <button id="notes-new" class="notes-new" title="New note">＋ New</button>
+        <button id="notes-view-close" class="notes-close" title="Close notes">✕</button>
+      </div>
+      <div id="notes-grid" class="notes-grid"></div>
+      <div id="notes-empty" class="notes-empty hidden">
+        <div class="notes-empty-mark"></div>
+        <div id="notes-empty-title" class="notes-empty-title">No notes yet</div>
+        <div id="notes-empty-text" class="notes-empty-text">
+          Create your first note to get started.
+        </div>
+        <button id="notes-empty-new" class="notes-new">＋ New note</button>
+      </div>
+    </div>
+
     </div><!-- /#editor-area -->
 
     <!-- draggable divider between editor area and the bottom panel -->
@@ -483,6 +514,7 @@
       <div class="sb-left">
         <button class="sb-item" id="sb-branch" title="Source control"><span class="sb-ico">⎇</span><span id="sb-branch-name">—</span><span id="sb-sync"></span></button>
         <button class="sb-item" id="sb-project" title="Recent projects"><span id="sb-project-name"></span></button>
+        <button class="sb-item hidden" id="sb-graph" title="Code graph — click to recompute regression impact"><span class="sb-ico">⛓</span><span id="sb-graph-txt">graph</span><span class="sb-graph-bar hidden" id="sb-graph-bar"><i></i></span></button>
         <button class="sb-item hidden" id="sb-problems" title="Problems"><span class="sb-ico">⊘</span><span id="sb-problems-n">0</span></button>
       </div>
       <div class="sb-right">
@@ -800,6 +832,19 @@
     </div>
   </div>
 
+  <!-- Note editor — a modal floating over the notes gallery screen -->
+  <div id="notes-modal" class="modal hidden">
+    <div class="modal-card notes-card">
+      <div class="notes-head">
+        <input id="notes-title" class="notes-title" placeholder="Untitled" />
+        <button id="notes-delete" class="notes-close" title="Delete note">🗑</button>
+        <button id="notes-close" class="notes-close" title="Close">✕</button>
+      </div>
+      <div id="notes-body" class="notes-body"></div>
+      <div id="notes-slash" class="slash-menu notes-slash hidden"></div>
+    </div>
+  </div>
+
   <!-- Git history + diff -->
   <div id="git-modal" class="modal hidden">
     <div class="modal-card git-modal-card">
@@ -1072,6 +1117,7 @@
   <script src="src/layout.js"></script>
   <script src="src/statusbar.js"></script>
   <script src="src/workspace.js"></script>
+  <script src="src/notes.js"></script>
   <script src="src/palette.js"></script>
   <script src="src/profile.js"></script>
   <script src="src/onboarding.js"></script>

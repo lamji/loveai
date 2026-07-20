@@ -296,6 +296,89 @@ async function saveFile(f) {
   if (gitRepo) gitRefresh();
 }
 
+// ============================================================
+// TOGGLE COMMENT — Ctrl+/, VS Code style. Comments/uncomments every line
+// touched by the selection (or just the caret line with no selection).
+// ============================================================
+const LINE_COMMENT_MAP = {
+  js: '//', jsx: '//', ts: '//', tsx: '//', jsonc: '//', java: '//', kotlin: '//',
+  swift: '//', c: '//', cpp: '//', csharp: '//', php: '//', dart: '//', go: '//',
+  rust: '//', scss: '//', less: '//',
+  python: '#', ruby: '#', yaml: '#', toml: '#', ini: '#', shellscript: '#',
+  powershell: '#', dotenv: '#', docker: '#', ignore: '#', graphql: '#',
+  bat: '::',
+  sql: '--'
+};
+const BLOCK_COMMENT_MAP = {
+  html: ['<!--', '-->'], xml: ['<!--', '-->'], vue: ['<!--', '-->'], svelte: ['<!--', '-->'],
+  md: ['<!--', '-->'], mdx: ['<!--', '-->'],
+  css: ['/*', '*/']
+};
+
+function commentTokens(lang) {
+  if (BLOCK_COMMENT_MAP[lang]) return { block: BLOCK_COMMENT_MAP[lang] };
+  return { line: LINE_COMMENT_MAP[lang] || '//' };
+}
+
+function toggleLineComment(prefix) {
+  const val = vwInput.value;
+  const selStart = vwInput.selectionStart, selEnd = vwInput.selectionEnd;
+  const lineStart = val.lastIndexOf('\n', selStart - 1) + 1;
+  // exclude a trailing line whose selection only touches its column-0 start
+  const effectiveEnd = (selEnd > selStart && val[selEnd - 1] === '\n') ? selEnd - 1 : selEnd;
+  let lineEnd = val.indexOf('\n', effectiveEnd);
+  if (lineEnd === -1) lineEnd = val.length;
+
+  const lines = val.slice(lineStart, lineEnd).split('\n');
+  const nonBlank = lines.filter(l => l.trim() !== '');
+  const target = nonBlank.length ? nonBlank : lines;
+  const escPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const commentRe = new RegExp('^(\\s*)' + escPrefix + ' ?');
+  const allCommented = target.every(l => commentRe.test(l));
+
+  let newLines;
+  if (allCommented) {
+    newLines = lines.map(l => l.replace(commentRe, '$1'));
+  } else {
+    const minIndent = Math.min(...nonBlank.map(l => (/^(\s*)/.exec(l))[1].length));
+    newLines = lines.map(l => l.trim() === '' ? l : l.slice(0, minIndent) + prefix + ' ' + l.slice(minIndent));
+  }
+  const newBlock = newLines.join('\n');
+
+  vwInput.setSelectionRange(lineStart, lineEnd);
+  document.execCommand('insertText', false, newBlock);
+  vwInput.setSelectionRange(lineStart, lineStart + newBlock.length);
+}
+
+function toggleBlockComment(tokens) {
+  const [open, close] = tokens;
+  const val = vwInput.value;
+  let start = vwInput.selectionStart, end = vwInput.selectionEnd;
+  let text = val.slice(start, end);
+  const noSelection = start === end;
+  if (noSelection) {
+    // wrap the whole caret line, like VS Code does with no selection
+    start = val.lastIndexOf('\n', start - 1) + 1;
+    end = val.indexOf('\n', start);
+    if (end === -1) end = val.length;
+    text = val.slice(start, end);
+  }
+
+  const wrapped = new RegExp('^' + open.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    + ' ?([\\s\\S]*?) ?' + close.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$').exec(text);
+
+  const newText = wrapped ? wrapped[1] : `${open} ${text} ${close}`;
+  vwInput.setSelectionRange(start, end);
+  document.execCommand('insertText', false, newText);
+  vwInput.setSelectionRange(start, start + newText.length);
+}
+
+function toggleComment(f) {
+  const tokens = commentTokens(f.lang);
+  if (tokens.block) toggleBlockComment(tokens.block);
+  else toggleLineComment(tokens.line);
+}
+
 vwInput.addEventListener('keydown', e => {
   const f = activeF();
   if (!f) return;
@@ -304,6 +387,13 @@ vwInput.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
     e.preventDefault();
     saveFile(f);
+    return;
+  }
+
+  // Ctrl+/ — toggle line comment, VS Code style
+  if ((e.ctrlKey || e.metaKey) && e.key === '/') {
+    e.preventDefault();
+    toggleComment(f);
     return;
   }
 

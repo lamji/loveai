@@ -51,6 +51,9 @@ function renderStatusBar() {
     sbShow('sb-project', false);
   }
 
+  // ----- code graph status (throttled internally) -----
+  refreshGraphStatus();
+
   // ----- work in progress (agent running OR pipeline active/paused) -----
   renderWork();
 
@@ -225,6 +228,128 @@ document.getElementById('sb-agent').onclick = (e) => {
   if (id && typeof openChat === 'function') openChat(id);
 };
 document.getElementById('sb-project').onclick = () => { if (window.openRecentProjects) window.openRecentProjects(); };
+
+// ----- code-graph status + manual recompute -----
+// Shows whether the regression-impact graph is precomputed, whether its fs
+// watcher is running, and when it was last built. Click = rebuild (progress
+// bar). Status IPC is throttled (not the 1s tick); progress comes from events.
+const sbGraph = { building: false, pct: 0, lastError: '', phase: 'graph' };
+let sbGraphFetchAt = 0;
+let sbGraphProj = null;
+
+function graphAgo(ts) {
+  if (!ts) return '';
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+function paintGraph(st) {
+  const item = document.getElementById('sb-graph');
+  const txt = document.getElementById('sb-graph-txt');
+  const bar = document.getElementById('sb-graph-bar');
+  if (!item || !txt) return;
+  const pd = (typeof projectDir !== 'undefined') && projectDir;
+  if (!pd) { item.classList.add('hidden'); return; }
+  item.classList.remove('hidden');
+  if (sbGraph.building || (st && st.building)) {
+    item.classList.add('building');
+    const lbl = sbGraph.phase === 'vectors' ? 'vectors' : 'graph';
+    txt.textContent = lbl + ' ⏳ ' + (sbGraph.pct || 0) + '%';
+    if (bar) { bar.classList.remove('hidden'); bar.querySelector('i').style.width = (sbGraph.pct || 0) + '%'; }
+    item.title = sbGraph.phase === 'vectors'
+      ? 'Embedding symbols for semantic search…'
+      : 'Building code graph…';
+    return;
+  }
+  item.classList.remove('building');
+  if (bar) bar.classList.add('hidden');
+  if (st && st.broken) {
+    txt.textContent = 'graph ✗';
+    item.title = 'Code graph failed: ' + (st.error || 'tree-sitter unavailable')
+      + '\nClick to retry.';
+    return;
+  }
+  if (st && st.built) {
+    txt.textContent = 'graph ✓ ' + graphAgo(st.lastBuilt) + (st.watching ? ' · watching' : '');
+    item.title = 'Code graph — ' + st.files + ' symbols · built '
+      + (st.lastBuilt ? new Date(st.lastBuilt).toLocaleString() : 'unknown')
+      + (st.watching ? ' · watcher running' : ' · watcher off') + '\nClick to recompute.';
+  } else if (st && st.empty) {
+    // the build completed (the bar hit 100%) but produced no symbols — say so,
+    // instead of repainting as "no graph yet" like the build never happened
+    txt.textContent = 'graph ⚠ 0 symbols';
+    item.title = 'Code graph built but found 0 symbols.\n'
+      + 'Likely no supported languages (js/ts/tsx/py/go/rs/java) or grammar '
+      + 'loads failed — check DevTools console for "[codegraph]" errors.\n'
+      + 'Click to rebuild.';
+  } else if (sbGraph.lastError) {
+    txt.textContent = 'graph ✗';
+    item.title = 'Last build failed: ' + sbGraph.lastError + '\nClick to retry.';
+  } else {
+    txt.textContent = 'graph — build';
+    item.title = 'No code graph yet — click to compute regression impact.';
+  }
+}
+async function refreshGraphStatus(force) {
+  const item = document.getElementById('sb-graph');
+  if (!item) return;
+  const pd = (typeof projectDir !== 'undefined') && projectDir;
+  if (!pd) { item.classList.add('hidden'); return; }
+  if (pd !== sbGraphProj) { sbGraphProj = pd; force = true; }   // project changed → refresh now
+  const now = Date.now();
+  if (!force && now - sbGraphFetchAt < 4000) return;            // throttle — not every 1s tick
+  sbGraphFetchAt = now;
+  let st; try { st = await window.deck.codegraphStatus(pd); } catch { return; }
+  if (st && st.ok) paintGraph(st);
+}
+document.getElementById('sb-graph').onclick = async () => {
+  const pd = (typeof projectDir !== 'undefined') && projectDir;
+  if (!pd || sbGraph.building) return;
+  sbGraph.building = true; sbGraph.pct = 0; sbGraph.phase = 'graph';
+  paintGraph({ building: true });
+  // keep the result — a failed build repainted as "no graph yet" otherwise
+  let r = null;
+  try { r = await window.deck.codegraphBuild(pd); } catch {}
+  sbGraph.building = false;   // 'codegraph-updated' also finalizes; guards a silent finish
+  sbGraph.lastError = (r && !r.ok && r.error) ? r.error : '';
+  refreshGraphStatus(true);
+};
+window.deck.onCodegraphProgress((p) => {
+  const pd = (typeof projectDir !== 'undefined') && projectDir;
+  if (!pd || p.cwd !== pd) return;
+  sbGraph.building = true; sbGraph.phase = 'graph';
+  sbGraph.pct = p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
+  paintGraph({ building: true });
+});
+window.deck.onCodegraphUpdated(() => {
+  // Graph is done, but the semantic VECTOR build starts right after (main.js kicks
+  // it off). Don't finalize to 100% yet — switch into the 'vectors' phase so the
+  // bar keeps running until vectors.json actually exists. Otherwise the user sees
+  // "100%" while the vector index is still missing.
+  sbGraph.building = true; sbGraph.phase = 'vectors'; sbGraph.pct = 0;
+  paintGraph({ building: true });
+});
+// vector-embedding progress (second half of a build)
+window.deck.onVectorProgress((p) => {
+  const pd = (typeof projectDir !== 'undefined') && projectDir;
+  if (!pd || p.cwd !== pd) return;
+  sbGraph.building = true; sbGraph.phase = 'vectors';
+  sbGraph.pct = p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
+  paintGraph({ building: true });
+});
+window.deck.onVectorUpdated((p) => {
+  const pd = (typeof projectDir !== 'undefined') && projectDir;
+  if (!pd || (p && p.cwd && p.cwd !== pd)) return;
+  // ignore the incremental re-embeds the file watcher emits — only a running
+  // build (vectors phase) should finalize the bar.
+  if (sbGraph.phase !== 'vectors' || !sbGraph.building) return;
+  sbGraph.building = false; sbGraph.pct = 100; sbGraph.phase = 'graph';
+  sbGraph.lastError = (p && p.ok === false)
+    ? ('vector embedding failed' + (p.error ? ': ' + p.error : '')) : '';
+  refreshGraphStatus(true);
+});
 
 // ----- repaint hooks -----
 // caret / selection movement while editing

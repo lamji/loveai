@@ -7,6 +7,9 @@ const tvBody = document.getElementById('tv-body');
 const termTabs = [];        // { id, shell, title, xterm, fit, pane, dead }
 let termActive = null;      // id
 let termSeq = 0;
+// wsIds where the terminal panel is intentionally open (per-project intent,
+// not one global flag) — see syncTermsToWorkspace()
+const termPanelWs = new Set();
 
 function termOpen() {
   return typeof panelOpen === 'function' && panelOpen()
@@ -200,6 +203,7 @@ async function newTerm(shell, cwd) {
   const t = { id, shell, cwd: startCwd, wsId: activeWorkspaceId,
               title: '', xterm: xt, fit, pane, dead: false };
   termTabs.push(t);
+  termPanelWs.add(t.wsId);
   activateTerm(id);
   try { fit.fit(); } catch {}
 
@@ -222,6 +226,7 @@ function closeTerm(id) {
   const i = termTabs.findIndex(t => t.id === id);
   if (i < 0) return;
   const t = termTabs[i];
+  const closedWsId = t.wsId;
   window.deck.termKill(id);
   t.xterm.dispose();
   t.pane.remove();
@@ -232,12 +237,17 @@ function closeTerm(id) {
     termActive = mine.length ? mine[Math.max(0, Math.min(i - 1, mine.length - 1))].id : null;
     if (termActive) activateTerm(termActive);
   }
+  // an emptied project must not re-show an empty panel on the next switch
+  if (!termTabs.some(t2 => t2.wsId === closedWsId)) termPanelWs.delete(closedWsId);
   renderTermTabs();
 }
 
 // terminal now lives in the dockable bottom panel — it COEXISTS with the editor
 // / console above it (no longer swaps the center surface). See src/layout.js.
 function openTerminal() {
+  if (window.tkIsOpen && window.tkIsOpen() && window.closeTicketWs) window.closeTicketWs();
+  if (window.notesViewOpen && window.notesViewOpen() && window.closeNotesView) window.closeNotesView();
+  termPanelWs.add(activeWorkspaceId);
   panelShow('terminal');
   const mine = wsTerms();
   if (!mine.length) newTerm('bash');   // first terminal for this project
@@ -249,13 +259,17 @@ function openTerminal() {
 function closeTerminalView() {
   // tabs keep their PTYs alive in the background — this only hides the panel
   panelHide();
+  termPanelWs.delete(activeWorkspaceId);
   setTermIconActive(false);
   renderConsoleChips();
 }
 
-// switching projects: hide every terminal, reveal the active project's — and
-// if its panel is open with no terminal yet, spawn one in its own cwd
+// switching projects: hide every terminal, reveal the active project's own
+// terminals if it has any AND the user had its panel open — NEVER spawn one.
+// The panel is a single global dock but its OPEN state is per-project intent
+// (termPanelWs), independent of whether the incoming project has terminals.
 function syncTermsToWorkspace() {
+  if (!termOpen() && panelOpen()) return;   // panel is on the 'problems' page — leave it alone
   termTabs.forEach(t => t.pane.classList.add('hidden'));
   const mine = wsTerms();
   if (mine.length) {
@@ -265,10 +279,16 @@ function syncTermsToWorkspace() {
     try { keep.fit.fit(); } catch {}
   } else {
     termActive = null;
-    // open a shell in THIS project's folder. Pass projectDir explicitly — gitRepo
-    // is set asynchronously by gitDetect() and still holds the previous project's
-    // repo at this instant, which would open the terminal in the wrong directory.
-    if (termOpen() && projectDir) { newTerm('bash', projectDir); return; }
+  }
+  const wantTerm = termPanelWs.has(activeWorkspaceId) && mine.length > 0;
+  if (wantTerm) {
+    panelShow('terminal');
+    setTermIconActive(true);
+  } else if (termOpen()) {
+    panelHide();
+    setTermIconActive(false);
+  } else {
+    setTermIconActive(false);
   }
   renderTermTabs();
 }
@@ -276,6 +296,7 @@ function syncTermsToWorkspace() {
 // closing (or resetting) a project: tear down its terminals
 function killWorkspaceTerms(wsId) {
   for (const t of termTabs.filter(t => t.wsId === wsId)) closeTerm(t.id);
+  termPanelWs.delete(wsId);
 }
 
 // fit the visible terminal to the panel (called on resize / panel show)
@@ -304,6 +325,8 @@ function currentSurface() {
   return 'console';
 }
 function showSurface(name) {
+  if (window.tkIsOpen && window.tkIsOpen() && window.closeTicketWs) window.closeTicketWs();
+  if (window.notesViewOpen && window.notesViewOpen() && window.closeNotesView) window.closeNotesView();
   if (name === 'terminal') { openTerminal(); return; }
   if (name === 'editor' && openFiles.length) {
     paneOverride = 'editor';

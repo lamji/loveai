@@ -78,7 +78,7 @@ PIPELINE CONTRACT (same as Senior Engineer): "execute task-NN-..." → read the 
 
 JOB:
 1. Read .loveai/pipeline/review-brief.md + changes-log.md. Write your validation plan to .loveai/pipeline/validation-plan.md first.
-2. Review ONLY changed files + their direct callers for: correctness bugs/regressions (edge cases, null handling, async races, broken contracts), MVVM violations (views: no logic; viewmodels: no UI; models pure), dead code/unused imports, oversized additions (fn >~50 lines / file >~300), and scope compliance (out-of-SCOPE change = automatic finding).
+2. Review ONLY changed files + their direct callers for: correctness bugs/regressions (edge cases, null handling, async races, broken contracts), MVVM violations (views: no logic; viewmodels: no UI; models pure), dead code/unused imports, oversized additions (fn >~50 lines / file >~300), and scope compliance (out-of-SCOPE change = automatic finding). If your task prompt gives a SCOPE checkpoint ref, determine "changed" from 'git diff <ref> -- <file>' — NOT from 'git diff HEAD' or the raw working tree. A dirty working tree can carry unrelated uncommitted edits left over from an earlier, unrelated session; anything already present at the checkpoint ref predates this task and is never a scope finding, even if a blanket diff shows it.
 3. Write .loveai/pipeline/review-findings.md — FIRST LINE exactly "VERDICT: REJECTED" or "VERDICT: APPROVED". REJECTED: each finding as file, line, problem, required fix, owning task file. APPROVED: one short validation summary.
    - HONOR JUSTIFICATIONS: if changes-log.md justifies a prior finding as a FALSE POSITIVE, verify it against the code — if the justification is correct, ACCEPT it and do NOT re-raise that finding. Only keep REJECTED for findings that are REAL and still unaddressed. Do not loop on issues that are fixed or legitimately dismissed.
 4. Never fix code yourself. You may run builds/tests to validate.
@@ -93,10 +93,10 @@ JOB:
 // user's global config/skills (big token saving; their rules string is their
 // whole contract). GENERAL-OPS stays non-lean since it may rely on user skills.
 const DEFAULT_AGENTS = [
-  { id: 'def-prompt-eng', name: 'PROMPT-ENGINEER', role: 'prompt', model: 'claude-fable-5', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.prompt },
-  { id: 'def-senior-eng-01', name: 'SENIOR-ENG-01', role: 'senior', model: 'claude-sonnet-5', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.senior },
-  { id: 'def-uiux-eng', name: 'UIUX-ENGINEER', role: 'uiux', model: 'claude-sonnet-5', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.uiux },
-  { id: 'def-reviewer-eng', name: 'REVIEWER-ENGINEER', role: 'reviewer', model: 'claude-opus-4-8', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.reviewer },
+  { id: 'def-prompt-eng', name: 'BRAINX', role: 'prompt', model: 'claude-opus-4-8', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.prompt },
+  { id: 'def-senior-eng-01', name: 'BACKEND', role: 'senior', model: 'claude-sonnet-5', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.senior },
+  { id: 'def-uiux-eng', name: 'FRONTEND', role: 'uiux', model: 'claude-sonnet-5', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.uiux },
+  { id: 'def-reviewer-eng', name: 'QA', role: 'reviewer', model: 'claude-opus-4-8', perm: 'bypassPermissions', lean: true, cwd: '', rules: RULES.reviewer },
   // no rules — free-form helper for general tasks (fix git issues, merge conflicts, quick questions...)
   { id: 'def-general', name: 'GENERAL-OPS', role: 'custom', model: 'claude-sonnet-5', perm: 'bypassPermissions', lean: false, cwd: '', rules: '' }
 ];
@@ -202,6 +202,17 @@ function canonicalDefaultId(a) {
   return DEFAULT_IDS.find(id => a.id === id || String(a.id).startsWith(id + '-')) || null;
 }
 
+// one-time roster rename: old stock name/model -> current DEFAULT_AGENTS
+// name/model, so existing saved workspaces pick up a roster rename too.
+// Only migrates agents still on their ORIGINAL stock value — an operator
+// who already renamed/re-modeled the agent themselves is left alone.
+const LEGACY_DEFAULTS = {
+  'def-prompt-eng': { name: 'PROMPT-ENGINEER', model: 'claude-fable-5' },
+  'def-senior-eng-01': { name: 'SENIOR-ENG-01' },
+  'def-uiux-eng': { name: 'UIUX-ENGINEER' },
+  'def-reviewer-eng': { name: 'REVIEWER-ENGINEER' },
+};
+
 // merge app-managed defaults into a roster + backfill flags. Reused when a new
 // workspace is opened so every project starts from the same baseline line-up.
 // De-duplicates managed defaults (heals the old clone-on-reload bug) and stamps
@@ -228,6 +239,12 @@ function normalizeRoster(roster) {
       // (RULES gains new directives over time, e.g. IMPLEMENT-MODEL routing)
       if (d.rules) existing.rules = d.rules;
       if (existing.lean === undefined) existing.lean = d.lean;
+      // migrate stock name/model forward if the operator never customized it
+      const legacy = LEGACY_DEFAULTS[d.id];
+      if (legacy) {
+        if (legacy.name && existing.name === legacy.name) existing.name = d.name;
+        if (legacy.model && existing.model === legacy.model) existing.model = d.model;
+      }
     } else {
       kept.push({ ...d, defId: d.id });
     }
@@ -284,6 +301,7 @@ function loadWorkspaces() {
 let workspaces = loadWorkspaces();
 let activeWorkspaceId = localStorage.getItem(ACTIVE_WS_KEY) || workspaces[0].id;
 if (!workspaces.some(w => w.id === activeWorkspaceId)) activeWorkspaceId = workspaces[0].id;
+saveWorkspaces();   // persist any one-time migrations (name/model upgrades)
 
 function ws() {
   return workspaces.find(w => w.id === activeWorkspaceId) || workspaces[0];
@@ -1068,6 +1086,8 @@ function anyBusy() {
 function syncPane() {
   // the ticket workspace owns the center area while it's open
   if (window.tkIsOpen && tkIsOpen()) return;
+  // the notes gallery screen also owns the center area while it's open
+  if (window.notesViewOpen && notesViewOpen()) return;
   // terminal now lives in the bottom panel and no longer owns the center —
   // console/editor swap independently of whether the panel is open
   // split mode: editor and console are shown side by side, so don't hide either
@@ -1151,7 +1171,7 @@ async function memoryInject(cwd, query) {
 }
 
 async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) {
-  const a = agents.find(x => x.id === agentId);
+  const a = findAgent(agentId);
   const r = R(agentId);
   if (!a || r.running) return;
   if (!prompt) { feed(agentId, 'err', 'no task assigned.', '⚠'); return; }
@@ -1192,27 +1212,83 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   r.cpStandalone = !pipelineActiveForCwd(cwd);
   if (r.cpStandalone && cwd) cpBeginTask(cwd, prompt);
   r.cpCwd = cwd;
+  // WARM RUN — this run resumes a session (opts.resume) or continues the shared
+  // one (opts.cont with a live session). That transcript already carries every
+  // auto-inject below (orientation, memory, impact, retrieval front-load) from
+  // its first run — re-attaching them would replay thousands of duplicate
+  // tokens into an already-loaded context, so all injects are skipped.
+  const warm = !!(opts.resume || (opts.cont && getSession()));
   let fullPrompt = prompt;
-  if (a.role !== 'indexer' && await hasProjectMap(cwd)) {
+  if (!warm && a.role !== 'indexer' && await hasProjectMap(cwd)) {
     fullPrompt += '\n\nOrientation: read .loveai/index/PROJECT-MAP.md first and open only the files relevant to this task — do not survey the repo.';
   }
   // TOPIC MEMORY — front-load only the feature memory relevant to this run so
   // the agent already knows the flow (paths, functions, step-by-step) without
   // re-exploring. Light by design: at most 1-2 topics, not the whole codebase.
   // Every role reads it and (per DISCIPLINE) every role maintains it.
-  if (a.role !== 'indexer' && cwd) {
+  if (!warm && a.role !== 'indexer' && cwd) {
     fullPrompt += await memoryInject(cwd, prompt);
   }
-  // LEXICAL RETRIEVAL: pre-rank the files most likely involved (symbol + BM25)
-  // and hand them to the Prompt Engineer so it reads a few instead of grepping
-  // the whole repo. Cheap local call, no LLM, big latency win.
-  if ((a.role === 'prompt' || a.role === 'custom') && cwd) {
+  // REGRESSION IMPACT (global) — the native code graph's blast-radius, injected
+  // for EVERY non-indexer run so any agent/model sees what a change touches. The
+  // Prompt Engineer / custom already get a richer version inside the retrieval
+  // front-load below, so they're excluded here to avoid a duplicate block.
+  if (!warm && a.role !== 'indexer' && a.role !== 'prompt' && a.role !== 'custom' && a.role !== 'senior' && a.role !== 'uiux' && cwd) {
+    try {
+      const im = await window.deck.regressionImpact(cwd, prompt);
+      if (im && im.ok && im.impact && im.impact.trim()) {
+        fullPrompt += `\n\nREGRESSION IMPACT (auto, from the code graph — NOT ` +
+          `exhaustive, verify): the symbols you may change and what calls/imports ` +
+          `them. Before altering any symbol below, check EACH listed reference for ` +
+          `breakage and prefer a minimal, backward-compatible change.\n${im.impact}`;
+      }
+    } catch {}
+  }
+  // LEXICAL + GRAPH FRONT-LOAD: pre-rank the files most likely involved (symbol +
+  // BM25) and inline their source, so the agent reads its context HERE instead of
+  // re-grepping/re-reading the repo. Given to the planner (PE/custom) AND the build
+  // agents (seniors + UI/UX engineers) — the latter previously re-opened every file
+  // over many turns, which is what actually burned the token budget. Cheap local
+  // call, no LLM.
+  if (!warm && (a.role === 'prompt' || a.role === 'custom' || a.role === 'senior' || a.role === 'uiux') && cwd) {
     try {
       // top 12 ranked; full CONTENT for the top 5 so the agent barely needs to Read
       const r = await window.deck.retrieveContext(cwd, prompt, 12, 5);
+      // SEMANTIC (RAG) retrieval — vector search over the tree-sitter symbols, so
+      // the agent sees files whose MEANING matches even when no identifier does.
+      // LOGGED so the operator can confirm the vector index is actually being used
+      // (and is warned when it isn't built yet).
+      let vhits = [];
+      try {
+        const vq = await window.deck.vectorQuery(cwd, prompt, 20);
+        if (vq && vq.ready && Array.isArray(vq.hits)) vhits = vq.hits;
+      } catch {}
+      const vTopFiles = [...new Set(
+        vhits.map(h => h.id.slice(0, h.id.lastIndexOf('#')))
+      )].slice(0, 6);
+      feed(agentId, 'sys', vhits.length
+        ? `RAG query → "${String(prompt).replace(/\s+/g, ' ').slice(0, 70)}" · ` +
+          `${vhits.length} semantic hits · top: ${vTopFiles.join(', ')}`
+        : `RAG: no vector index for this project yet — lexical only ` +
+          `(build the graph to enable semantic retrieval)`, '🧬');
       if (r.ok && r.files && r.files.length) {
-        // 1) repo map for instant orientation (no exploring the tree)
-        if (r.repoMap) {
+        // fold semantic-only files into the ranked list so they're surfaced too
+        const haveRel = new Set(r.files.map(f => f.rel));
+        for (const rel of vTopFiles) {
+          if (!haveRel.has(rel)) { haveRel.add(rel); r.files.push({ rel }); }
+        }
+        // SYMBOL-LEVEL PACK (tree-sitter) — the primary context path. Loads only the
+        // symbols the request needs + their dependencies instead of whole files.
+        // Graph-gated: `ready` is false when the code graph is cold or nothing
+        // relevant was found, and we transparently fall back to the whole-file
+        // front-load below (hybrid). Cheap local call, no LLM.
+        let sym = null;
+        try { sym = await window.deck.retrieveSymbols(cwd, prompt, 12000, false); } catch {}
+        const symReady = !!(sym && sym.ok && sym.ready && sym.context);
+
+        // 1) repo map — the symbol pack carries its own (symbol-level) map, so only
+        // add the lexical dir-map when we're on the whole-file fallback path.
+        if (!symReady && r.repoMap) {
           fullPrompt += `\n\nREPO MAP (directories by file count + notable files — use this for orientation instead of exploring):\n${r.repoMap}`;
         }
         // 2) ranked candidate files for this specific issue
@@ -1220,20 +1296,65 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
           .map(f => `- ${f.rel}${f.symbols && f.symbols.length ? ' — ' + f.symbols.slice(0, 8).join(', ') : ''}`)
           .join('\n');
         fullPrompt += `\n\nPRE-RANKED RELEVANT FILES (lexical match on the issue):\n${lines}`;
-        // 3) inline the actual code of the top files (front-loaded context)
-        let budget = 16000;
-        const blocks = [];
-        for (const f of r.files) {
-          if (budget <= 0 || !f.content) continue;
-          const chunk = f.content.slice(0, budget);
-          budget -= chunk.length;
-          blocks.push(`\n===== ${f.rel} =====\n${chunk}`);
+        // semantic matches from the vector index — meaning-based, complements lexical
+        if (vhits.length) {
+          const symLines = vhits.slice(0, 12)
+            .map(h => `- ${h.id} (${h.score.toFixed(2)})`).join('\n');
+          fullPrompt += `\n\nSEMANTIC MATCHES (vector/RAG search — meaning-based, ` +
+            `use alongside the lexical list):\n${symLines}`;
         }
-        if (blocks.length) {
-          fullPrompt += `\n\nTOP FILE CONTENTS (already loaded — read here, do NOT re-open with Read):\n${blocks.join('\n')}`;
+        // 3) CONTEXT — symbol pack if ready; ALSO inline whole files when the pack
+        // is absent OR thin. A thin pack (few files / few chars) starves the agent
+        // and forces manual grep/read loops — every extra turn re-reads the whole
+        // transcript, which is what balloons cache-read (and the plan quota). Lexical
+        // retrieval whiffs when the issue's words don't match code identifiers, so a
+        // thin pack is common for cross-cutting bugs — hand over the code up front.
+        const s = (symReady && sym.stats) ? sym.stats : {};
+        // Only augment a genuinely starved pack. A working symbol pack already IS
+        // the context — adding a 6k whole-file dump on top just re-sends code the
+        // agent has, and every later turn replays it (pure waste on Opus).
+        const thinPack = symReady
+          && ((s.files || 0) <= 1 || (s.chars || 0) < 2500);
+        if (symReady) {
+          fullPrompt += `\n\n${sym.context}`;
+          feed(agentId, 'sys',
+            `symbol context: ${s.seeds || 0} symbols + ${s.deps || 0} deps from ` +
+            `${s.files || 0} files (~${s.chars || 0} chars)` +
+            (thinPack ? ' — thin, adding whole-file front-load'
+                      : ' — whole-file load skipped'), '🌳');
+        }
+        if (!symReady || thinPack) {
+          // whole-file front-load — inline the actual code of the top files
+          let budget = 6000;          // total inline char budget — fallback only; the symbol pack is primary
+          const PER_FILE = 3000;      // cap any single file so one big file can't eat it all
+          const blocks = [];
+          for (const f of r.files) {
+            if (budget <= 0 || !f.content) continue;
+            const chunk = f.content.slice(0, Math.min(budget, PER_FILE));
+            budget -= chunk.length;
+            blocks.push(`\n===== ${f.rel} =====\n${chunk}`);
+          }
+          if (blocks.length) {
+            fullPrompt += `\n\nTOP FILE CONTENTS (already loaded — read here, do NOT re-open with Read):\n${blocks.join('\n')}`;
+          }
+        }
+        // 3b) regression blast-radius — who references the symbols you may touch. The
+        // planner bakes it into the task CONTEXT so seniors inherit it; seniors/UI
+        // engineers also see it directly here (they no longer get the lighter block above).
+        if (r.impact) {
+          fullPrompt += `\n\nREGRESSION IMPACT (auto, computed from the index — NOT ` +
+            `exhaustive, verify): symbols you may change and the files that reference ` +
+            `them. Before altering any symbol below, check EACH listed reference for ` +
+            `breakage, prefer a minimal backward-compatible change, and RECORD the ` +
+            `affected files in your task's CONTEXT so the engineers inherit this.\n${r.impact}`;
         }
         // 4) firm directive so it trusts the above and stops exploring
-        fullPrompt += `\n\nEFFICIENCY: The repo map + ranked files + inlined contents above ARE your context. Do AT MOST 2-3 extra targeted reads/greps only if something specific is missing. Do not survey the tree, do not re-read the inlined files, and go straight to producing the output.`;
+        const ctxDesc = symReady
+          ? (thinPack
+              ? 'symbol context + inlined file contents'
+              : 'symbol context (implementations + dependencies)')
+          : 'inlined file contents';
+        fullPrompt += `\n\nEFFICIENCY: The ranked files + ${ctxDesc} above ARE your context. Do AT MOST 2-3 extra targeted reads/greps only if a specific symbol you need is missing. Do not survey the tree, do not re-read what is already loaded, and go straight to producing the output.`;
       }
     } catch {}
   }
@@ -1243,6 +1364,9 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
     model, cwd, rules: effectiveRules(a),
     permissionMode: plan ? 'plan' : a.perm,
     leanContext: !!a.lean,
+    // constrain OUTPUT tokens (~5x the cost of input) on executor roles; the
+    // planner (prompt/custom) stays verbose so its plan stays complete
+    concise: !!a.lean || ['senior', 'uiux', 'reviewer'].includes(a.role),
     // pass a real Claude effort level only when one is chosen ('auto' = none)
     effort: EFFORT_VALUES.includes(effort) ? effort : null,
     // pipeline agents must do the work THEMSELVES — never delegate to the
@@ -1421,6 +1545,10 @@ window.deck.onAgentEvent(ev => {
       // a MANUAL Prompt Engineer run (outside the pipeline) that produced task
       // files → offer to deploy engineers, so the work doesn't just stop
       const doneWsId = wsForAgent(ev.agentId);
+      if (typeof refreshWorkspace === 'function'
+          && doneWsId === activeWorkspaceId) {
+        refreshWorkspace();
+      }
       const doneWsPipe = pipelines.get(doneWsId);
       if (!(doneWsPipe && doneWsPipe.active) && r.lastResult === 'success') {
         const da = findAgent(ev.agentId);
@@ -1572,19 +1700,27 @@ async function launchPipeline(issue, effort, wsId) {
   runAgent(indexer.id, prompt, false, false, { fresh: true, effort: p.effort });
 }
 
-function startStage1(issue, wsId) {
+async function startStage1(issue, wsId) {
   const p = pipeFor(wsId);
   const pe = byRoleIn(wsId, 'prompt')[0];
   plog('info', 'Stage 1: PROMPT ENGINEER analyzing...', wsId);
   setStage(wsId, 'prompt');
-  const resume = getPESession(p.cwd);
-  const opts = resume ? { resume, fork: true, effort: p.effort } : { effort: p.effort };
-  if (resume) {
-    plog('info',
-      `resuming Prompt Engineer session ${resume.slice(0, 8)} (warm context)`,
-      wsId);
-  }
-  runAgent(pe.id, `ISSUE: ${issue}\n\nAnalyze the codebase and produce the executable task prompt file(s) and review-brief.md per your pipeline rules.`, false, false, opts);
+  // token-lean: every issue starts the PE FRESH. Topic memory + the retrieval
+  // front-load ARE its warm context — resuming (and forking) the stored PE
+  // session here replayed every PRIOR issue's full planning transcript (front-
+  // loaded file contents, tool results, all of it) as paid input on each new
+  // launch, growing without bound. The saved PE session remains in use where a
+  // shared context is actually wanted: plan revisions and the post-run chat
+  // bridge, both of which resume it explicitly.
+  //
+  // Context (semantic vector/RAG + lexical + regression impact) is injected by
+  // runAgent's shared retrieval block for every role, so the PE gets it here too —
+  // no separate injection needed. The directive keeps it from re-exploring.
+  runAgent(pe.id,
+    `ISSUE: ${issue}\n\nUsing the retrieved context provided, produce the executable ` +
+    `task prompt file(s) and review-brief.md per your pipeline rules. Do AT MOST ` +
+    `1-2 targeted reads only if a specific symbol you need is missing.`,
+    false, false, { effort: p.effort });
 }
 
 // BRIDGE — hand the pipeline's own context to whatever you chat with next
@@ -2039,9 +2175,17 @@ async function startReview(wsId) {
   const opts = resume
     ? { model: p.reviewModel, fresh: true, resume, fork: false, effort: p.effort }
     : { model: p.reviewModel, fresh: true, effort: p.effort };
+  // point the Reviewer at THIS task's checkpoint ref so it can diff against its
+  // own pre-task baseline instead of `git diff HEAD` / the raw working tree —
+  // the working tree may still carry unrelated uncommitted edits left over from
+  // an earlier, unrelated session, and those must not be misread as in-scope.
+  const cp = await cpActiveRef(p.cwd);
+  const scopeHint = cp
+    ? `\n\nSCOPE: this task's pre-task checkpoint is git ref ${cp.ref} (repo: ${cp.repo}). To see ONLY what THIS task changed, run \`git diff ${cp.ref} -- <file>\` per changed file — do NOT judge scope from \`git diff HEAD\` or the raw working tree. Anything already present at that checkpoint ref predates this task; it is not this task's change and must not be flagged as out-of-scope, even if a blanket working-tree diff shows it.`
+    : '';
   runAgent(rv.id, p.iteration === 0
-    ? 'Review the pipeline changes per your rules. Write validation-plan.md first, then review-findings.md with a VERDICT first line.'
-    : 'The Senior Engineers applied fixes for the findings you listed last round (see the newest entries in changes-log.md). You already have full context from your last review still loaded — do NOT re-read files you already validated and found fine; re-check ONLY the files touched by this fix round against those specific findings, then write a fresh review-findings.md with a VERDICT first line.',
+    ? `Review the pipeline changes per your rules. Write validation-plan.md first, then review-findings.md with a VERDICT first line.${scopeHint}`
+    : `The Senior Engineers applied fixes for the findings you listed last round (see the newest entries in changes-log.md). You already have full context from your last review still loaded — do NOT re-read files you already validated and found fine; re-check ONLY the files touched by this fix round against those specific findings, then write a fresh review-findings.md with a VERDICT first line.${scopeHint}`,
     false, false, opts);
 }
 
@@ -2294,6 +2438,20 @@ function setupSlash(textarea, menu) {
   });
 }
 setupSlash(chatInput, document.getElementById('slash-menu'));
+
+// short label for whatever the composer's target select currently points at
+// (agent + model, bare model, or the auto pipeline) — used in confirmations
+// so the operator can see what a "new session" will actually run against.
+function currentTargetLabel() {
+  const target = document.getElementById('chat-target').value;
+  if (target === '__pipeline__') return 'auto pipeline';
+  if (target.startsWith('model:')) {
+    const model = target.slice('model:'.length);
+    return MODEL_LABELS[model] || model;
+  }
+  const a = agents.find(x => x.id === target);
+  return a ? `${a.name} (${MODEL_LABELS[a.model] || a.model})` : 'no target selected';
+}
 
 // a leading /name becomes an explicit directive so the Prompt Engineer (or the
 // single agent) loads that skill/command and builds its output around it
@@ -2551,7 +2709,16 @@ cxInput.addEventListener('keydown', e => {
 document.getElementById('btn-new-session').onclick = () => {
   if (Object.values(rt).some(r => r.running)) { plog('err', 'stop all agents before resetting the session.'); return; }
   clearSession();
-  plog('info', 'shared session reset — next run starts with a fresh context.');
+  // wipe this project's visible feed (background workspaces keep their own
+  // buffers untouched — see stashFeed/restoreFeed) so the reset is obvious.
+  feedContentNodes().forEach(n => n.remove());
+  closeAgentView();
+  // 'SESSION' isn't in SILENT_FEED_TAGS (unlike 'PIPELINE'), so this actually
+  // renders — the old plog('info', ...) call here used the silenced tag and
+  // never showed up, leaving the operator with no confirmation.
+  feedRaw('SESSION', 'ok',
+    `new session started — console cleared. next run (${currentTargetLabel()}) starts with a fresh context.`,
+    '↺');
 };
 
 // ============================================================
@@ -2711,7 +2878,7 @@ function learnedModel(model) {
 function learnedMaxTurns(role) {
   const base = MAX_TURNS[role] || 60;
   const hits = LEARN.turnCapHits[role] || 0;
-  return Math.min(120, Math.round(base * (1 + 0.25 * Math.min(hits, 3))));
+  return Math.min(90, Math.round(base * (1 + 0.15 * Math.min(hits, 3))));
 }
 
 // operator manually sent a task to the UI/UX agent → grow the UI vocabulary
@@ -2855,14 +3022,19 @@ function showFeedEmpty() {
     consoleFeed.insertAdjacentHTML('afterbegin', FEED_EMPTY_HTML);
   }
 }
+// all feed content nodes (.ev log/stream/diff rows + .plan-result pipeline
+// cards) — everything in #console-feed except the #feed-empty placeholder.
+function feedContentNodes() {
+  return consoleFeed.querySelectorAll(':scope > *:not(#feed-empty)');
+}
 // active project → move its live nodes into its buffer (keeps streaming there)
 function stashFeed(wsId) {
   const buf = getFeedBuf(wsId);
-  consoleFeed.querySelectorAll('.ev').forEach(n => buf.appendChild(n));
+  feedContentNodes().forEach(n => buf.appendChild(n));
 }
 // incoming project → pull its buffered nodes into the visible feed
 function restoreFeed(wsId) {
-  consoleFeed.querySelectorAll('.ev').forEach(n => n.remove());
+  feedContentNodes().forEach(n => n.remove());
   const buf = feedBuf[wsId];
   if (buf && buf.children.length) {
     hideFeedEmpty();
@@ -2929,6 +3101,8 @@ function refreshProjectBindings() {
   loadSlashItems();  // project skills / commands
   // ticket workspace is per-project — rebind (or close if no folder)
   if (window.tkProjectChanged) tkProjectChanged();
+  // notes are per-project — close the modal on switch (already saved)
+  if (window.notesProjectChanged) notesProjectChanged();
   // terminals are per-project too — show this project's, hide the others
   if (typeof syncTermsToWorkspace === 'function') syncTermsToWorkspace();
   // re-sync stop button / status bar / console-vs-editor pane for this workspace
@@ -3111,12 +3285,14 @@ let usage = JSON.parse(localStorage.getItem('usage') || 'null');
 if (!usage || usage.date !== todayKey()) usage = { date: todayKey(), runs: 0, in: 0, out: 0, cost: 0 };
 
 function trackUsage(ev) {
-  if (usage.date !== todayKey()) usage = { date: todayKey(), runs: 0, in: 0, out: 0, cost: 0 };
+  if (usage.date !== todayKey()) usage = { date: todayKey(), runs: 0, in: 0, out: 0, cost: 0, cacheRead: 0, cacheWrite: 0 };
   usage.runs++;
   usage.cost += ev.costUsd || 0;
   if (ev.usage) {
     usage.in += ev.usage.input + ev.usage.cacheRead + ev.usage.cacheWrite;
     usage.out += ev.usage.output;
+    usage.cacheRead += ev.usage.cacheRead || 0;
+    usage.cacheWrite += ev.usage.cacheWrite || 0;
   }
   localStorage.setItem('usage', JSON.stringify(usage));
   renderUsage();
@@ -3126,7 +3302,9 @@ function fmtK(n) { return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n 
 
 function renderUsage() {
   document.getElementById('u-runs').textContent = usage.runs;
-  document.getElementById('u-in').textContent = fmtK(usage.in);
+  const cr = usage.cacheRead || 0;
+  const hit = usage.in ? Math.round(100 * cr / usage.in) : 0;
+  document.getElementById('u-in').textContent = fmtK(usage.in) + (cr ? ` (${hit}% cached)` : '');
   document.getElementById('u-out').textContent = fmtK(usage.out);
   document.getElementById('u-cost').textContent = '$' + usage.cost.toFixed(2);
 }
@@ -3221,6 +3399,15 @@ function agoText(ms) {
   if (s < 86400) return Math.round(s / 3600) + ' hr ago';
   return Math.round(s / 86400) + ' d ago';
 }
+// absolute date + time for a session's last-touched timestamp, so a session
+// from a few days ago (where "3 d ago" isn't precise enough for follow-up)
+// can still be pinned to an exact moment.
+function sessionTimeLabel(ms) {
+  const d = new Date(ms);
+  const date = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  return `${date}, ${time}`;
+}
 
 async function openHistory() {
   historyPanel.classList.remove('hidden');
@@ -3234,9 +3421,9 @@ async function openHistory() {
     const row = document.createElement('div');
     row.className = 'hp-item' + (s.id === current ? ' current' : '');
     row.innerHTML = `
-      <div class="hp-top"><span class="hp-proj">${esc(s.project)}</span><span class="hp-ago">${esc(agoText(s.mtime))}</span></div>
+      <div class="hp-top"><span class="hp-proj">${esc(s.project)}</span><span class="hp-ago" title="${esc(sessionTimeLabel(s.mtime))}">${esc(agoText(s.mtime))}</span></div>
       <div class="hp-snippet">${esc(s.snippet || '(no prompt found)')}</div>
-      <div class="hp-id">${esc(s.id.slice(0, 8))}${s.id === current ? ' · ACTIVE' : ''}</div>`;
+      <div class="hp-id">${esc(sessionTimeLabel(s.mtime))} · ${esc(s.id.slice(0, 8))}${s.id === current ? ' · ACTIVE' : ''}</div>`;
     row.onclick = async () => {
       setSession(s.id);
       historyPanel.classList.add('hidden');

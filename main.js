@@ -37,6 +37,8 @@ function resolveClaudeExecutable() {
 const CLAUDE_EXE = resolveClaudeExecutable();
 const saas = require('./auth');
 const config = require('./config');
+const V = require('./vectors');   // semantic vector index over the tree-sitter graph
+const { Worker } = require('worker_threads');
 
 let win;
 // runId -> { abortController }
@@ -436,6 +438,16 @@ ipcMain.handle('index-mark', (_e, cwd) => {
 const SYMBOL_MAX_BYTES = 400 * 1024;
 const STOP = new Set(['the', 'and', 'for', 'with', 'this', 'that', 'from', 'into', 'when', 'then', 'not', 'but', 'you', 'are', 'was', 'will', 'add', 'fix', 'use', 'get', 'set', 'new', 'now', 'has', 'have', 'should', 'need', 'want', 'make', 'change', 'update', 'issue', 'bug', 'feature', 'file', 'code', 'function', 'const', 'let', 'var', 'return', 'import', 'export']);
 
+// null-prototype map for identifier-keyed lookups. Source symbols are OFTEN
+// named after Object.prototype members (constructor, toString, valueOf, ...)
+// and a plain {} then returns the INHERITED function instead of "absent" —
+// which crashed the graph build ("byName[name].push is not a function") and
+// silently corrupted tf/inv maps. dict() has no prototype, so lookups of any
+// identifier are honest. hasOwn() guards reads of JSON.parse'd maps (those
+// come back WITH Object.prototype attached).
+const dict = () => Object.create(null);
+const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+
 function tokenize(s) {
   return String(s)
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')   // split camelCase
@@ -486,7 +498,7 @@ async function buildSymbolIndex(cwd) {
         const text = await fs.promises.readFile(full, 'utf8');
         const rel = path.relative(root, full).replace(/\\/g, '/');
         const symbols = extractSymbols(text);
-        const tf = {};
+        const tf = dict();
         const bump = (s, w) => { for (const t of tokenize(s)) tf[t] = (tf[t] || 0) + w; };
         for (const s of symbols) bump(s, 4);          // symbol names weigh most
         bump(rel.replace(/[\/.]/g, ' '), 3);          // path + filename
@@ -547,7 +559,7 @@ async function indexOneFile(cwd, abs) {
     if (!stat.isFile() || stat.size > SYMBOL_MAX_BYTES) return false;
     const text = await fs.promises.readFile(abs, 'utf8');
     const symbols = extractSymbols(text);
-    const tf = {};
+    const tf = dict();
     const bump = (s, w) => { for (const t of tokenize(s)) tf[t] = (tf[t] || 0) + w; };
     for (const s of symbols) bump(s, 4);
     bump(rel.replace(/[\/.]/g, ' '), 3);
@@ -670,7 +682,7 @@ function dictPhrase(dir) {
 // token, not raw tf weight — keeps one big file from dominating).
 function domainTokens(dir, list, idx) {
   const pathTokens = new Set(tokenize(dir.replace(/\//g, ' ')));
-  const df = {};
+  const df = dict();
   for (const f of list) {
     const tf = (idx.files[f.rel] && idx.files[f.rel].tf) || {};
     for (const t of Object.keys(tf)) {
@@ -707,7 +719,7 @@ function dirPurpose(dir, list, idx, cwd) {
 // compact repo map from the index (dirs by file count + top files by symbol
 // density) — gives the agent instant orientation without exploring the tree
 function repoMapFromIndex(idx, cwd) {
-  const dirs = {};
+  const dirs = dict();
   for (const rel of Object.keys(idx.files)) {
     const cut = rel.lastIndexOf('/');
     const dir = cut >= 0 ? rel.slice(0, cut) : '.';
@@ -731,15 +743,19 @@ function retrieve(idx, query, k) {
   if (!qterms.length) return [];
   const rels = Object.keys(idx.files);
   const N = rels.length || 1;
-  const df = {}; for (const t of qterms) df[t] = 0;
-  for (const rel of rels) { const tf = idx.files[rel].tf; for (const t of qterms) if (tf[t]) df[t]++; }
+  const df = dict(); for (const t of qterms) df[t] = 0;
+  for (const rel of rels) { const tf = idx.files[rel].tf; for (const t of qterms) if (hasOwn(tf, t)) df[t]++; }
   const k1 = 1.5, b = 0.75;
   const out = [];
   for (const rel of rels) {
     const f = idx.files[rel];
     let s = 0;
     for (const t of qterms) {
-      const freq = f.tf[t]; if (!freq) continue;
+      // hasOwn: a JSON-loaded tf has Object.prototype, so 'constructor' etc.
+      // would read the inherited function; the typeof guard drops corrupted
+      // (string) counts persisted by builds from before the dict() fix
+      const freq = hasOwn(f.tf, t) ? f.tf[t] : 0;
+      if (!freq || typeof freq !== 'number') continue;
       const idf = Math.log(1 + (N - df[t] + 0.5) / (df[t] + 0.5));
       s += idf * (freq * (k1 + 1)) / (freq + k1 * (1 - b + b * f.len / idx.avgLen));
     }
@@ -747,6 +763,911 @@ function retrieve(idx, query, k) {
   }
   out.sort((a, b2) => b2.score - a.score);
   return out.slice(0, k || 8);
+}
+
+// ===== NATIVE code knowledge graph — tree-sitter, in-process (GitNexus-style) =====
+// "If you change this symbol, what references it?" A deterministic blast-radius the
+// Prompt Engineer sees BEFORE editing. WASM tree-sitter parses each source file into
+// def nodes (functions/methods/classes) + call/import edges resolved by NAME; we keep
+// an in-memory REVERSE adjacency (def -> {callers, importers}), cached per cwd and
+// persisted to codegraph.json. NOT MCP, NOT a graph DB. If the runtime or a grammar is
+// missing it degrades to a lexical tf reverse-map — a run NEVER blocks on the graph.
+
+// ext -> prebuilt grammar (tree-sitter-wasms). Only these langs get an AST graph;
+// unknown exts fall through to the lexical fallback. Grammars load LAZILY (below).
+const LANG_GRAMMAR = {
+  js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
+  ts: 'typescript', tsx: 'tsx', py: 'python', go: 'go', rs: 'rust', java: 'java',
+};
+// tree-sitter queries per grammar: def (declarations), call (references), imp (named
+// imports). tsx reuses the typescript set. Each string is compiled independently and
+// skipped on error, so a grammar version drift can't break the whole build.
+const TS_QUERIES_JS = {
+  def: [
+    '(function_declaration name:(identifier)@n)',
+    '(class_declaration name:(identifier)@n)',
+    '(method_definition name:(property_identifier)@n)',
+    '(variable_declarator name:(identifier)@n value:[(arrow_function)(function_expression)])',
+  ],
+  call: [
+    '(call_expression function:(identifier)@n)',
+    '(call_expression function:(member_expression property:(property_identifier)@n))',
+    '(new_expression constructor:(identifier)@n)',   // constructor dependency (new Foo())
+  ],
+  imp: ['(import_specifier name:(identifier)@n)', '(import_clause (identifier)@n)'],
+};
+const TS_QUERIES_TS = {
+  def: [
+    '(function_declaration name:(identifier)@n)',
+    '(class_declaration name:(type_identifier)@n)',
+    '(interface_declaration name:(type_identifier)@n)',
+    '(enum_declaration name:(identifier)@n)',
+    '(method_definition name:(property_identifier)@n)',
+    '(variable_declarator name:(identifier)@n value:[(arrow_function)(function_expression)])',
+  ],
+  call: TS_QUERIES_JS.call,
+  imp: TS_QUERIES_JS.imp,
+};
+const TS_QUERIES = {
+  javascript: TS_QUERIES_JS,
+  typescript: TS_QUERIES_TS,
+  tsx: TS_QUERIES_TS,
+  python: {
+    def: ['(function_definition name:(identifier)@n)', '(class_definition name:(identifier)@n)'],
+    call: [
+      '(call function:(identifier)@n)',
+      '(call function:(attribute attribute:(identifier)@n))',
+    ],
+    imp: ['(import_from_statement name:(dotted_name (identifier)@n))'],
+  },
+  go: {
+    def: [
+      '(function_declaration name:(identifier)@n)',
+      '(method_declaration name:(field_identifier)@n)',
+      '(type_spec name:(type_identifier)@n)',
+    ],
+    call: [
+      '(call_expression function:(identifier)@n)',
+      '(call_expression function:(selector_expression field:(field_identifier)@n))',
+    ],
+    imp: [],
+  },
+  rust: {
+    def: [
+      '(function_item name:(identifier)@n)',
+      '(struct_item name:(type_identifier)@n)',
+      '(enum_item name:(type_identifier)@n)',
+    ],
+    call: [
+      '(call_expression function:(identifier)@n)',
+      '(call_expression function:(scoped_identifier name:(identifier)@n))',
+      '(call_expression function:(field_expression field:(field_identifier)@n))',
+    ],
+    imp: [],
+  },
+  java: {
+    def: [
+      '(method_declaration name:(identifier)@n)',
+      '(class_declaration name:(identifier)@n)',
+      '(interface_declaration name:(identifier)@n)',
+    ],
+    call: ['(method_invocation name:(identifier)@n)'],
+    imp: [],
+  },
+};
+
+// tree-sitter runtime state (all lazy — nothing loads until the first build).
+let tsMod = null;             // the web-tree-sitter module (required lazily)
+let tsReady = null;           // Parser.init() promise (run once)
+let tsParser = null;          // reused Parser instance (setLanguage per file)
+let tsBroken = false;         // runtime/grammar totally unavailable → skip tree-sitter
+let tsInitError = '';         // last real tsInit failure, surfaced via codegraph-status
+let tsInitErrorLogged = false; // log a given failure once per session, not per file
+const tsLangs = {};           // grammar name -> Language (null = failed)
+const tsQueryCache = {};      // grammar name -> { def:[Query], call:[Query], imp:[Query] }
+const graphCache = {};        // cwd -> in-memory graph
+const graphBuilding = {};     // cwd -> in-flight build promise (dedupe)
+
+// resolve a bundled .wasm, preferring the asar.unpacked copy in a packaged build
+function tsAsset(p) {
+  const unpacked = p.replace('app.asar', 'app.asar.unpacked');
+  try { if (fs.existsSync(unpacked)) return unpacked; } catch {}
+  return p;
+}
+function grammarWasm(name) {
+  return tsAsset(path.join(__dirname, 'node_modules', 'tree-sitter-wasms', 'out',
+    `tree-sitter-${name}.wasm`));
+}
+async function tsInit() {
+  if (tsReady) return tsReady;
+  tsReady = (async () => {
+    try {
+      try {
+        tsMod = require('web-tree-sitter');
+        if (!tsMod || !tsMod.Parser) throw new Error('web-tree-sitter: Parser missing');
+      } catch {
+        // exports-map may resolve oddly under Electron — fall back to the explicit CJS entry
+        tsMod = require('web-tree-sitter/tree-sitter.cjs');
+      }
+      // read the runtime WASM as bytes: passing a path lets the glue code try
+      // fetch() under Electron's renderer-flavored globals, which fails silently
+      const wasmPath = tsAsset(path.join(__dirname, 'node_modules', 'web-tree-sitter',
+        'tree-sitter.wasm'));
+      const wasmBinary = fs.readFileSync(wasmPath);
+      await tsMod.Parser.init({
+        wasmBinary,
+        locateFile(name) {
+          return tsAsset(path.join(__dirname, 'node_modules', 'web-tree-sitter', name));
+        },
+      });
+    } catch (err) {
+      tsInitError = String(err && err.message ? err.message : err);
+      if (!tsInitErrorLogged) {
+        console.error('[codegraph] tree-sitter init failed:', err);
+        tsInitErrorLogged = true;
+      }
+      tsReady = null;   // allow a later retry (e.g. a manual rebuild) to re-attempt
+      throw err;
+    }
+  })();
+  return tsReady;
+}
+async function loadLang(name) {
+  if (name in tsLangs) return tsLangs[name];
+  try {
+    tsLangs[name] = await tsMod.Language.load(fs.readFileSync(grammarWasm(name)));
+  } catch (err) {
+    tsLangs[name] = null;
+    console.error(`[codegraph] grammar load failed (${name}):`, err);
+  }
+  return tsLangs[name];
+}
+function compiledQueries(name, lang) {
+  if (tsQueryCache[name]) return tsQueryCache[name];
+  const spec = TS_QUERIES[name] || {};
+  const out = { def: [], call: [], imp: [] };
+  for (const cat of ['def', 'call', 'imp']) {
+    for (const q of (spec[cat] || [])) {
+      try { out[cat].push(new tsMod.Query(lang, q)); }
+      catch (err) { console.error(`[codegraph] query compile failed (${name}/${cat}):`, err); }
+    }
+  }
+  tsQueryCache[name] = out;
+  return out;
+}
+// ===== Rich symbol records — from a def name node up to its declaration =====
+// A def query captures a NAME identifier; the symbol's extent/type/parent live on
+// the enclosing declaration node. These maps + helpers derive the full record
+// (type, line range, parent, visibility, doc, language) WITHOUT storing source —
+// source is read lazily by line range when a symbol is actually packed, keeping
+// the index small (a Performance goal). Node API per web-tree-sitter 0.25.
+const DECL_TYPES = new Set([
+  'function_declaration', 'function_definition', 'function_item',
+  'generator_function_declaration', 'function_expression', 'arrow_function',
+  'class_declaration', 'class_definition',
+  'method_definition', 'method_declaration',
+  'interface_declaration', 'enum_declaration', 'enum_item',
+  'struct_item', 'trait_item', 'type_spec', 'type_alias_declaration',
+  'variable_declarator', 'lexical_declaration', 'public_field_definition',
+]);
+// enclosing nodes that make a symbol a CHILD (its parent symbol)
+const CONTAINER_TYPES = new Set([
+  'class_declaration', 'class_definition', 'interface_declaration',
+  'struct_item', 'trait_item', 'enum_declaration', 'impl_item',
+  'namespace_declaration', 'internal_module', 'module',
+]);
+// declaration node type -> our coarse symbol.type label
+const TYPE_OF = {
+  function_declaration: 'function', function_definition: 'function',
+  function_item: 'function', generator_function_declaration: 'function',
+  function_expression: 'function', arrow_function: 'function',
+  variable_declarator: 'function', lexical_declaration: 'function',
+  method_definition: 'method', method_declaration: 'method',
+  class_declaration: 'class', class_definition: 'class',
+  interface_declaration: 'interface',
+  enum_declaration: 'enum', enum_item: 'enum',
+  struct_item: 'struct', trait_item: 'trait',
+  type_spec: 'type', type_alias_declaration: 'type',
+  public_field_definition: 'field',
+};
+// walk up from a captured name node to the declaration that owns its extent
+function enclosingDecl(nameNode) {
+  let n = nameNode;
+  while (n && !DECL_TYPES.has(n.type)) n = n.parent;
+  return n || nameNode.parent || nameNode;
+}
+function nodeName(node) {
+  try { const id = node.childForFieldName('name'); if (id && id.text) return id.text; }
+  catch {}
+  return '';
+}
+// nearest enclosing class/interface/struct/namespace name (for symbol.parent)
+function parentSymbol(decl) {
+  let n = decl.parent;
+  while (n) {
+    if (CONTAINER_TYPES.has(n.type)) { const nm = nodeName(n); if (nm) return nm.slice(0, 80); }
+    n = n.parent;
+  }
+  return '';
+}
+// visibility heuristic — accessibility modifier > export/pub > python underscore
+function visibilityOf(decl, grammar, name) {
+  try {
+    for (const c of (decl.namedChildren || [])) {
+      if (!c) continue;
+      if (c.type === 'accessibility_modifier') return c.text;   // TS/Java public/private/protected
+      if (c.type === 'visibility_modifier') return 'pub';        // Rust
+    }
+  } catch {}
+  let n = decl, hops = 0;
+  while (n && hops < 4) {
+    if (n.type === 'export_statement') return 'exported';
+    n = n.parent; hops++;
+  }
+  if (grammar === 'python') return name.startsWith('_') ? 'private' : 'public';
+  return 'public';
+}
+// leading line-comment(s) immediately above the declaration → short doc string
+function leadingDoc(decl) {
+  let n = decl.previousNamedSibling;
+  if (!n && decl.parent && decl.parent.type === 'export_statement') {
+    n = decl.parent.previousNamedSibling;
+  }
+  const parts = [];
+  while (n && n.type === 'comment' && parts.length < 6) {
+    parts.unshift(n.text);
+    n = n.previousNamedSibling;
+  }
+  let doc = parts.join(' ').replace(/^[\/*#\s]+|[*\/\s]+$/g, '').replace(/\s+/g, ' ').trim();
+  if (doc.length > 200) doc = doc.slice(0, 200) + '…';
+  return doc;
+}
+// build the rich record for one captured name node (rel/id filled by the assembler)
+function defRecord(nameNode, grammar, langName) {
+  const name = (nameNode.text || '').slice(0, 80);
+  if (!name) return null;
+  const decl = enclosingDecl(nameNode);
+  const sp = decl.startPosition || { row: 0 };
+  const ep = decl.endPosition || { row: 0 };
+  return {
+    name,
+    type: TYPE_OF[decl.type] || 'symbol',
+    sl: sp.row + 1,
+    el: ep.row + 1,
+    parent: parentSymbol(decl),
+    vis: visibilityOf(decl, grammar, name),
+    doc: leadingDoc(decl),
+    lang: langName,
+  };
+}
+
+// parse one file → { symbols, calls, imps }. symbols are rich def records (deduped
+// by name, first wins — matches the prior name-Set behavior so ids stay unique per
+// file); calls/imps stay name-only for NAME-resolved edge linking. null on failure.
+async function extractFileGraph(text, grammar) {
+  const lang = await loadLang(grammar);
+  if (!lang) return null;
+  if (!tsParser) tsParser = new tsMod.Parser();
+  tsParser.setLanguage(lang);
+  let tree;
+  try { tree = tsParser.parse(text); } catch { return null; }
+  if (!tree) return null;
+  const q = compiledQueries(grammar, lang);
+  const langName = grammar === 'tsx' ? 'typescript' : grammar;
+  const grab = (queries) => {
+    const seen = new Set();
+    for (const query of queries) {
+      let caps; try { caps = query.captures(tree.rootNode); } catch { continue; }
+      for (const c of caps) {
+        const t = c.node.text;
+        if (t && t.length <= 80) seen.add(t);
+      }
+    }
+    return [...seen];
+  };
+  const byName = new Map();
+  for (const query of q.def) {
+    let caps; try { caps = query.captures(tree.rootNode); } catch { continue; }
+    for (const c of caps) {
+      const rec = defRecord(c.node, grammar, langName);
+      if (rec && !byName.has(rec.name)) byName.set(rec.name, rec);
+    }
+  }
+  const symbols = [...byName.values()];
+  // FORWARD deps: bucket each call/new capture into the INNERMOST enclosing def
+  // (by line range) → per-symbol `calls`. This is what lets the packer expand
+  // "load login() AND what it calls" without reading whole files. Callee names
+  // resolve to def ids by NAME at query time (see forwardReach).
+  const callCaps = [];
+  for (const query of q.call) {
+    let caps; try { caps = query.captures(tree.rootNode); } catch { continue; }
+    for (const c of caps) {
+      const t = c.node.text;
+      const row = (c.node.startPosition ? c.node.startPosition.row : 0) + 1;
+      if (t && t.length <= 80) callCaps.push({ name: t, row });
+    }
+  }
+  const fwd = symbols.map(() => new Set());
+  for (const cc of callCaps) {
+    let bestI = -1, bestSpan = Infinity;
+    for (let i = 0; i < symbols.length; i++) {
+      const s = symbols[i];
+      if (cc.row >= s.sl && cc.row <= s.el) {
+        const span = s.el - s.sl;
+        if (span < bestSpan) { bestSpan = span; bestI = i; }
+      }
+    }
+    if (bestI >= 0 && cc.name !== symbols[bestI].name) fwd[bestI].add(cc.name);
+  }
+  symbols.forEach((s, i) => { s.calls = [...fwd[i]].slice(0, 30); });
+  // CONSTRUCTOR DEPENDENCIES: reaching a class via `new Class()` should expand to
+  // what its constructor builds. Members' calls bucket to the member (e.g. the
+  // constructor def), not the class — so merge a class's constructor calls up onto
+  // the class itself, letting forwardReach follow class → constructor deps.
+  for (const s of symbols) {
+    if (s.type !== 'class' && s.type !== 'struct' && s.type !== 'interface') continue;
+    const isCtor = (m) => m.name === 'constructor' || m.name === s.name;
+    const members = symbols.filter((m) => m !== s && m.parent === s.name);
+    const merged = new Set(s.calls);
+    // constructor deps first (they matter most for `new Class()`), then other methods
+    for (const m of members) if (isCtor(m)) for (const c of m.calls) merged.add(c);
+    for (const m of members) if (!isCtor(m) && m.type === 'method') for (const c of m.calls) merged.add(c);
+    s.calls = [...merged].slice(0, 30);
+  }
+  const res = { symbols, calls: grab(q.call), imps: grab(q.imp) };
+  try { tree.delete(); } catch {}
+  return res;
+}
+
+// persisted codegraph schema version. Bumped to 2 when def records became RICH
+// symbols (type/lines/parent/visibility/doc/lang). A v1 file on disk is ignored
+// (treated as absent) so it gets rebuilt into the richer shape in the background.
+const GRAPH_SCHEMA = 2;
+function emptyGraph() { return { v: GRAPH_SCHEMA, built: 0, defs: [], callers: {}, importers: {} }; }
+// read a persisted graph only if it matches the current schema, else null
+function loadGraphDisk(cwd) {
+  const disk = readJson(path.join(indexDir(cwd), 'codegraph.json'));
+  if (disk && disk.v === GRAPH_SCHEMA && disk.defs) return disk;
+  return null;
+}
+// rebuild the derived lookup indices (defById / fileDefs / byName) from graph.defs —
+// run after a build and after loading a persisted graph (only defs/edges are stored)
+function indexGraph(graph) {
+  graph.defById = dict();
+  graph.fileDefs = dict();
+  graph.byName = dict();
+  for (const d of graph.defs) {
+    graph.defById[d.id] = d;
+    (graph.fileDefs[d.rel] = graph.fileDefs[d.rel] || []).push(d.id);
+    (graph.byName[d.name] = graph.byName[d.name] || []).push(d.id);
+  }
+  graph.callers = graph.callers || {};
+  graph.importers = graph.importers || {};
+  return graph;
+}
+// resolve one file's call/import names to def ids by NAME (GitNexus-style) and record
+// the referring file on each def's reverse edge list. Skips self-references, overly
+// ambiguous names (>25 defs), and caps each edge list so a common name can't explode.
+function linkEdges(graph, byName, raw) {
+  const relOf = (id) => id.slice(0, id.lastIndexOf('#'));
+  const addEdge = (map, id) => {
+    if (relOf(id) === raw.rel) return;
+    const arr = (map[id] = map[id] || []);
+    if (arr.length < 50 && !arr.includes(raw.rel)) arr.push(raw.rel);
+  };
+  const link = (names, map) => {
+    for (const name of names) {
+      const ids = byName[name];
+      if (!ids || ids.length > 25) continue;
+      for (const id of ids) addEdge(map, id);
+    }
+  };
+  link(raw.calls, graph.callers);
+  link(raw.imps, graph.importers);
+}
+// stamp rel + id onto a raw file's rich symbols (id = rel#name, unique per file)
+function stampSymbols(raw) {
+  for (const s of raw.symbols) { s.rel = raw.rel; s.id = raw.rel + '#' + s.name; }
+  return raw.symbols;
+}
+// full assembly: all defs first (so edges can resolve against the whole repo), then edges
+function assembleGraph(graph, raws) {
+  const byName = dict();
+  for (const r of raws) {
+    for (const s of stampSymbols(r)) {
+      graph.defs.push(s);
+      (byName[s.name] = byName[s.name] || []).push(s.id);
+    }
+  }
+  for (const r of raws) linkEdges(graph, byName, r);
+}
+async function persistGraph(cwd, graph) {
+  try {
+    const dir = indexDir(cwd);
+    await fs.promises.mkdir(dir, { recursive: true });
+    const data = { v: GRAPH_SCHEMA, built: graph.built, defs: graph.defs,
+      callers: graph.callers, importers: graph.importers };
+    await fs.promises.writeFile(path.join(dir, 'codegraph.json'), JSON.stringify(data), 'utf8');
+  } catch {}
+}
+// walk the repo (same skip/size rules as buildSymbolIndex) parsing each grammar file,
+// then assemble the reverse graph. ASYNC + yielding so it never freezes the main process.
+// quick file count (readdir only — no read/parse) so a manual rebuild can show
+// a determinate progress bar in the status bar
+async function countGraphFiles(root) {
+  let n = 0;
+  async function w(dir) {
+    if (n >= INDEX_MAX_FILES) return;
+    let entries;
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const d of entries) {
+      if (n >= INDEX_MAX_FILES) return;
+      if (d.isDirectory()) {
+        if (!d.name.startsWith('.') && !INDEX_SKIP_DIRS.has(d.name)) await w(path.join(dir, d.name));
+        continue;
+      }
+      if (LANG_GRAMMAR[path.extname(d.name).slice(1).toLowerCase()]) n++;
+    }
+  }
+  await w(root);
+  return n;
+}
+async function buildCodeGraph(cwd, onProgress) {
+  const root = cwd || process.env.USERPROFILE;
+  const graph = emptyGraph();
+  try {
+    await tsInit();
+  } catch (err) {
+    tsBroken = true;
+    if (!tsInitErrorLogged) {
+      console.error('[codegraph] buildCodeGraph: tsInit failed:', err);
+      tsInitErrorLogged = true;
+    }
+    return graph;
+  }
+  if (!tsMod) {
+    tsBroken = true;
+    if (!tsInitError) tsInitError = 'tree-sitter module failed to load';
+    return graph;
+  }
+  const raws = [];
+  // pre-count parseable files so a manual rebuild can render a determinate bar
+  const total = onProgress ? await countGraphFiles(root) : 0;
+  let count = 0, sinceYield = 0;
+  const yieldSoon = () => new Promise((r) => setImmediate(r));
+  async function walk(dir) {
+    if (count >= INDEX_MAX_FILES) return;
+    let entries;
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const d of entries) {
+      if (count >= INDEX_MAX_FILES) return;
+      if (d.isDirectory()) {
+        if (!d.name.startsWith('.') && !INDEX_SKIP_DIRS.has(d.name)) await walk(path.join(dir, d.name));
+        continue;
+      }
+      const ext = path.extname(d.name).slice(1).toLowerCase();
+      const grammar = LANG_GRAMMAR[ext];
+      if (!grammar) continue;
+      const full = path.join(dir, d.name);
+      try {
+        const stat = await fs.promises.stat(full);
+        if (stat.size > SYMBOL_MAX_BYTES) continue;
+        const text = await fs.promises.readFile(full, 'utf8');
+        const rel = path.relative(root, full).replace(/\\/g, '/');
+        const raw = await extractFileGraph(text, grammar);
+        if (raw) { raw.rel = rel; raws.push(raw); }
+        count++;
+        if (onProgress && count % 10 === 0) onProgress(count, total);
+        if (++sinceYield >= 20) { sinceYield = 0; await yieldSoon(); }
+      } catch {}
+    }
+  }
+  await walk(root);
+  if (onProgress) onProgress(count, total || count);
+  assembleGraph(graph, raws);
+  graph.built = Date.now();
+  indexGraph(graph);
+  graphCache[cwd] = graph;
+  await persistGraph(cwd, graph);
+  return graph;
+}
+// background build/refresh — memory → disk → build, deduped. NEVER awaited on a hot path.
+function ensureGraph(cwd) {
+  if (graphCache[cwd]) return Promise.resolve(graphCache[cwd]);
+  if (graphBuilding[cwd]) return graphBuilding[cwd];
+  const disk = loadGraphDisk(cwd);
+  if (disk) { indexGraph(disk); graphCache[cwd] = disk; return Promise.resolve(disk); }
+  if (tsBroken) return Promise.resolve(null);
+  graphBuilding[cwd] = buildCodeGraph(cwd)
+    .catch(() => null)
+    .finally(() => { delete graphBuilding[cwd]; });
+  return graphBuilding[cwd];
+}
+// synchronous cached read for the query path — memory or disk only, NEVER a build
+function getGraphForQuery(cwd) {
+  if (graphCache[cwd]) return graphCache[cwd];
+  const disk = loadGraphDisk(cwd);
+  if (disk) { indexGraph(disk); graphCache[cwd] = disk; return disk; }
+  return null;
+}
+// add one file's defs + outgoing edges to an existing graph (incremental re-parse)
+function addFileToGraph(graph, raw) {
+  const byName = dict();
+  for (const d of graph.defs) (byName[d.name] = byName[d.name] || []).push(d.id);
+  for (const s of stampSymbols(raw)) {
+    graph.defs.push(s);
+    (byName[s.name] = byName[s.name] || []).push(s.id);
+  }
+  linkEdges(graph, byName, raw);
+}
+// drop everything a file contributed: its own defs and its appearances as a referrer
+function removeFileFromGraph(graph, rel) {
+  const kept = [];
+  const removed = new Set();
+  for (const d of graph.defs) {
+    if (d.rel === rel) removed.add(d.id);
+    else kept.push(d);
+  }
+  graph.defs = kept;
+  for (const id of removed) { delete graph.callers[id]; delete graph.importers[id]; }
+  for (const map of [graph.callers, graph.importers]) {
+    for (const id of Object.keys(map)) {
+      if (map[id].includes(rel)) map[id] = map[id].filter((r) => r !== rel);
+    }
+  }
+}
+// re-parse a single changed file into the in-memory graph — mirrors indexOneFile
+async function reparseFileInGraph(cwd, abs) {
+  const graph = graphCache[cwd];
+  if (!graph || tsBroken || !tsMod) return false;
+  const rel = path.relative(cwd, abs).replace(/\\/g, '/');
+  if (rel.startsWith('..')) return false;
+  if (rel.split('/').some((p) => p.startsWith('.') || INDEX_SKIP_DIRS.has(p))) return false;
+  const grammar = LANG_GRAMMAR[path.extname(abs).slice(1).toLowerCase()];
+  if (!grammar) return false;
+  try {
+    const stat = await fs.promises.stat(abs);
+    if (!stat.isFile() || stat.size > SYMBOL_MAX_BYTES) return false;
+    const text = await fs.promises.readFile(abs, 'utf8');
+    const raw = await extractFileGraph(text, grammar);
+    if (!raw) return false;
+    raw.rel = rel;
+    removeFileFromGraph(graph, rel);
+    addFileToGraph(graph, raw);
+    indexGraph(graph);
+    return true;
+  } catch { return false; }
+}
+
+// reverse-reachability: files that (transitively, ≤depth hops) reference a def, via
+// callers ∪ importers. Bounded so a hub symbol can't blow up the BFS.
+function reverseReach(graph, startId, depth) {
+  const startRel = graph.defById[startId] ? graph.defById[startId].rel : null;
+  const files = new Set();
+  const visited = new Set([startId]);
+  let frontier = [startId];
+  for (let hop = 0; hop < depth && frontier.length; hop++) {
+    const next = [];
+    for (const id of frontier) {
+      const refs = [...(graph.callers[id] || []), ...(graph.importers[id] || [])];
+      for (const rel of refs) {
+        if (rel === startRel) continue;
+        files.add(rel);
+        if (files.size >= 200) return files;
+        for (const nid of (graph.fileDefs[rel] || [])) {
+          if (!visited.has(nid)) { visited.add(nid); next.push(nid); }
+        }
+      }
+    }
+    frontier = next;
+  }
+  return files;
+}
+// forward-reachability: def ids a start symbol DEPENDS ON (transitively, ≤depth
+// hops) via its per-def `calls`, resolved to defs by NAME. Skips ambiguous names
+// (>25 defs) and is bounded so a fan-out symbol can't explode the pack. Returns
+// def ids (the packer reads their source). This drives context expansion:
+// login() → validatePassword() → UserRepository → DatabaseClient (depth-limited).
+function forwardReach(graph, startId, depth, cap) {
+  const out = new Set();
+  const visited = new Set([startId]);
+  let frontier = [startId];
+  const limit = cap || 60;
+  for (let hop = 0; hop < depth && frontier.length; hop++) {
+    const next = [];
+    for (const id of frontier) {
+      const d = graph.defById[id];
+      if (!d || !d.calls) continue;
+      for (const name of d.calls) {
+        const ids = graph.byName[name];
+        if (!ids || ids.length > 25) continue;   // ambiguous → skip (name-resolution limit)
+        for (const nid of ids) {
+          if (visited.has(nid)) continue;
+          visited.add(nid);
+          out.add(nid);
+          next.push(nid);
+          if (out.size >= limit) return out;
+        }
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+const impactBase = (rel) => rel.slice(rel.lastIndexOf('/') + 1);
+// one lean line: `symbol (defined in a.ts) ← used by: b.tsx, c.tsx (+N)`, ≤~90 chars
+function fmtImpactLine(name, rel, users) {
+  const shown = users.slice(0, 6).map(impactBase);
+  const extra = users.length > 6 ? ` (+${users.length - 6})` : '';
+  let line = `${name} (defined in ${impactBase(rel)}) ← used by: ${shown.join(', ')}${extra}`;
+  if (line.length > 90) line = line.slice(0, 89) + '…';
+  return line;
+}
+// LEXICAL FALLBACK — token→files inverted map when the graph is cold or a grammar is
+// missing. A symbol is "used by" any OTHER file whose tf contains all of its tokens.
+function lexicalImpact(idx, files) {
+  if (!idx || !idx.files) return '';
+  const inv = dict();
+  for (const rel of Object.keys(idx.files)) {
+    for (const t of Object.keys(idx.files[rel].tf)) (inv[t] = inv[t] || new Set()).add(rel);
+  }
+  const lines = [];
+  const seen = new Set();
+  for (const f of files.slice(0, 6)) {
+    const syms = (idx.files[f.rel] && idx.files[f.rel].symbols) || [];
+    for (const sym of syms) {
+      if (lines.length >= 8) break;
+      if (seen.has(sym)) continue;
+      seen.add(sym);
+      const toks = tokenize(sym);
+      if (!toks.length) continue;
+      let inter = null;
+      for (const t of toks) {
+        const s = inv[t];
+        if (!s) { inter = null; break; }
+        inter = inter ? inter.filter((r) => s.has(r)) : [...s];
+      }
+      if (!inter) continue;
+      const users = inter.filter((r) => r !== f.rel);
+      if (users.length) lines.push(fmtImpactLine(sym, f.rel, users));
+    }
+    if (lines.length >= 8) break;
+  }
+  return lines.join('\n');
+}
+// GLOBAL regression impact for an issue: seed with the def nodes of the top ranked
+// files, reverse-BFS the graph, and emit the highest-impact symbols. Falls back to the
+// lexical reverse-map when the AST graph isn't ready. Query-cheap: lookups + BFS only.
+function regressionImpact(graph, idx, files) {
+  if (graph && graph.defs && graph.defs.length) {
+    const seeds = [];
+    const seenKey = new Set();
+    for (const f of (files || []).slice(0, 6)) {
+      for (const id of (graph.fileDefs[f.rel] || [])) {
+        const d = graph.defById[id];
+        if (!d || seenKey.has(id)) continue;
+        seenKey.add(id);
+        seeds.push(d);
+      }
+    }
+    const scored = [];
+    for (const d of seeds) {
+      const users = [...reverseReach(graph, d.id, 3)];
+      if (users.length) scored.push({ d, users });
+    }
+    scored.sort((a, b) => b.users.length - a.users.length);
+    const lines = scored.slice(0, 8).map((s) => fmtImpactLine(s.d.name, s.d.rel, s.users));
+    if (lines.length) return lines.join('\n');
+  }
+  return lexicalImpact(idx, files);
+}
+
+// ===== Symbol-level repository map (tree-sitter) — names only, no bodies =====
+// Spec: a lightweight overview listing ONLY symbol names per file, grouped by
+// directory. Built from the code graph's rich defs (falls back to '' when the
+// graph is cold — callers then use the lexical dir-map). Token-lean by design:
+// caps files, and symbols-per-file, and prefers files that carry more symbols.
+function repoMapSymbols(graph, opts = {}) {
+  if (!graph || !graph.defs || !graph.defs.length) return '';
+  const maxFiles = opts.maxFiles || 50;
+  const perFile = opts.perFile || 16;
+  const only = opts.files ? new Set(opts.files) : null;   // restrict to a file subset
+  const byFile = dict();
+  for (const d of graph.defs) {
+    if (only && !only.has(d.rel)) continue;
+    (byFile[d.rel] = byFile[d.rel] || []).push(d.name);
+  }
+  const rels = Object.keys(byFile);
+  // most-symbol-dense files first, then a stable path sort for readability
+  rels.sort((a, b) => byFile[b].length - byFile[a].length);
+  const chosen = rels.slice(0, maxFiles).sort();
+  const byDir = dict();
+  for (const rel of chosen) {
+    const cut = rel.lastIndexOf('/');
+    const dir = cut >= 0 ? rel.slice(0, cut) : '.';
+    (byDir[dir] = byDir[dir] || []).push(rel);
+  }
+  const out = [];
+  for (const dir of Object.keys(byDir).sort()) {
+    out.push(`${dir}/`);
+    for (const rel of byDir[dir]) {
+      const base = rel.slice(rel.lastIndexOf('/') + 1);
+      const names = [...new Set(byFile[rel])].slice(0, perFile);
+      out.push(`  ${base}: ${names.join(', ')}`);
+    }
+  }
+  return out.join('\n');
+}
+
+// ===== Symbol-level context packer (tree-sitter) — the token-optimizer =====
+// Replaces whole-file front-loading: instead of dumping N files, load only the
+// symbols the request needs (query-matched seeds) + their forward dependencies
+// (calls/constructors, depth-limited), reading each symbol's SOURCE lazily by
+// line range. Graph-gated — returns null when the graph is cold so the caller
+// keeps today's whole-file path. No embeddings; ranking reuses BM25 retrieve().
+
+// read a file's lines once per pack (cache), size-guarded
+function readLinesCached(cache, cwd, rel) {
+  if (cache.has(rel)) return cache.get(rel);
+  let lines = null;
+  try {
+    const abs = path.join(cwd, rel);
+    const st = fs.statSync(abs);
+    if (st.isFile() && st.size <= SYMBOL_MAX_BYTES) lines = fs.readFileSync(abs, 'utf8').split('\n');
+  } catch {}
+  cache.set(rel, lines);
+  return lines;
+}
+// a symbol's source, sliced by its line range; truncated past maxLines with a marker
+function symbolSource(cache, cwd, sym, maxLines) {
+  const lines = readLinesCached(cache, cwd, sym.rel);
+  if (!lines) return '';
+  const from = Math.max(0, sym.sl - 1);
+  const span = sym.el - sym.sl + 1;
+  if (maxLines && span > maxLines) {
+    return lines.slice(from, from + maxLines).join('\n') +
+      `\n  // … (${span - maxLines} more lines)`;
+  }
+  return lines.slice(from, Math.min(lines.length, sym.el)).join('\n');
+}
+// a lean signature: first non-body lines up to the opening brace / statement end
+function signatureOf(cache, cwd, sym) {
+  const lines = readLinesCached(cache, cwd, sym.rel);
+  if (!lines) return sym.name;
+  const from = Math.max(0, sym.sl - 1);
+  const slice = lines.slice(from, Math.min(lines.length, from + 6));
+  const buf = [];
+  for (const ln of slice) {
+    const brace = ln.indexOf('{');
+    if (brace >= 0) { buf.push(ln.slice(0, brace).trimEnd()); break; }
+    buf.push(ln.trimEnd());
+    if (/;\s*$/.test(ln) || /=>\s*$/.test(ln) || /:\s*$/.test(ln)) break;
+  }
+  let sig = buf.join(' ').replace(/\s+/g, ' ').trim();
+  if (sig.length > 160) sig = sig.slice(0, 157) + '…';
+  return sig || sym.name;
+}
+// token optimization: collapse runs of blank lines; when !keepComments also drop
+// whole-line comments (// … , # … , single-line /* … */). Never touches code.
+function optimizeSource(src, keepComments) {
+  const out = [];
+  let blank = 0;
+  for (const raw of src.split('\n')) {
+    const t = raw.trim();
+    if (!keepComments &&
+        (/^\/\//.test(t) || /^#/.test(t) || (/^\/\*.*\*\/$/.test(t)))) continue;
+    if (!t) { blank++; if (blank > 1) continue; } else blank = 0;
+    out.push(raw);
+  }
+  return out.join('\n').trim();
+}
+// pick seed symbols (query-matched in top-ranked files; else exported top-level of
+// the top files) + their forward dependencies (depth-limited call/constructor BFS)
+function selectSymbols(graph, query, files, opts) {
+  const qtokens = new Set(tokenize(query));
+  const rankedFiles = files.slice(0, opts.topFiles || 4).map((f) => f.rel);
+  const seen = new Set();
+  const seeds = [];
+  for (const rel of rankedFiles) {
+    for (const id of (graph.fileDefs[rel] || [])) {
+      const d = graph.defById[id];
+      if (!d || seen.has(id)) continue;
+      if (tokenize(d.name).some((t) => qtokens.has(t))) { seen.add(id); seeds.push(id); }
+    }
+  }
+  if (!seeds.length) {   // no name match → exported/public top-level symbols of the top files
+    for (const rel of rankedFiles.slice(0, 2)) {
+      for (const id of (graph.fileDefs[rel] || [])) {
+        const d = graph.defById[id];
+        if (!d || seen.has(id) || d.parent) continue;
+        if (d.vis === 'exported' || d.vis === 'public' || d.vis === 'pub') {
+          seen.add(id); seeds.push(id);
+        }
+      }
+    }
+  }
+  const seedIds = seeds.slice(0, opts.maxSeeds || 8);
+  const depSet = new Set();
+  for (const id of seedIds) {
+    for (const nid of forwardReach(graph, id, opts.callDepth || 2, 40)) {
+      if (!seen.has(nid)) depSet.add(nid);
+    }
+  }
+  return { seeds: seedIds, deps: [...depSet].slice(0, opts.maxDeps || 12) };
+}
+// build the packed symbol context. Returns null (→ caller falls back to whole-file)
+// when the graph is cold or nothing relevant is found.
+function packSymbols(cwd, graph, idx, query, opts = {}) {
+  if (!graph || !graph.defs || !graph.defs.length) return null;
+  const files = retrieve(idx, query, opts.rankFiles || 12);
+  if (!files.length) return null;
+  const { seeds, deps } = selectSymbols(graph, query, files, opts);
+  if (!seeds.length) return null;
+
+  const cache = new Map();
+  const keepComments = !!opts.comments;
+  const budget = opts.budget || 12000;
+  let used = 0;
+  const involved = new Set();
+  const sigLine = (d) =>
+    `- ${d.name} (${d.type} in ${d.rel}:${d.sl}` +
+    `${d.parent ? ', ' + d.parent : ''})${d.doc ? ' — ' + d.doc : ''}`;
+
+  const sigLines = [];
+  for (const id of [...seeds, ...deps]) {
+    const d = graph.defById[id]; if (!d) continue;
+    sigLines.push(sigLine(d)); involved.add(d.rel);
+  }
+  // IMPLEMENTATIONS — seed symbols, full (optimized) source, budget-first
+  const impl = [];
+  for (const id of seeds) {
+    const d = graph.defById[id]; if (!d) continue;
+    const src = optimizeSource(symbolSource(cache, cwd, d, opts.maxLines || 120), keepComments);
+    if (!src) continue;
+    const block = `===== ${d.rel} :: ${d.name} (${d.sl}-${d.el}) =====\n${src}`;
+    if (used + block.length > budget) break;
+    used += block.length; impl.push(block);
+  }
+  if (!impl.length) return null;   // couldn't read any seed source → fall back
+  // DEPENDENCIES — full body if it fits, else signature-only (token optimization)
+  const depBlocks = [];
+  for (const id of deps) {
+    const d = graph.defById[id]; if (!d) continue;
+    const src = optimizeSource(symbolSource(cache, cwd, d, 60), keepComments);
+    let block;
+    if (src && used + src.length + 80 <= budget) {
+      block = `===== ${d.rel} :: ${d.name} (${d.sl}-${d.el}) =====\n${src}`;
+    } else {
+      block = `----- ${d.rel} :: ${d.name} — ${signatureOf(cache, cwd, d)}`;
+    }
+    if (used + block.length > budget) break;
+    used += block.length; depBlocks.push(block);
+  }
+  const map = repoMapSymbols(graph, { files: [...involved], maxFiles: 30, perFile: 12 });
+  return {
+    seedCount: seeds.length, depCount: deps.length, chars: used,
+    files: involved.size, map, sigLines, impl, depBlocks,
+  };
+}
+// render a pack into the prompt block, in the spec's order:
+// repo map → signatures → implementations → dependencies
+function formatSymbolContext(pack) {
+  const parts = [];
+  if (pack.map) {
+    parts.push('REPO MAP (symbols — orientation only, do not re-list):\n' + pack.map);
+  }
+  if (pack.sigLines.length) {
+    parts.push('RELEVANT SYMBOLS (signatures):\n' + pack.sigLines.join('\n'));
+  }
+  if (pack.impl.length) {
+    parts.push('IMPLEMENTATIONS (the symbols this task touches — already loaded, ' +
+      'do NOT re-open the files):\n' + pack.impl.join('\n\n'));
+  }
+  if (pack.depBlocks.length) {
+    parts.push('DEPENDENCIES (called/constructed by the above; ' +
+      'signature-only lines start with -----):\n' + pack.depBlocks.join('\n\n'));
+  }
+  return parts.join('\n\n');
 }
 
 ipcMain.handle('symbol-build', async (_e, cwd) => {
@@ -760,6 +1681,7 @@ ipcMain.handle('symbol-ensure', async (_e, cwd) => {
   try {
     const existed = !!readJson(path.join(indexDir(cwd), 'symbols.json'));
     const idx = await loadOrBuildIndex(cwd);
+    ensureGraph(cwd).catch(() => {});   // build the code graph in the background too
     return { ok: true, cached: existed, files: Object.keys(idx.files).length };
   } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
 });
@@ -770,24 +1692,45 @@ ipcMain.handle('symbol-watch', async (_e, cwd) => {
   try {
     if (symbolWatchers[cwd]) return { ok: true, already: true };
     await loadOrBuildIndex(cwd);
+    ensureGraph(cwd).catch(() => {});   // keep the code graph warm for this project
     const state = { timer: null, pending: new Set() };
     const flush = async () => {
       const idx = symbolCache[cwd]; if (!idx) { state.pending.clear(); return; }
       const paths = [...state.pending]; state.pending.clear();
       let changed = 0;
+      const graph = graphCache[cwd];
+      let gChanged = false;
       for (const abs of paths) {
         const rel = path.relative(cwd, abs).replace(/\\/g, '/');
         try {
           const st = await fs.promises.stat(abs);
-          if (st.isFile()) { if (await indexOneFile(cwd, abs)) changed++; }
-        } catch {                      // gone → remove from index
+          if (st.isFile()) {
+            if (await indexOneFile(cwd, abs)) changed++;
+            if (await reparseFileInGraph(cwd, abs)) gChanged = true;
+          }
+        } catch {                      // gone → remove from index + graph
           if (idx.files[rel]) { delete idx.files[rel]; changed++; }
+          if (graph) { removeFileFromGraph(graph, rel); indexGraph(graph); gChanged = true; }
         }
       }
       if (changed) {
         recomputeAvgLen(idx);
         await persistIndex(cwd, idx);
         send('symbol-updated', { cwd, files: Object.keys(idx.files).length, changed });
+      }
+      if (gChanged && graph) {
+        try { await persistGraph(cwd, graph); } catch {}
+        // keep the semantic vectors in step — re-embed only the changed files, in
+        // a worker so the ~seconds of embed + rewrite never freeze the UI. Fire
+        // and forget; the watcher must not block on it.
+        if (V.hasVectorIndex(indexDir(cwd))) {
+          const rels = paths.map((abs) => path.relative(cwd, abs).replace(/\\/g, '/'));
+          runVectorJob(cwd, { job: 'sync', dir: indexDir(cwd), rels })
+            .then((m) => {
+              if (m && m.ok) { V.invalidateCache(); send('vector-updated', { cwd, count: m.count }); }
+            })
+            .catch(() => {});
+        }
       }
     };
     let watcher;
@@ -812,6 +1755,120 @@ ipcMain.handle('symbol-watch', async (_e, cwd) => {
 
 app.on('before-quit', () => {
   for (const k of Object.keys(symbolWatchers)) { try { symbolWatchers[k].watcher.close(); } catch {} }
+});
+
+// ===== Code-graph controls for the status bar =====
+// regression-impact: the LEAN per-run query every agent launch hits (cached
+// graph only, never a build). codegraph-build: user-triggered rebuild with a
+// progress stream. codegraph-status: precomputed? watcher running? last built?
+const graphManualBuilding = {};   // cwd -> true while a user-triggered rebuild runs
+
+ipcMain.handle('regression-impact', async (_e, { cwd, prompt }) => {
+  try {
+    if (!cwd) return { ok: true, impact: '' };
+    const idx = await loadOrBuildIndex(cwd);
+    const files = retrieve(idx, prompt || '', 8);
+    const impact = regressionImpact(getGraphForQuery(cwd), idx, files);
+    ensureGraph(cwd).catch(() => {});   // warm for next time; never blocks the run
+    return { ok: true, impact };
+  } catch (e) { return { ok: false, impact: '', error: String(e && e.message ? e.message : e) }; }
+});
+
+ipcMain.handle('codegraph-status', (_e, cwd) => {
+  if (!cwd) {
+    return {
+      ok: true, built: false, empty: false, building: false, watching: false,
+      lastBuilt: 0, files: 0, broken: false, error: ''
+    };
+  }
+  let g = graphCache[cwd];
+  if (!g) g = loadGraphDisk(cwd);
+  return {
+    ok: true,
+    built: !!(g && g.defs && g.defs.length),
+    // a build DID complete but yielded no symbols (grammar failures or no
+    // supported languages) — the UI must not repaint this as "never built"
+    empty: !!(g && g.built && g.defs && !g.defs.length),
+    building: !!graphBuilding[cwd] || !!graphManualBuilding[cwd],
+    watching: !!symbolWatchers[cwd],
+    lastBuilt: g && g.built ? g.built : 0,
+    files: g && g.defs ? g.defs.length : 0,
+    broken: !!tsBroken,
+    error: tsBroken ? tsInitError : ''
+  };
+});
+
+// One PERSISTENT embedding worker for ALL vector work (build / sync / query). The
+// model loads once and stays resident OFF the main thread, so neither building nor
+// querying ever freezes the UI. Jobs are serialized inside the worker. `payload`
+// carries { job, dir, ... }; onProgress fires for build progress.
+let _vecWorker = null;
+const _vecReqs = new Map();
+let _vecReqId = 0;
+function vecWorker() {
+  if (_vecWorker) return _vecWorker;
+  const w = new Worker(path.join(__dirname, 'vectors-worker.js'));
+  w.on('message', (m) => {
+    const req = _vecReqs.get(m.id);
+    if (!req) return;
+    if (m.type === 'progress') { if (req.onProgress) req.onProgress(m.done, m.total); }
+    else if (m.type === 'done') { _vecReqs.delete(m.id); req.resolve(m); }
+  });
+  const fail = (err) => {
+    for (const [, req] of _vecReqs) req.resolve({ ok: false, error: err });
+    _vecReqs.clear(); _vecWorker = null;   // allow a fresh spawn next request
+  };
+  w.on('error', (e) => fail(String(e && e.message || e)));
+  w.on('exit', () => fail('vector worker exited'));
+  _vecWorker = w;
+  return w;
+}
+function runVectorJob(cwd, payload, onProgress) {
+  return new Promise((resolve) => {
+    const id = ++_vecReqId;
+    _vecReqs.set(id, { resolve, onProgress });
+    try { vecWorker().postMessage({ id, ...payload }); }
+    catch (e) { _vecReqs.delete(id); resolve({ ok: false, error: String(e && e.message || e) }); }
+  });
+}
+
+// build the semantic vector index over a fresh graph — off-thread, deduped,
+// progress-reported. Never awaited on a hot path (embedding is CPU-heavy).
+const vectorBuilding = {};
+function buildVectorsBg(cwd, graph) {
+  if (!cwd || !graph || !graph.defs || !graph.defs.length) return;
+  if (vectorBuilding[cwd]) return;
+  vectorBuilding[cwd] = true;
+  const total = graph.defs.length || 1;
+  send('vector-progress', { cwd, done: 0, total, phase: 'build' });
+  runVectorJob(cwd, { job: 'build', dir: indexDir(cwd) },
+    (done, t) => send('vector-progress', { cwd, done, total: t || total, phase: 'build' }))
+    .then((m) => {
+      V.invalidateCache();   // worker rewrote the file — drop main's stale copy
+      // ALWAYS report completion (ok true/false) so the bar finalizes instead of
+      // hanging at "vectors 0%" when embedding is unavailable.
+      send('vector-updated', { cwd, count: (m && m.count) || 0, ok: !!(m && m.ok), error: m && m.error });
+    })
+    .finally(() => { delete vectorBuilding[cwd]; });
+}
+
+ipcMain.handle('codegraph-build', async (_e, cwd) => {
+  if (!cwd) return { ok: false, error: 'no project open' };
+  if (graphManualBuilding[cwd] || graphBuilding[cwd]) return { ok: false, error: 'already building' };
+  graphManualBuilding[cwd] = true;
+  // a manual rebuild is the retry gesture — clear any prior stuck failure so the
+  // (possibly now-fixed) tree-sitter init gets re-attempted instead of staying broken
+  tsBroken = false; tsReady = null; tsInitError = ''; tsInitErrorLogged = false;
+  try {
+    delete graphCache[cwd];   // force a fresh parse (buildCodeGraph repopulates + persists)
+    const graph = await buildCodeGraph(cwd, (done, total) => send('codegraph-progress', { cwd, done, total }));
+    if (tsBroken) return { ok: false, error: tsInitError || 'tree-sitter unavailable' };
+    send('codegraph-updated', { cwd });
+    buildVectorsBg(cwd, graph);   // refresh semantic vectors off the new graph
+    return { ok: true, files: graph && graph.defs ? graph.defs.length : 0, lastBuilt: graph ? graph.built : 0 };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  } finally { delete graphManualBuilding[cwd]; }
 });
 
 // ===== Open-file watcher — notify the renderer when a file it has OPEN in the
@@ -867,8 +1924,174 @@ ipcMain.handle('retrieve-context', async (_e, { cwd, query, k, withContent }) =>
         } catch {}
       }
     }
-    return { ok: true, files, repoMap: repoMapFromIndex(idx, cwd) };
+    // regression blast-radius from the cached code graph (never triggers a build here);
+    // background-refresh it for next time so a cold first run still returns via fallback.
+    const impact = regressionImpact(getGraphForQuery(cwd), idx, files);
+    ensureGraph(cwd).catch(() => {});
+    return { ok: true, files, repoMap: repoMapFromIndex(idx, cwd), impact };
   } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e), files: [] }; }
+});
+
+// SYMBOL-LEVEL context (tree-sitter): the minimum symbols a request needs +
+// their dependencies, instead of whole files. Graph-gated — returns
+// { ok, ready:false } when the graph is cold so the renderer keeps the whole-file
+// path; still warms the graph in the background for next time.
+ipcMain.handle('retrieve-symbols', async (_e, { cwd, query, budget, comments }) => {
+  try {
+    if (!cwd) return { ok: true, ready: false };
+    const idx = await loadOrBuildIndex(cwd);
+    const graph = getGraphForQuery(cwd);
+    ensureGraph(cwd).catch(() => {});           // warm for next time; never blocks
+    if (!graph || !graph.defs || !graph.defs.length) return { ok: true, ready: false };
+    const pack = packSymbols(cwd, graph, idx, query || '', {
+      budget: budget || 12000, comments: !!comments,
+    });
+    if (!pack) return { ok: true, ready: false };
+    return {
+      ok: true, ready: true, context: formatSymbolContext(pack),
+      stats: { seeds: pack.seedCount, deps: pack.depCount, files: pack.files, chars: pack.chars },
+    };
+  } catch (e) {
+    return { ok: false, ready: false, error: String(e && e.message ? e.message : e) };
+  }
+});
+
+// ===== Semantic vector retrieval + single-shot planning =====
+ipcMain.handle('vector-status', (_e, cwd) => {
+  return { ok: true, exists: cwd ? V.hasVectorIndex(indexDir(cwd)) : false };
+});
+
+ipcMain.handle('vector-build', async (_e, cwd) => {
+  try {
+    if (!cwd) return { ok: false, error: 'no project' };
+    const graph = await ensureGraph(cwd);   // ensures codegraph.json exists on disk
+    if (!graph || !graph.defs || !graph.defs.length) return { ok: false, error: 'no code graph' };
+    if (vectorBuilding[cwd]) return { ok: false, error: 'already building' };
+    vectorBuilding[cwd] = true;
+    send('vector-progress', { cwd, done: 0, total: graph.defs.length || 1, phase: 'build' });
+    try {
+      const m = await runVectorJob(cwd, { job: 'build', dir: indexDir(cwd) },
+        (d, t) => send('vector-progress', { cwd, done: d, total: t }));
+      V.invalidateCache();
+      send('vector-updated', { cwd, count: (m && m.count) || 0, ok: !!(m && m.ok), error: m && m.error });
+      return m || { ok: false };
+    } finally { delete vectorBuilding[cwd]; }
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+
+ipcMain.handle('vector-query', async (_e, { cwd, query: q, k }) => {
+  try {
+    if (!cwd || !q) return { ok: true, ready: false, hits: [] };
+    // query runs in the persistent worker — never loads the model on the main
+    // thread. hits === null means the index isn't built yet (vs. built-but-no-match).
+    const m = await runVectorJob(cwd, { job: 'query', dir: indexDir(cwd), query: q, k: k || 30 });
+    return { ok: !!m.ok, ready: Array.isArray(m.hits), hits: Array.isArray(m.hits) ? m.hits : [] };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e), hits: [] }; }
+});
+
+// Fuse semantic (vector) + lexical (BM25) file rankings via reciprocal-rank fusion.
+// Vector catches meaning ("timezone bug" -> formatUnixDate); BM25 nails exact
+// identifiers. Pure local math, no LLM. Returns { idx, files:[{rel,...}], symbolHits }.
+async function fuseRetrieval(cwd, q, k) {
+  const idx = await loadOrBuildIndex(cwd);
+  const bm = retrieve(idx, q, (k || 8) * 2);
+  const symbolHits = (await V.queryVectors(indexDir(cwd), q, (k || 8) * 4)) || [];
+  const vBest = new Map();
+  for (const h of symbolHits) {
+    const rel = h.id.slice(0, h.id.lastIndexOf('#'));
+    if (!vBest.has(rel) || vBest.get(rel) < h.score) vBest.set(rel, h.score);
+  }
+  const vfiles = [...vBest.entries()].sort((a, b) => b[1] - a[1]).map((e) => e[0]);
+  const RRF = 60, score = new Map(), meta = new Map();
+  bm.forEach((f, i) => { score.set(f.rel, (score.get(f.rel) || 0) + 1 / (RRF + i)); meta.set(f.rel, f); });
+  vfiles.forEach((rel, i) => { score.set(rel, (score.get(rel) || 0) + 1 / (RRF + i)); });
+  const files = [...score.keys()]
+    .sort((a, b) => score.get(b) - score.get(a))
+    .slice(0, k || 8)
+    .map((rel) => meta.get(rel) || { rel });
+  return { idx, files, symbolHits };
+}
+
+// Deterministic, LLM-free context bundle for the planner: fused ranked files +
+// implementations of the top semantic symbols + regression impact. This is the
+// package that replaces 32 turns of agentic grep/read with one prepared payload.
+async function buildPlanContext(cwd, q, opts = {}) {
+  const { idx, files, symbolHits } = await fuseRetrieval(cwd, q, opts.files || 10);
+  const graph = getGraphForQuery(cwd);
+  const cache = new Map();
+  const parts = [];
+  parts.push('RANKED FILES (semantic + lexical fusion):\n' +
+    files.map((f) => `- ${f.rel}`).join('\n'));
+  if (graph && graph.defById && symbolHits.length) {
+    const seen = new Set();
+    const blocks = [];
+    let budget = opts.budget || 16000;
+    for (const h of symbolHits) {
+      if (budget <= 0) break;
+      const d = graph.defById[h.id];
+      if (!d || seen.has(d.id)) continue;
+      seen.add(d.id);
+      const src = symbolSource(cache, cwd, d, 120);
+      if (!src) continue;
+      const block = `===== ${d.rel} :: ${d.name} (${d.type}, ${d.sl}-${d.el}) =====\n${src}`;
+      if (block.length > budget) continue;
+      budget -= block.length;
+      blocks.push(block);
+    }
+    if (blocks.length) parts.push('KEY SYMBOLS (implementations):\n' + blocks.join('\n\n'));
+  }
+  const impact = regressionImpact(graph, idx, files);
+  if (impact) parts.push('REGRESSION IMPACT (who references what you may change):\n' + impact);
+  const text = parts.join('\n\n');
+  return { text, files: files.map((f) => f.rel), chars: text.length };
+}
+
+// expose the deterministic bundle on its own (preview / debugging / renderer reuse)
+ipcMain.handle('plan-context', async (_e, { cwd, issue }) => {
+  try { return { ok: true, ...(await buildPlanContext(cwd, issue, {})) }; }
+  catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+
+// SINGLE-SHOT plan: deterministic context in, ONE tool-less LLM call out. No agent
+// loop, no grep/read turns, no transcript re-read pileup — the token-light
+// replacement for the agentic prompt-engineer. Returns { ok, text, usage, cost }.
+ipcMain.handle('plan-generate', async (_e, { cwd, issue, model, effort }) => {
+  await sdkReady;
+  try {
+    if (!cwd || !issue) return { ok: false, error: 'cwd and issue required' };
+    const ctx = await buildPlanContext(cwd, issue, {});
+    const sys =
+      'You are a planning engineer. Using ONLY the context provided, produce a ' +
+      'precise implementation plan: root cause, the exact files/symbols to change, ' +
+      'the change per file, and regression risks. The context is complete — do NOT ' +
+      'ask to explore. Be concrete and terse.';
+    const prompt =
+      `ISSUE:\n${issue}\n\n` +
+      `CONTEXT (retrieved deterministically — this is everything you get):\n${ctx.text}`;
+    const opts = {
+      model: model || 'claude-opus-4-8',
+      cwd,
+      systemPrompt: { type: 'preset', preset: 'claude_code', append: sys },
+      settingSources: ['project'],
+      maxTurns: 1,
+      allowedTools: [],            // NO tools → single turn, no agentic exploration
+      includePartialMessages: false,
+    };
+    if (CLAUDE_EXE) opts.pathToClaudeCodeExecutable = CLAUDE_EXE;
+    const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+    if (effort && EFFORTS.includes(effort)) opts.effort = effort;
+    let text = '', usage = null, cost = 0;
+    for await (const msg of query({ prompt, options: opts })) {
+      if (msg.type === 'assistant') {
+        for (const b of msg.message.content || []) if (b.type === 'text') text += b.text;
+      } else if (msg.type === 'result') {
+        usage = msg.usage || null;
+        cost = msg.total_cost_usd || msg.cost_usd || 0;
+        if (msg.subtype === 'success' && !text && msg.result) text = msg.result;
+      }
+    }
+    return { ok: true, text: text.trim(), ctxChars: ctx.chars, files: ctx.files, usage, cost };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
 });
 
 // flat list of all project files (for Ctrl+P quick-open). Skips heavy dirs,
@@ -2014,7 +3237,9 @@ ipcMain.handle('term-start', (_e, { termId, cwd, cols, rows, shell }) => {
     cols: cols || 100,
     rows: rows || 24,
     cwd: cwd || process.env.USERPROFILE,
-    env: process.env
+    // user's core.editor may be a Windows abs path MINGW can't parse;
+    // override per-terminal only (no global git config writes)
+    env: { ...process.env, GIT_EDITOR: 'notepad', GIT_SEQUENCE_EDITOR: 'notepad' }
   });
   terms.set(termId, p);
   p.onData(d => send('term-data', { termId, data: d }));
@@ -2070,7 +3295,11 @@ ipcMain.handle('ai-generate', async (_e, { prompt, model, cwd }) => {
       model: model || 'claude-haiku-4-5-20251001',
       cwd: cwd || process.env.USERPROFILE,
       permissionMode: 'bypassPermissions',
-      systemPrompt: { type: 'preset', preset: 'claude_code' },
+      // NOT the claude_code preset: that system prompt costs ~10k+ tokens and
+      // buys nothing here — this path is tool-less one-shot text generation
+      // (commit messages, PR bodies, fix routing), so a tiny prompt suffices.
+      systemPrompt: 'You are a text generator. Reply with ONLY the requested ' +
+        'text — no preamble, no explanations, no markdown fences.',
       settingSources: [],
       // pure text-gen: forbid ALL tools so it can't try to explore the repo and
       // burn turns (that caused "reached maximum number of turns"). One-shot.
@@ -2096,13 +3325,18 @@ ipcMain.handle('agent-run', async (_e, cfg) => {
   const abortController = new AbortController();
   runs.set(cfg.runId, { abortController });
 
+  const CONCISE_RULE = 'OUTPUT DISCIPLINE: be terse. No preamble, no recap of ' +
+    'the task, no summary of steps already visible in tool calls. State only what ' +
+    'changed and why, briefly. Output tokens cost ~5x input.';
+  const appendRules = [cfg.rules, cfg.concise ? CONCISE_RULE : '']
+    .filter(Boolean).join('\n\n');
   const options = {
     model: cfg.model,
     cwd: cfg.cwd || process.env.USERPROFILE,
     permissionMode: cfg.permissionMode || 'acceptEdits',
     abortController,
-    systemPrompt: cfg.rules
-      ? { type: 'preset', preset: 'claude_code', append: cfg.rules }
+    systemPrompt: appendRules
+      ? { type: 'preset', preset: 'claude_code', append: appendRules }
       : { type: 'preset', preset: 'claude_code' },
     includePartialMessages: true,
     autoCompact: true,

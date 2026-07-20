@@ -105,6 +105,26 @@ async function cmtChangeDiff() {
   return (d.ok && d.diff) ? d.diff : '';
 }
 
+// diff of `base` vs HEAD for the PR description. The base picker yields a bare
+// name (e.g. "main"), but the LOCAL ref of that name often doesn't exist (the
+// branch was cut from origin/main and no local main was ever created) or is
+// stale, so a three-dot range against it fails. Try the remote ref first —
+// it's the one that's actually present after clone/fetch/push — then fall
+// back to the local ref, then a two-dot remote range.
+async function cmtBranchDiff(base) {
+  const bare = base.replace(/^origin\//, '');
+  const ranges = [
+    `origin/${bare}...HEAD`,
+    `${bare}...HEAD`,
+    `origin/${bare}..HEAD`,
+  ];
+  for (const range of ranges) {
+    const r = await window.deck.gitDiff(gitRepo, { range });
+    if (r.ok && r.diff && r.diff.trim()) return r.diff;
+  }
+  return '';
+}
+
 // ✨ generate a concise commit message from the diff (Haiku)
 async function cmtGenMessage() {
   const btn = cmtEl('cmt-gen-msg');
@@ -339,8 +359,7 @@ async function cmtGenPRDesc() {
   // diff of this branch vs the base gives the reviewer-facing change set. Use
   // `range`, NOT `commit` — `commit` always gets `^!` appended (single-commit
   // shorthand), which mangles an already-a-range string like "qa...HEAD".
-  let d = await window.deck.gitDiff(gitRepo, { range: `${base}...HEAD` });
-  let diff = (d.ok && d.diff) ? d.diff : '';
+  let diff = await cmtBranchDiff(base);
   if (!diff.trim()) diff = await cmtChangeDiff();
   if (!diff.trim()) {
     // never hand the model an empty diff — it will fabricate a plausible-

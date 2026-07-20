@@ -253,6 +253,8 @@
       if (window.toast) toast('Open a project folder first', false);
       return;
     }
+    // only one center screen at a time — leave the notes gallery first
+    if (window.closeNotesView) window.closeNotesView();
     tk = tkLoad();
     isOpen = true;
     view.classList.remove('hidden');
@@ -273,14 +275,14 @@
 
   window.tkIsOpen = () => isOpen;
   window.openTicketWs = openTk;
+  window.closeTicketWs = closeTk;
 
-  // project switched (or its folder changed) — rebind to the new project's data
+  // project switched (or its folder changed) — the board is a transient UI
+  // mode, not per-project state, so a switch always leaves it (no-op if
+  // it was already closed)
   window.tkProjectChanged = () => {
     if (!isOpen) return;
-    closeModal();
-    if (!projectDir) { closeTk(); return; }
-    tk = tkLoad();
-    render();
+    closeTk();
   };
 
   headBtn.onclick = () => (isOpen ? closeTk() : openTk());
