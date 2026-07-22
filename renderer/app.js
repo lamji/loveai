@@ -1331,9 +1331,22 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
       } else if (vq && vq.indexed && vq.embedErr) {
         ragMsg = `RAG: vector index exists but the embedder won't load ` +
           `(${vq.embedErr}) — lexical only`;
+      } else if (vq && vq.indexed) {
+        ragMsg = `RAG: vector index built · 0 semantic matches for this query ` +
+          `— lexical only`;
       } else {
-        ragMsg = `RAG: no vector index for this project yet — lexical only ` +
-          `(build the graph to enable semantic retrieval)`;
+        // vq is null (query timed out — worker likely busy on another project's
+        // build) or !vq.indexed. Check disk directly: vectorStatus runs on the
+        // MAIN thread, so it isn't blocked behind a queued worker job.
+        let vs = null;
+        try { vs = await window.deck.vectorStatus(cwd); } catch {}
+        if (vs && vs.exists) {
+          ragMsg = `RAG: vector index exists but the query didn't return ` +
+            `(another build may be running) — lexical for now`;
+        } else {
+          ragMsg = `RAG: no vector index for this project yet — lexical only ` +
+            `(build the graph to enable semantic retrieval)`;
+        }
       }
       feed(agentId, 'sys', ragMsg, '🧬');
       if (r.ok && r.files && r.files.length) {
@@ -1678,7 +1691,11 @@ function freshPipe() {
     // plan-review data captured when the plan lands — the modal is a single
     // shared DOM element, so it's populated lazily (on open) from here instead
     // of at plan-ready time, which would clobber another project's open modal.
-    planCardEl: null, planFiles: [], planSummary: ''
+    planCardEl: null, planFiles: [], planSummary: '',
+    // true once PASS TO ENGINEERS has been clicked for the current plan —
+    // reopening the plan-review modal must show the button disabled instead
+    // of allowing a second, duplicate deploy.
+    engineersAssigned: false
   };
 }
 const pipelines = new Map();   // wsId -> pipe state
@@ -1753,6 +1770,7 @@ async function launchPipeline(issue, effort, wsId) {
   p.reviewerSessionId = null;
   p.pending.clear();
   p.taskAssign.clear();
+  p.engineersAssigned = false;
   if (wsId === activeWorkspaceId) document.getElementById('btn-pipeline-stop').classList.remove('hidden');
   if (planReviewWsId === wsId) hidePlanReview();
 
@@ -1919,6 +1937,9 @@ function openPlanModalFor(wsId) {
   });
   content.textContent = (p.planFiles && p.planFiles.length) ? p.planFiles[0].content : '(no plan files found)';
   document.getElementById('pr-summary').textContent = p.planSummary || '(no summary returned — open the card for the full plan)';
+  const approveBtn = document.getElementById('pr-approve');
+  approveBtn.disabled = !!p.engineersAssigned;
+  approveBtn.textContent = p.engineersAssigned ? '✔ ASSIGNED TO ENGINEERS' : '✔ PASS TO ENGINEERS';
   planModal.classList.remove('hidden');
   document.getElementById('pr-revision').focus();
 }
@@ -2017,7 +2038,8 @@ document.getElementById('pr-approve').onclick = async () => {
   const wsId = planReviewWsId;
   if (wsId == null) return;
   const p = pipeFor(wsId);
-  if (!p.active || p.stage !== 'plan') return;
+  if (!p.active || p.stage !== 'plan' || p.engineersAssigned) return;
+  p.engineersAssigned = true;
   hidePlanReview();
   closePlanCard(wsId, 'approved — passed to engineers');
   await deployEngineersFromDir(wsId);
@@ -2850,8 +2872,10 @@ function openChat(agentId) {   // called by the roster card click
   updateChatModal();
   renderAttach();
   adInput.focus();
-  // ensure the console surface is what's visible (not editor/terminal)
-  if (typeof showSurface === 'function') showSurface('console');
+  // ensure the console surface is what's visible, and every other center
+  // screen / the terminal dock is hidden so the run is unmistakably visible
+  if (typeof focusConsoleForTask === 'function') focusConsoleForTask();
+  else if (typeof showSurface === 'function') showSurface('console');
 }
 function closeAgentView() {
   chatAgentId = null;
@@ -2860,6 +2884,36 @@ function closeAgentView() {
   agentDock.classList.add('hidden');
   document.getElementById('console-feed').classList.remove('has-dock');
 }
+
+// sessions whose stored transcript we've already replayed into the feed, so
+// navigating back to the same ticket doesn't stack duplicate history blocks
+const hydratedSessions = new Set();
+
+// open an agent's console view AND, when its live feed has nothing for that
+// agent this launch, replay the stored transcript of `sessionId` so a ticket
+// resumed from the board (whose run happened in a prior session/app launch)
+// doesn't land on a blank console. Used by the workspace ticket flows.
+async function openChatSession(agentId, sessionId) {
+  openChat(agentId);
+  if (!sessionId || hydratedSessions.has(sessionId)) return;
+  // already has live entries for this agent this launch → nothing to backfill
+  const hasLive = [...consoleFeed.querySelectorAll('.ev')]
+    .some(el => el.dataset.agent === agentId);
+  if (hasLive) return;
+  hydratedSessions.add(sessionId);
+  let msgs = [];
+  try { msgs = await window.deck.sessionLoad(sessionId); } catch {}
+  if (!msgs || !msgs.length) return;
+  // still the same agent's view? (operator may have clicked away while loading)
+  if (feedFilter && feedFilter !== agentId) return;
+  feed(agentId, 'sys', `— previous conversation (${msgs.length} entries) —`, '🕘');
+  for (const m of msgs) {
+    if (m.role === 'user') feed(agentId, 'sys', m.text, '🗣');
+    else if (m.role === 'tool') feed(agentId, 'tool', m.text, '⚙');
+    else feed(agentId, 'txt', m.text, '');
+  }
+}
+window.openChatSession = openChatSession;
 
 // kept name — called from setRunningUI/ticker/events to refresh the dock header
 function updateChatModal() {

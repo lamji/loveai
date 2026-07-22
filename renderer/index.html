@@ -748,6 +748,34 @@
           <select id="tk-f-effort" class="think-select"></select>
         </div>
       </div>
+      <label>SCHEDULE <span class="hint">(run this task on its own, no manual start)</span></label>
+      <div class="row tk-sched-row">
+        <div class="col">
+          <select id="tk-f-sched-mode">
+            <option value="off">Off — manual start only</option>
+            <option value="once">Once, at a date/time</option>
+            <option value="daily">Daily, at a time</option>
+            <option value="interval">Every N hours</option>
+          </select>
+        </div>
+        <div class="col tk-sched-field hidden" id="tk-sched-datewrap">
+          <input type="date" id="tk-f-sched-date" />
+        </div>
+        <div class="col tk-sched-field hidden tk-sched-time-group" id="tk-sched-timewrap">
+          <div class="tk-time-picker">
+            <select id="tk-f-sched-hour"></select>
+            <span class="tk-time-colon">:</span>
+            <select id="tk-f-sched-min"></select>
+            <select id="tk-f-sched-ampm">
+              <option value="AM">AM</option>
+              <option value="PM">PM</option>
+            </select>
+          </div>
+        </div>
+        <div class="col tk-sched-field hidden" id="tk-sched-intervalwrap">
+          <input type="number" id="tk-f-sched-interval" min="1" step="1" placeholder="hours" />
+        </div>
+      </div>
       <label>ACCEPTANCE CRITERIA <span class="hint">(@ files/folders · / skills · # image)</span></label>
       <div class="tk-input-wrap">
         <div id="tk-ac-slash" class="slash-menu hidden"></div>
@@ -761,6 +789,7 @@
       <input type="file" id="tk-file-in" multiple hidden />
       <div class="modal-actions tk-modal-actions">
         <button id="tk-f-del" class="btn btn-danger hidden">✕ DELETE</button>
+        <button id="tk-f-gosession" class="btn hidden">↪ GO TO SESSION</button>
         <div style="flex:1"></div>
         <button id="tk-f-cancel" class="btn">CANCEL</button>
         <button id="tk-f-save" class="btn btn-launch">✓ SAVE</button>

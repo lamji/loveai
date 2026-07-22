@@ -297,7 +297,15 @@ async function refreshGraphStatus(force) {
   if (!item) return;
   const pd = (typeof projectDir !== 'undefined') && projectDir;
   if (!pd) { item.classList.add('hidden'); return; }
-  if (pd !== sbGraphProj) { sbGraphProj = pd; force = true; }   // project changed → refresh now
+  if (pd !== sbGraphProj) {
+    sbGraphProj = pd;
+    force = true;
+    // reset transient build state so another project's in-flight bar doesn't leak in
+    sbGraph.building = false;
+    sbGraph.pct = 0;
+    sbGraph.phase = 'graph';
+    sbGraph.lastError = '';
+  }
   const now = Date.now();
   if (!force && now - sbGraphFetchAt < 4000) return;            // throttle — not every 1s tick
   sbGraphFetchAt = now;
@@ -323,7 +331,9 @@ window.deck.onCodegraphProgress((p) => {
   sbGraph.pct = p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
   paintGraph({ building: true });
 });
-window.deck.onCodegraphUpdated(() => {
+window.deck.onCodegraphUpdated((p) => {
+  const pd = (typeof projectDir !== 'undefined') && projectDir;
+  if (!pd || !p || p.cwd !== pd) return;
   // Graph is done, but the semantic VECTOR build starts right after (main.js kicks
   // it off). Don't finalize to 100% yet — switch into the 'vectors' phase so the
   // bar keeps running until vectors.json actually exists. Otherwise the user sees

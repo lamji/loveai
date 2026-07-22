@@ -331,6 +331,7 @@ function currentSurface() {
 function showSurface(name) {
   if (window.tkIsOpen && window.tkIsOpen() && window.closeTicketWs) window.closeTicketWs();
   if (window.notesViewOpen && window.notesViewOpen() && window.closeNotesView) window.closeNotesView();
+  if (window.browserViewOpen && window.browserViewOpen() && window.closeBrowserView) window.closeBrowserView();
   if (name === 'terminal') { openTerminal(); return; }
   if (name === 'editor' && openFiles.length) {
     paneOverride = 'editor';
@@ -343,6 +344,15 @@ function showSurface(name) {
   }
   renderConsoleChips();
 }
+// starting a task or chat brings the console front and center — closes every
+// other center screen (via showSurface) plus the terminal dock, so the
+// operator immediately sees the console tab active with the run in progress.
+function focusConsoleForTask() {
+  if (termOpen()) closeTerminalView();
+  showSurface('console');
+}
+window.focusConsoleForTask = focusConsoleForTask;
+
 async function closeSurface(name) {
   if (name === 'editor') {
     for (const f of [...openFiles]) await closeFile(f.path);

@@ -19,6 +19,15 @@
   const attPreviewFile = document.getElementById('tk-att-preview-file');
   const attPreviewName = document.getElementById('tk-att-preview-name');
   const attPreviewPath = document.getElementById('tk-att-preview-path');
+  const schModeSel = document.getElementById('tk-f-sched-mode');
+  const schDateWrap = document.getElementById('tk-sched-datewrap');
+  const schTimeWrap = document.getElementById('tk-sched-timewrap');
+  const schIntervalWrap = document.getElementById('tk-sched-intervalwrap');
+  const schDateIn = document.getElementById('tk-f-sched-date');
+  const schHourIn = document.getElementById('tk-f-sched-hour');
+  const schMinIn = document.getElementById('tk-f-sched-min');
+  const schAmpmIn = document.getElementById('tk-f-sched-ampm');
+  const schIntervalIn = document.getElementById('tk-f-sched-interval');
 
   const TK_IMG_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
   const DEFAULT_PROMPT =
@@ -27,8 +36,55 @@
   const DEFAULT_STATUSES = [
     { id: 'todo', label: 'TODO' },
     { id: 'inprogress', label: 'IN PROGRESS' },
+    { id: 'inreview', label: 'IN REVIEW' },
     { id: 'done', label: 'DONE' }
   ];
+  // how far ahead of a schedule's next run to start showing a live countdown
+  const SCHED_TIMER_WINDOW_MS = 20 * 60000;
+  // how far ahead of a schedule's next run to raise the top-right "starting
+  // soon" toast — separate from SCHED_TIMER_WINDOW_MS, which just drives the
+  // on-card countdown once it's already showing
+  const SCHED_ALERT_WINDOW_MS = 5 * 60000;
+
+  // ---------- 12h time picker (hour/min/AM-PM selects — explicit AM/PM so a
+  // 24h-locale OS never silently swallows it, which used to make "9 PM" get
+  // stored/read as 09:00 and fire immediately since that time had already
+  // passed) ----------
+  function time24To12(hhmm) {
+    const [h, m] = (hhmm || '09:00').split(':').map(Number);
+    const hour = ((h % 12) || 12);
+    return { hour, min: m || 0, ampm: h >= 12 ? 'PM' : 'AM' };
+  }
+  function time12To24(hour, min, ampm) {
+    let h = Number(hour) % 12;
+    if (ampm === 'PM') h += 12;
+    return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+  }
+  function fmtTime12(hhmm) {
+    const { hour, min, ampm } = time24To12(hhmm);
+    return `${hour}:${String(min).padStart(2, '0')} ${ampm}`;
+  }
+  (function populateTimePicker() {
+    for (let h = 1; h <= 12; h++) {
+      const o = document.createElement('option');
+      o.value = String(h); o.textContent = String(h);
+      schHourIn.appendChild(o);
+    }
+    for (let m = 0; m < 60; m++) {
+      const o = document.createElement('option');
+      o.value = String(m); o.textContent = String(m).padStart(2, '0');
+      schMinIn.appendChild(o);
+    }
+  })();
+  function setTimePicker(hhmm) {
+    const { hour, min, ampm } = time24To12(hhmm);
+    schHourIn.value = String(hour);
+    schMinIn.value = String(min);
+    schAmpmIn.value = ampm;
+  }
+  function getTimePicker() {
+    return time12To24(schHourIn.value, schMinIn.value, schAmpmIn.value);
+  }
 
   let tk = null;          // active project's workspace data
   let isOpen = false;
@@ -38,6 +94,43 @@
   // ---------- running tickets (ephemeral — not persisted) ----------
   // ticketId -> { kind: 'agent'|'pipeline', agentId?, startedAt }
   const tkRun = new Map();
+
+  // ---------- "starting soon" top-right alerts (ephemeral) ----------
+  // ticketId -> the sch.nextRun value already alerted for, so a recurring
+  // schedule re-alerts on its next run instead of just once, ever
+  const tkAlerted = new Map();
+
+  function schedAlertsEl() {
+    let el = document.getElementById('tk-sched-alerts');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'tk-sched-alerts';
+      document.body.appendChild(el);
+    }
+    return el;
+  }
+  function showSchedAlert(t) {
+    const stack = schedAlertsEl();
+    dismissSchedAlert(t.id); // replace, don't stack duplicates for the same ticket
+    const mins = Math.max(1, Math.round((t.schedule.nextRun - Date.now()) / 60000));
+    const card = document.createElement('div');
+    card.className = 'tk-sched-alert';
+    card.dataset.id = t.id;
+    card.innerHTML = `
+      <span class="tk-sched-alert-ico">⏰</span>
+      <div class="tk-sched-alert-body">
+        <div class="tk-sched-alert-title">${esc(t.num || '')} ${esc(t.title)}</div>
+        <div class="tk-sched-alert-sub">starting in ${mins} min</div>
+      </div>
+      <button class="tk-sched-alert-close" title="Dismiss">✕</button>`;
+    card.querySelector('.tk-sched-alert-close').onclick = () => card.remove();
+    stack.appendChild(card);
+    requestAnimationFrame(() => card.classList.add('show'));
+  }
+  function dismissSchedAlert(id) {
+    const el = schedAlertsEl().querySelector(`[data-id="${id}"]`);
+    if (el) el.remove();
+  }
 
   // ---------- storage (per project folder) ----------
   function tkKey() { return 'ticketWs:' + (projectDir || ''); }
@@ -55,6 +148,13 @@
     if (!d || !Array.isArray(d.tickets)) d = freshData();
     if (!Array.isArray(d.statuses) || !d.statuses.length) {
       d.statuses = DEFAULT_STATUSES.map(s => ({ ...s }));
+    }
+    // boards saved before IN REVIEW existed — splice it in ahead of DONE
+    if (!d.statuses.some(s => s.id === 'inreview')) {
+      const doneIdx = d.statuses.findIndex(s => s.id === 'done');
+      const inreview = { id: 'inreview', label: 'IN REVIEW' };
+      if (doneIdx === -1) d.statuses.push(inreview);
+      else d.statuses.splice(doneIdx, 0, inreview);
     }
     return d;
   }
@@ -100,6 +200,99 @@
     return p;
   }
 
+  // first few acceptance-criteria lines, for the card preview — real criteria
+  // only, never padded/fabricated when a ticket has fewer than 3.
+  function acLines(t) {
+    return (t.acceptance || '')
+      .split('\n')
+      .map(l => l.replace(/^[-*]\s*/, '').trim())
+      .filter(Boolean);
+  }
+
+  // ---------- schedule (each ticket runs on its own, independent of the others) ----------
+  function computeNextRun(sch, from) {
+    const base = from || Date.now();
+    if (sch.mode === 'daily') {
+      const [hh, mm] = (sch.time || '09:00').split(':').map(Number);
+      const d = new Date(base);
+      d.setHours(hh || 0, mm || 0, 0, 0);
+      if (d.getTime() <= base) d.setDate(d.getDate() + 1);
+      return d.getTime();
+    }
+    if (sch.mode === 'interval') {
+      const hours = Math.max(1, Number(sch.intervalHours) || 1);
+      return base + hours * 3600000;
+    }
+    if (sch.mode === 'once') {
+      const d = new Date(`${sch.date}T${sch.time || '09:00'}:00`);
+      return isNaN(d.getTime()) ? null : d.getTime();
+    }
+    return null;
+  }
+
+  function schLabel(sch) {
+    if (!sch || !sch.enabled) return '';
+    if (sch.mode === 'daily') return `daily ${fmtTime12(sch.time)}`;
+    if (sch.mode === 'interval') return `every ${sch.intervalHours}h`;
+    if (sch.mode === 'once') return `${sch.date} ${fmtTime12(sch.time)}`;
+    return '';
+  }
+
+  // ms → "m:ss", for the on-card countdown once a schedule is coming up soon
+  function fmtCountdown(ms) {
+    const total = Math.max(0, Math.round(ms / 1000));
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return `${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  // remaining ms until this ticket's schedule fires, or null if not due soon
+  // (used both for the initial render and the 1s ticker that keeps it live)
+  function schedRemaining(sch, now) {
+    if (!sch || !sch.enabled || !sch.nextRun) return null;
+    const remain = sch.nextRun - now;
+    return remain > 0 && remain <= SCHED_TIMER_WINDOW_MS ? remain : null;
+  }
+
+  // checked periodically for the ACTIVE project only — same scoping every
+  // other ticket action already uses (agents/runAgent are bound to whichever
+  // workspace is currently active), so a schedule fires while its own
+  // project is open, exactly like clicking Start would.
+  function tkSchedulerTick() {
+    if (!projectDir) return;
+    if (!tk) tk = tkLoad();
+    if (!tk || !Array.isArray(tk.tickets)) return;
+    const now = Date.now();
+    let dirty = false;
+    for (const t of tk.tickets) {
+      const sch = t.schedule;
+      // "starting soon" heads-up — keyed on nextRun so a recurring (daily/
+      // interval) schedule re-alerts on its NEXT run instead of only once ever
+      if (sch && sch.enabled && sch.nextRun) {
+        const remain = sch.nextRun - now;
+        if (remain > 0 && remain <= SCHED_ALERT_WINDOW_MS) {
+          if (tkAlerted.get(t.id) !== sch.nextRun) {
+            tkAlerted.set(t.id, sch.nextRun);
+            showSchedAlert(t);
+          }
+        } else if (tkAlerted.has(t.id)) {
+          tkAlerted.delete(t.id);
+        }
+      } else {
+        tkAlerted.delete(t.id);
+      }
+      if (!sch || !sch.enabled || !sch.nextRun || sch.nextRun > now) continue;
+      if (!t.agentId || tkRun.has(t.id) || t.status === 'inprogress') continue;
+      dismissSchedAlert(t.id);
+      startTicket(t.id, '');
+      dirty = true;
+      if (sch.mode === 'once') { sch.enabled = false; sch.nextRun = null; }
+      else sch.nextRun = computeNextRun(sch, now);
+    }
+    if (dirty) tkSave();
+  }
+  setInterval(tkSchedulerTick, 20000);
+
   function inProgressStatusId() {
     const s = tk.statuses.find(s => s.id === 'inprogress') || tk.statuses[1] || tk.statuses[0];
     return s.id;
@@ -124,6 +317,10 @@
   // called once a ticket's run is really over (agent 'done', or pipeline end)
   function finishTicketRun(id) {
     if (!tkRun.delete(id)) return;
+    // stamped so the card can keep showing a "done" check-circle instead of
+    // just reverting straight back to START/chat with no trace it ran
+    const t = ticketById(id);
+    if (t) { t.lastFinishedAt = Date.now(); tkSave(); }
     if (isOpen) render();
   }
 
@@ -159,6 +356,9 @@
     const prompt = ticketPrompt(t, message);
 
     const effort = t.effort || 'auto';
+    // set below for model/agent runs so we can jump the console over to it
+    // once it's launched — pipeline runs have no single agent chat to land on
+    let navAgentId = null;
 
     if (target === '__pipeline__') {
       if (typeof pipeFor === 'function' && pipeFor(activeWorkspaceId).active) {
@@ -174,8 +374,17 @@
         if (window.toast) toast(`${MODEL_LABELS[model] || model} is already running`, false);
         return;
       }
+      // re-starting the SAME agent that ran this ticket before anchors back
+      // onto its own session instead of losing prior context
+      const resume = (t.lastAgentId === aid && t.lastSessionId) || null;
       tkRun.set(id, { kind: 'agent', agentId: aid, startedAt: Date.now() });
-      runAgent(aid, prompt, false, false, { effort, onDone: () => onTicketAgentDone(id, aid) });
+      runAgent(aid, prompt, false, false, {
+        effort,
+        resume: resume || undefined,
+        fork: resume ? false : undefined,
+        onDone: () => onTicketAgentDone(id, aid)
+      });
+      navAgentId = aid;
     } else {
       const a = agentById(target);
       if (!a) {
@@ -186,14 +395,28 @@
         if (window.toast) toast(`${a.name} is already running`, false);
         return;
       }
+      const resume = (t.lastAgentId === a.id && t.lastSessionId) || null;
       tkRun.set(id, { kind: 'agent', agentId: a.id, startedAt: Date.now() });
-      runAgent(a.id, prompt, false, false, { effort, onDone: () => onTicketAgentDone(id, a.id) });
+      runAgent(a.id, prompt, false, false, {
+        effort,
+        resume: resume || undefined,
+        fork: resume ? false : undefined,
+        onDone: () => onTicketAgentDone(id, a.id)
+      });
+      navAgentId = a.id;
     }
 
     t.status = inProgressStatusId();
     t.updatedAt = Date.now();
     tkSave();
     render();
+    // a message typed into the card's own chatbox means the operator wants to
+    // watch/continue it live — follow the run into the console right away
+    // instead of leaving them staring at the board
+    if (navAgentId && message && typeof openChat === 'function') openChat(navAgentId);
+    // surface the console immediately so the operator sees the run — closes
+    // the board itself + notes/browser/terminal, matching the chat-start flow
+    if (typeof focusConsoleForTask === 'function') focusConsoleForTask();
   }
 
   function stopTicket(id) {
@@ -230,6 +453,9 @@
         fork: false,
         onDone: () => onTicketAgentDone(id, agentId)
       });
+      // follow the resumed session into the console instead of leaving the
+      // operator parked on the board
+      if (typeof openChat === 'function') openChat(agentId);
     } else {
       if (input) input.value = '';
       startTicket(id, text);
@@ -239,11 +465,28 @@
   // keep running cards' elapsed time + live status ticking without a full
   // board/list re-render (which would tear down drag listeners every second)
   setInterval(() => {
-    if (!isOpen || !tk || !tkRun.size) return;
+    if (!isOpen || !tk) return;
     for (const [id, run] of tkRun) {
       const label = (boardEl.querySelector(`.tk-card-item[data-id="${id}"] .tk-run-label`))
         || (listEl.querySelector(`.tk-row[data-id="${id}"] .tk-run-label`));
       if (label) label.textContent = runLabel(run);
+    }
+    const now = Date.now();
+    for (const t of tk.tickets) {
+      const timerEl = boardEl.querySelector(`.tk-card-item[data-id="${t.id}"] .tk-sched-timer`)
+        || listEl.querySelector(`.tk-row[data-id="${t.id}"] .tk-sched-timer`);
+      if (!timerEl) continue;
+      const remain = schedRemaining(t.schedule, now);
+      timerEl.classList.toggle('hidden', remain === null);
+      if (remain !== null) {
+        const cd = timerEl.querySelector('.tk-sched-countdown');
+        if (cd) cd.textContent = `starts in ${fmtCountdown(remain)}`;
+      }
+      if (!tkRun.has(t.id) && t.lastFinishedAt) {
+        const doneLabel = (boardEl.querySelector(`.tk-card-item[data-id="${t.id}"] .tk-done-label`))
+          || (listEl.querySelector(`.tk-row[data-id="${t.id}"] .tk-done-label`));
+        if (doneLabel) doneLabel.textContent = `done ${timeAgo(t.lastFinishedAt)}`;
+      }
     }
   }, 1000);
 
@@ -282,6 +525,7 @@
   // mode, not per-project state, so a switch always leaves it (no-op if
   // it was already closed)
   window.tkProjectChanged = () => {
+    tk = null;   // reload fresh for whichever project is active now (scheduler included)
     if (!isOpen) return;
     closeTk();
   };
@@ -328,6 +572,38 @@
     return bits.join('');
   }
 
+  // statuses that have actually run something worth tracing back to
+  const SESSION_VISIBLE_STATUSES = ['inprogress', 'inreview', 'done'];
+
+  // short session-id badge — only once a run has actually stamped one, and
+  // only past TODO (nothing to resume before a ticket has ever started)
+  function sessionIdChip(t) {
+    if (!t.lastSessionId || !SESSION_VISIBLE_STATUSES.includes(t.status)) return '';
+    return `<span class="tk-chip tk-chip-sid" title="session ${esc(t.lastSessionId)}">
+      ${esc(t.lastSessionId.slice(0, 8))}
+    </span>`;
+  }
+
+  // schedule chip, rendered on its OWN row below the ticket number — kept
+  // separate from cardMeta() so it never gets crowded out by agent/attachment
+  // chips sharing the top row
+  function schChip(t) {
+    const sl = schLabel(t.schedule);
+    if (!sl) return '';
+    return `<span class="tk-chip tk-chip-sched"><span class="tk-chip-ico">⏰</span>${esc(sl)}</span>`;
+  }
+
+  // relative time since a ticket last finished running, for the "done" badge
+  function timeAgo(ms) {
+    const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+    if (s < 60) return 'just now';
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+  }
+
   function renderBoard() {
     boardEl.innerHTML = '';
     for (const st of tk.statuses) {
@@ -367,6 +643,12 @@
     const isDone = t.status === 'done';
     const showChat = !run && !!t.agentId && inProg;
     const showStart = !run && !!t.agentId && !inProg && !isDone;
+    // once a run finishes it stays marked "done" (check-circle) instead of
+    // silently disappearing back to START/chat with no trace it ever ran
+    const justFinished = !run && !!t.lastFinishedAt;
+    const criteria = acLines(t);
+    const schRemain = schedRemaining(t.schedule, Date.now());
+    const sched = schChip(t);
     el.className = 'tk-card-item' + (run ? ' tk-running' : '');
     el.draggable = true;
     el.dataset.id = t.id;
@@ -376,11 +658,25 @@
         <span class="tk-num">${esc(t.num || '')}</span>
         <span class="tk-card-chips">${cardMeta(t)}</span>
       </div>
+      ${sched ? `<div class="tk-card-sched-row">${sched}</div>` : ''}
       <div class="tk-card-title">${esc(t.title)}</div>
+      <div class="tk-sched-timer ${schRemain === null ? 'hidden' : ''}">
+        <span class="tk-sched-ico">⏰</span><span class="tk-sched-countdown"></span>
+      </div>
+      ${criteria.length ? `
+      <div class="tk-card-criteria">
+        ${criteria.slice(0, 3).map(c => `<div class="tk-cr-line">☐ ${esc(c)}</div>`).join('')}
+        ${criteria.length > 3 ? `<div class="tk-cr-more">+${criteria.length - 3} more</div>` : ''}
+      </div>` : ''}
+      ${sessionIdChip(t) ? `<div class="tk-card-sid-row">${sessionIdChip(t)}</div>` : ''}
       <div class="tk-card-run ${run ? '' : 'hidden'}">
         <span class="think-dots"><i></i><i></i><i></i></span>
         <span class="tk-run-label"></span>
         <button class="tk-run-stop" title="Stop">■</button>
+      </div>
+      <div class="tk-card-done ${justFinished ? '' : 'hidden'}">
+        <span class="tk-done-ico">✓</span>
+        <span class="tk-done-label"></span>
       </div>
       <div class="tk-card-chat ${showChat ? '' : 'hidden'}">
         <input class="tk-chat-input" placeholder="${everRun ? 'Follow up…' : 'Start with a message…'}" />
@@ -390,6 +686,10 @@
         <button class="tk-start-btn" title="Start this task">▶ START</button>
       </div>`;
     if (run) el.querySelector('.tk-run-label').textContent = runLabel(run);
+    if (justFinished) el.querySelector('.tk-done-label').textContent = `done ${timeAgo(t.lastFinishedAt)}`;
+    if (schRemain !== null) {
+      el.querySelector('.tk-sched-countdown').textContent = `starts in ${fmtCountdown(schRemain)}`;
+    }
     el.querySelector('.tk-run-stop').onclick = (e) => { e.stopPropagation(); stopTicket(t.id); };
     if (showChat) {
       const chatInput = el.querySelector('.tk-chat-input');
@@ -472,6 +772,9 @@
       const showChat = !run && !!t.agentId && inProg;
       const showStart = !run && !!t.agentId && !inProg && !isDone;
       const desc = (t.description || '').trim();
+      const schRemain = schedRemaining(t.schedule, Date.now());
+      const sched = schChip(t);
+      const justFinished = !run && !!t.lastFinishedAt;
       const row = document.createElement('div');
       row.className = 'tk-row' + (run ? ' tk-running' : '');
       row.dataset.id = t.id;
@@ -479,14 +782,20 @@
         <span class="tk-cell-num">${esc(t.num || '')}</span>
         <span class="tk-cell-title">
           <span class="tk-cell-title-text">${esc(t.title)}</span>
+          ${sched ? `<span class="tk-cell-sched-row">${sched}</span>` : ''}
           ${desc ? `<span class="tk-cell-desc">${esc(desc)}</span>` : ''}
+          <span class="tk-sched-timer ${schRemain === null ? 'hidden' : ''}">
+            <span class="tk-sched-ico">⏰</span><span class="tk-sched-countdown"></span>
+          </span>
         </span>
         <span class="tk-cell-status">
           <span class="tk-status-pill ${esc(t.status)}">${esc(st.label)}</span>
         </span>
         <span class="tk-cell-agent">${run
           ? `<span class="think-dots"><i></i><i></i><i></i></span> <span class="tk-run-label"></span>`
-          : esc(agentLabel(t) || '—')}</span>
+          : `${esc(agentLabel(t) || '—')}${sessionIdChip(t)}${justFinished
+              ? '<span class="tk-cell-done"><span class="tk-done-ico">✓</span><span class="tk-done-label"></span></span>'
+              : ''}`}</span>
         <span class="tk-cell-actions">
           ${showStart
             ? '<button class="tk-start-btn" title="Start this task">▶ START</button>'
@@ -499,6 +808,10 @@
           ` : ''}
         </span>`;
       if (run) row.querySelector('.tk-run-label').textContent = runLabel(run);
+      if (justFinished) row.querySelector('.tk-done-label').textContent = timeAgo(t.lastFinishedAt);
+      if (schRemain !== null) {
+        row.querySelector('.tk-sched-countdown').textContent = `starts in ${fmtCountdown(schRemain)}`;
+      }
       if (showStart) {
         row.querySelector('.tk-start-btn').onclick = (e) => {
           e.stopPropagation();
@@ -595,15 +908,51 @@
     }
     draftAtt = t ? (t.attachments || []).map(a => ({ ...a })) : [];
     renderDraftAtt();
+    const sch = (t && t.schedule) || null;
+    schModeSel.value = sch ? sch.mode : 'off';
+    schDateIn.value = (sch && sch.date) || '';
+    setTimePicker((sch && sch.time) || '09:00');
+    schIntervalIn.value = (sch && sch.intervalHours) || '';
+    showSchFields(schModeSel.value);
     document.getElementById('tk-f-del').classList.toggle('hidden', !t);
+    document.getElementById('tk-f-gosession').classList.toggle(
+      'hidden', !(t && t.lastAgentId && t.lastSessionId)
+    );
     modal.classList.remove('hidden');
     document.getElementById('tk-f-title').focus();
+  }
+  // jump straight to that ticket's last conversation in the console — same
+  // per-agent dock the roster card click opens (openChat, app.js), so
+  // resuming here and resuming via the roster land in the same place
+  document.getElementById('tk-f-gosession').onclick = () => {
+    const t = editingId ? ticketById(editingId) : null;
+    if (!t || !t.lastAgentId) return;
+    closeModal();
+    goToTicketSession(t);
+  };
+
+  // jump to a ticket's console view, replaying its stored transcript when the
+  // feed has nothing live for that agent (openChatSession handles the backfill;
+  // falls back to plain openChat if app.js hasn't defined it)
+  function goToTicketSession(t) {
+    if (typeof openChatSession === 'function') {
+      openChatSession(t.lastAgentId, t.lastSessionId || null);
+    } else if (typeof openChat === 'function') {
+      openChat(t.lastAgentId);
+    }
   }
   function closeModal() {
     modal.classList.add('hidden');
     editingId = null;
     draftAtt = [];
   }
+
+  function showSchFields(mode) {
+    schDateWrap.classList.toggle('hidden', mode !== 'once');
+    schTimeWrap.classList.toggle('hidden', mode !== 'once' && mode !== 'daily');
+    schIntervalWrap.classList.toggle('hidden', mode !== 'interval');
+  }
+  schModeSel.onchange = () => showSchFields(schModeSel.value);
 
   document.getElementById('tk-f-cancel').onclick = closeModal;
   document.addEventListener('keydown', (e) => {
@@ -662,6 +1011,38 @@
     const agentId = document.getElementById('tk-f-agent').value || null;
     const ag = agentById(agentId);
     const efSel = document.getElementById('tk-f-effort');
+    const schMode = schModeSel.value;
+    let schedule = null;
+    if (schMode !== 'off') {
+      if (!agentId) {
+        if (window.toast) toast('Pick RUN WITH before scheduling this ticket', false);
+        return;
+      }
+      if (schMode === 'once' && !schDateIn.value) {
+        if (window.toast) toast('Pick a date for the one-time schedule', false);
+        return;
+      }
+      if (schMode === 'interval' && !(Number(schIntervalIn.value) > 0)) {
+        if (window.toast) toast('Pick how many hours between runs', false);
+        return;
+      }
+      schedule = {
+        enabled: true, mode: schMode,
+        date: schDateIn.value || null,
+        time: getTimePicker(),
+        intervalHours: Number(schIntervalIn.value) || null
+      };
+      schedule.nextRun = computeNextRun(schedule, Date.now());
+      // a one-time schedule for a moment that's already gone by would fire
+      // the instant it's saved — same trap as the AM/PM mixup, so block it
+      // outright instead of silently running the task right away
+      if (schMode === 'once' && schedule.nextRun !== null && schedule.nextRun <= Date.now()) {
+        if (window.toast) {
+          toast(`That's already passed — ${schDateIn.value} ${fmtTime12(schedule.time)} is in the past`, false);
+        }
+        return;
+      }
+    }
     const fields = {
       title,
       acceptance: acField.value,
@@ -670,6 +1051,7 @@
       agentName: ag ? ag.name : null,   // survives roster changes
       effort: (efSel && efSel.value) || 'auto',
       attachments: draftAtt,
+      schedule,
       updatedAt: Date.now()
     };
     if (editingId) {

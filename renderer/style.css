@@ -929,6 +929,21 @@ body {
   margin: 0; padding: 0 20px; overflow-y: auto;
   position: relative;
 }
+
+/* Centered reading column — feed rows, diff cards and the per-agent dock are
+   wrapped to a ~70% width and centered so the content reads as one column
+   instead of stretching edge to edge. #console-head is the full-width
+   toolbar (title/chips/account bar) and must stay excluded — its
+   .head-spacer relies on the header spanning the whole console width to
+   push controls to the right edge. */
+:root { --console-col: 70%; --console-col-max: 1080px; }
+#agent-dock,
+#console-feed > *:not(.feed-empty) {
+  width: var(--console-col);
+  max-width: var(--console-col-max);
+  margin-left: auto;
+  margin-right: auto;
+}
 #console-feed .ev { padding: 1px 0; }
 #console-feed .tag {
   flex: none; width: 130px; text-align: right;
@@ -2464,6 +2479,39 @@ textarea.dropping { border-color: var(--accent) !important; background: var(--ac
 #toast.hide { opacity: 0; transform: translateX(-50%) translateY(-8px); }
 .btn-working { opacity: .75; cursor: wait !important; }
 
+/* scheduled-ticket "starting soon" alerts — top-right stack, separate from
+   the centered #toast since these can pop up unprompted while the user is
+   doing something else entirely and shouldn't cover the main toast lane */
+#tk-sched-alerts {
+  position: fixed; top: 18px; right: 18px; z-index: 501;
+  display: flex; flex-direction: column; gap: 8px;
+  max-width: 300px; pointer-events: none;
+}
+.tk-sched-alert {
+  display: flex; align-items: flex-start; gap: 9px;
+  background: var(--warn-weak); border: 1px solid var(--warn-line);
+  border-radius: 10px; padding: 10px 12px;
+  box-shadow: var(--shadow); pointer-events: auto;
+  opacity: 0; transform: translateX(16px);
+  transition: opacity .2s, transform .2s;
+}
+.tk-sched-alert.show { opacity: 1; transform: translateX(0); }
+.tk-sched-alert-ico { flex: none; font-size: 14px; line-height: 1.3; }
+.tk-sched-alert-body { flex: 1; min-width: 0; }
+.tk-sched-alert-title {
+  font-size: 11.5px; font-weight: 600; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tk-sched-alert-sub {
+  font-size: 10px; color: var(--warn); font-family: var(--mono); margin-top: 2px;
+}
+.tk-sched-alert-close {
+  flex: none; font-size: 10px; cursor: pointer; line-height: 1;
+  background: transparent; color: var(--fg-dim);
+  border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px;
+}
+.tk-sched-alert-close:hover { background: var(--err-weak); color: var(--red); border-color: var(--err-line); }
+
 /* commit flow modal */
 .cmt-card { width: 760px; max-height: 90vh; display: flex; flex-direction: column; }
 .cmt-steps { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
@@ -3157,6 +3205,7 @@ body.panel-fullscreen .ws-rail { display: none; }
 .tk-col-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .tk-col-dot.todo { background: var(--fg-dim); }
 .tk-col-dot.inprogress { background: var(--accent); }
+.tk-col-dot.inreview { background: var(--warn); }
 .tk-col-dot.done { background: var(--ok); }
 .tk-col-label { color: var(--fg); }
 .tk-col-count {
@@ -3178,7 +3227,8 @@ body.panel-fullscreen .ws-rail { display: none; }
   background: var(--surface-2); border: 1px solid var(--border);
   border-left: 3px solid var(--border); border-radius: 10px; padding: 11px 12px;
   cursor: grab; transition: transform .15s ease, border-color .15s, box-shadow .15s;
-  display: flex; flex-direction: column; gap: 5px; min-height: 112px; overflow: hidden;
+  display: flex; flex-direction: column; gap: 5px; min-height: 130px; overflow: hidden;
+  flex: none;
 }
 .tk-card-item:hover {
   border-color: var(--border-hi); transform: translateY(-1px);
@@ -3186,6 +3236,7 @@ body.panel-fullscreen .ws-rail { display: none; }
 }
 .tk-card-item[data-status="todo"] { border-left-color: var(--fg-dim); }
 .tk-card-item[data-status="inprogress"] { border-left-color: var(--accent); }
+.tk-card-item[data-status="inreview"] { border-left-color: var(--warn); }
 .tk-card-item[data-status="done"] { border-left-color: var(--ok); }
 .tk-card-item.dragging { opacity: 0.35; cursor: grabbing; }
 .tk-card-item.tk-pop { animation: tk-pop .25s ease; }
@@ -3207,11 +3258,41 @@ body.panel-fullscreen .ws-rail { display: none; }
   max-width: 130px; overflow: hidden; text-overflow: ellipsis;
 }
 .tk-chip-agent { color: var(--accent); border-color: var(--accent-line); }
+.tk-card-sid-row { display: flex; margin: -2px 0 2px; }
+.tk-chip-sid {
+  font-family: var(--mono); color: var(--fg-dim); background: var(--surface-2, transparent);
+}
+.tk-cell-agent .tk-chip-sid { margin-left: 6px; }
+/* schedule chip gets its own row, right below the ticket number */
+.tk-card-sched-row { display: flex; margin: -2px 0 2px; }
+.tk-chip-sched {
+  display: inline-flex; align-items: center; gap: 4px;
+  color: var(--warn); border-color: var(--warn-line); background: var(--warn-weak);
+  max-width: none;
+}
+.tk-chip-ico { font-size: 9px; }
 .tk-card-title {
   font-size: 12.5px; font-weight: 600; color: var(--fg); line-height: 1.4;
   overflow-wrap: anywhere;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   overflow: hidden;
+}
+.tk-card-criteria {
+  display: flex; flex-direction: column; gap: 2px; margin: 1px 0 2px;
+}
+.tk-cr-line {
+  font-size: 10.5px; color: var(--fg-dim); line-height: 1.35;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tk-cr-more {
+  font-size: 9.5px; color: var(--fg-dim); opacity: 0.7;
+}
+/* countdown shown once a scheduled ticket is about to fire */
+.tk-sched-timer {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 10px; font-family: var(--mono); color: var(--warn);
+  background: var(--warn-weak); border: 1px solid var(--warn-line);
+  border-radius: 6px; padding: 3px 7px; flex: none;
 }
 /* card while its task is actively running */
 .tk-card-item.tk-running {
@@ -3230,6 +3311,23 @@ body.panel-fullscreen .ws-rail { display: none; }
   border: 1px solid var(--err-line); border-radius: 6px; padding: 3px 6px;
 }
 .tk-run-stop:hover { background: var(--red); color: var(--surface); }
+/* persists after a run finishes — a trace that it ran, instead of the card
+   just reverting straight back to START/chat */
+.tk-card-done {
+  margin-top: auto; display: flex; align-items: center; gap: 6px;
+  font-size: 10px; color: var(--ok); flex: none;
+}
+.tk-done-ico {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; border-radius: 50%; flex: none;
+  background: var(--ok-weak); border: 1px solid var(--ok-line);
+  font-size: 9px; line-height: 1;
+}
+.tk-cell-done {
+  display: inline-flex; align-items: center; gap: 4px;
+  margin-left: 8px; color: var(--ok); font-size: 10px;
+}
+.tk-cell-done .tk-done-ico { width: 13px; height: 13px; }
 .tk-card-chat {
   margin-top: auto; display: flex; align-items: center; gap: 6px; flex: none;
 }
@@ -3245,11 +3343,11 @@ body.panel-fullscreen .ws-rail { display: none; }
   border: 1px solid var(--accent-line); border-radius: 6px; padding: 4px 7px;
 }
 .tk-chat-send:hover { background: var(--accent); color: var(--surface); }
-.tk-card-start { margin-top: auto; flex: none; }
+.tk-card-start { margin-top: auto; flex: none; display: flex; justify-content: flex-end; }
 .tk-start-btn {
-  width: 100%; font-size: 11px; cursor: pointer; line-height: 1;
+  width: auto; font-size: 10.5px; cursor: pointer; line-height: 1;
   background: var(--accent-weak); color: var(--accent);
-  border: 1px solid var(--accent-line); border-radius: 6px; padding: 5px 7px;
+  border: 1px solid var(--accent-line); border-radius: 6px; padding: 4px 10px;
   font-family: var(--sans);
 }
 .tk-start-btn:hover { background: var(--accent); color: var(--surface); }
@@ -3285,6 +3383,8 @@ body.panel-fullscreen .ws-rail { display: none; }
   font-size: 10.5px; color: var(--fg-dim);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.tk-cell-sched-row { display: flex; }
+.tk-cell-sched-row .tk-chip-sched { font-size: 9.5px; }
 .tk-cell-agent {
   font-size: 11px; color: var(--fg-dim);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -3308,6 +3408,9 @@ body.panel-fullscreen .ws-rail { display: none; }
   color: var(--accent); background: var(--accent-weak);
   border: 1px solid var(--accent-line);
 }
+.tk-status-pill.inreview {
+  color: var(--warn); background: var(--warn-weak); border: 1px solid var(--warn-line);
+}
 .tk-status-pill.done {
   color: var(--ok); background: var(--ok-weak); border: 1px solid var(--ok-line);
 }
@@ -3318,6 +3421,16 @@ body.panel-fullscreen .ws-rail { display: none; }
 /* ---- ticket editor modal ---- */
 .tk-card { width: min(680px, 94vw); max-height: 92vh; overflow-y: auto; }
 .tk-modal-actions { align-items: center; }
+.tk-sched-time-group { flex: none; }
+.tk-time-picker {
+  display: flex; align-items: center; gap: 4px; height: 100%;
+}
+.tk-time-picker select#tk-f-sched-hour,
+.tk-time-picker select#tk-f-sched-min { width: 54px; text-align: center; }
+.tk-time-picker select#tk-f-sched-ampm {
+  width: 78px; text-align: center; padding-left: 8px; padding-right: 8px;
+}
+.tk-time-colon { color: var(--fg-dim); font-family: var(--mono); }
 /* positioning anchor for the @ mention / slash menus over the criteria field.
    .modal-card is a flex column that stretches its DIRECT children to full
    width — nesting the textarea one level deeper inside this wrapper opts it

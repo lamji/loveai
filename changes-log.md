@@ -575,3 +575,24 @@
   renderer changed → manual app restart required (see [[rerun-app-after-changes]])
   to verify: follow-up continues same 8-char session id (no stale line);
   New Session resets mid-run and when a rt[id].running flag is wedged.
+
+## task-01-rag-line-accuracy — Fix wrong "no vector index" RAG line (2026-07-22)
+- **Why**: `vectors-worker.js` serializes build/sync/query on one thread. While
+  Project B's vector build occupies it, a Project A `vectorQuery` queues behind
+  it and blows the renderer's 8s timeout → `vq === null`, which the old code
+  treated as "no index" even though A's `vectors.json` exists on disk — false
+  diagnosis that loops the user into an unnecessary rebuild.
+- **renderer/app.js** (runAgent RAG block, ~1331-1348): split the old catch-all
+  `else` into two real states. `vq && vq.indexed` (no embedErr) now reads
+  "vector index built · 0 semantic matches for this query — lexical only"
+  instead of "no vector index". The true fallback (`vq` null or `!vq.indexed`)
+  calls `window.deck.vectorStatus(cwd)` (main-thread IPC, not blocked by the
+  busy worker; wrapped in try/catch) — if it reports `exists: true`, prints
+  "vector index exists but the query didn't return (another build may be
+  running) — lexical for now"; only when the index is genuinely absent does it
+  keep the original "no vector index for this project yet" wording.
+- **Untouched**: main.js, vectors.js, vectors-worker.js, preload.js, the 8000ms
+  timeout, the vectorQuery k argument, the status-bar progress bar (task-02).
+- **Status**: ✅ Complete — `node --check renderer/app.js` passes. Renderer-only
+  → hot-reloads via Ctrl+R, no app restart needed. Manual verification still
+  pending (needs two projects, one mid-build, to exercise the timeout path).
