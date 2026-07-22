@@ -124,6 +124,7 @@
     if (window.tkIsOpen && window.tkIsOpen() && window.closeTicketWs) {
       window.closeTicketWs();
     }
+    if (window.closeBrowserView) window.closeBrowserView();
     docDir = projectDir;
     store = notesLoad();
     note = null;

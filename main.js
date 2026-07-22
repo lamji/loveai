@@ -1,4 +1,5 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, session } =
+  require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -80,14 +81,38 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      webviewTag: true
     }
   });
   win.loadFile('renderer/index.html');
 }
 
+// Google (and Microsoft/other) OAuth sign-in rejects Electron's default user
+// agent (it contains "Electron/…") as an insecure/embedded browser — the
+// "This browser or app may not be secure" wall. Present the sandbox browser as
+// plain desktop Chrome by stripping the Electron + app tokens from the UA for
+// the whole persist:sandbox partition. Session-level covers EVERY request in
+// that session (OAuth popup windows, iframes, XHRs) — the per-<webview>
+// `useragent` attribute only reliably covers the top document, so popups the
+// Google flow opens could still leak the Electron UA. Doing both is belt +
+// suspenders and yields the same string for every site, not just Atlassian.
+function configureSandboxSession() {
+  try {
+    const base = session.defaultSession.getUserAgent();
+    const chromeUa = base
+      .replace(/\s?(agent-deck|LoveAi)\/\S+/gi, '')
+      .replace(/\s?Electron\/\S+/gi, '')
+      .trim();
+    session.fromPartition('persist:sandbox').setUserAgent(chromeUa);
+  } catch (e) {
+    console.error('sandbox UA setup failed', e);
+  }
+}
+
 app.whenReady().then(() => {
   saas.init(send);
+  configureSandboxSession();
   createWindow();
   // cold start via the protocol link (app wasn't running): URL is in OUR argv
   const url = deepLinkIn(process.argv);
@@ -184,6 +209,56 @@ function send(channel, payload) {
 ipcMain.handle('open-external', (_e, url) => {
   if (/^https?:\/\//i.test(String(url))) shell.openExternal(url);
   return true;
+});
+
+// OAuth providers we allow into a native shared-session window. Exact hostname
+// match only. Keep small + extend deliberately (mirror in browser.js isAuthUrl).
+const AUTH_HOSTS = new Set([
+  'accounts.google.com', 'accounts.youtube.com', 'oauth.googleusercontent.com',
+  'login.microsoftonline.com', 'login.live.com', 'appleid.apple.com',
+]);
+function isAuthHost(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:' && AUTH_HOSTS.has(u.hostname);
+  } catch { return false; }
+}
+// Shared-session webPreferences for the auth window + any nested popup: same
+// persist:sandbox partition so cookies land where the <webview> can see them,
+// NO preload so the auth page can't reach the app/node.
+const AUTH_WEBPREFS = {
+  partition: 'persist:sandbox',
+  contextIsolation: true, nodeIntegration: false, sandbox: true,
+};
+
+// "Sign in with Google" popups need a REAL desktop-Chrome window (Google
+// rejects embedded webviews). We share persist:sandbox so the session cookie
+// it sets is visible to the sandbox <webview> after the window closes.
+ipcMain.handle('open-auth-window', (_e, { url, returnOrigin } = {}) => {
+  if (!isAuthHost(url)) return { ok: false };
+  return new Promise(resolve => {
+    try {
+      const w = new BrowserWindow({
+        parent: win, width: 520, height: 680,
+        autoHideMenuBar: true, title: 'Sign in',
+        webPreferences: AUTH_WEBPREFS,
+      });
+      // Nested auth popups (Google sometimes chains them) also share the jar.
+      w.webContents.setWindowOpenHandler(({ url: u }) => {
+        if (!/^https:\/\//i.test(String(u))) return { action: 'deny' };
+        return { action: 'allow',
+          overrideBrowserWindowOptions: { webPreferences: AUTH_WEBPREFS } };
+      });
+      const backToSite = target => {
+        try { if (returnOrigin && new URL(target).origin === returnOrigin) w.close(); }
+        catch {}
+      };
+      w.webContents.on('did-navigate', (_ev, u) => backToSite(u));
+      w.webContents.on('did-navigate-in-page', (_ev, u) => backToSite(u));
+      w.on('closed', () => resolve({ ok: true }));
+      w.loadURL(url);
+    } catch (error) { resolve({ ok: false, error: String(error) }); }
+  });
 });
 
 // clipboard lives in the main process — a sandboxed preload can't touch it directly
@@ -1681,7 +1756,8 @@ ipcMain.handle('symbol-ensure', async (_e, cwd) => {
   try {
     const existed = !!readJson(path.join(indexDir(cwd), 'symbols.json'));
     const idx = await loadOrBuildIndex(cwd);
-    ensureGraph(cwd).catch(() => {});   // build the code graph in the background too
+    // build the code graph in the background too, then bootstrap vectors off it
+    ensureGraph(cwd).then((g) => maybeBootstrapVectors(cwd, g)).catch(() => {});
     return { ok: true, cached: existed, files: Object.keys(idx.files).length };
   } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
 });
@@ -1692,7 +1768,8 @@ ipcMain.handle('symbol-watch', async (_e, cwd) => {
   try {
     if (symbolWatchers[cwd]) return { ok: true, already: true };
     await loadOrBuildIndex(cwd);
-    ensureGraph(cwd).catch(() => {});   // keep the code graph warm for this project
+    // keep the code graph warm for this project, then bootstrap vectors off it
+    ensureGraph(cwd).then((g) => maybeBootstrapVectors(cwd, g)).catch(() => {});
     const state = { timer: null, pending: new Set() };
     const flush = async () => {
       const idx = symbolCache[cwd]; if (!idx) { state.pending.clear(); return; }
@@ -1805,9 +1882,27 @@ ipcMain.handle('codegraph-status', (_e, cwd) => {
 let _vecWorker = null;
 const _vecReqs = new Map();
 let _vecReqId = 0;
+// Absolute dir of the bundled embedding model. In the packaged app the model
+// ships as extraResources (resources/local_cache/...) on real disk — it can't
+// live inside app.asar because onnxruntime reads the .onnx via native code, not
+// Electron's asar-patched fs. In dev it sits next to the source.
+function embedModelDir() {
+  const rel = ['local_cache', 'fast-bge-small-en-v1.5'];
+  const packaged = process.resourcesPath
+    ? path.join(process.resourcesPath, ...rel) : '';
+  const dev = path.join(__dirname, ...rel);
+  try {
+    if (packaged && fs.existsSync(path.join(packaged, 'model_optimized.onnx'))) {
+      return packaged;
+    }
+  } catch {}
+  return dev;
+}
+
 function vecWorker() {
   if (_vecWorker) return _vecWorker;
-  const w = new Worker(path.join(__dirname, 'vectors-worker.js'));
+  const w = new Worker(path.join(__dirname, 'vectors-worker.js'),
+    { workerData: { modelDir: embedModelDir() } });
   w.on('message', (m) => {
     const req = _vecReqs.get(m.id);
     if (!req) return;
@@ -1850,6 +1945,18 @@ function buildVectorsBg(cwd, graph) {
       send('vector-updated', { cwd, count: (m && m.count) || 0, ok: !!(m && m.ok), error: m && m.error });
     })
     .finally(() => { delete vectorBuilding[cwd]; });
+}
+
+// auto-bootstrap: RAG stayed lexical-only forever unless a user manually clicked
+// "build graph" — kick a first-time vector build once a graph is available on open.
+// No-op once an index exists (watch-sync keeps it fresh) or while one is building.
+function maybeBootstrapVectors(cwd, graph) {
+  try {
+    if (!cwd || !graph || !graph.defs || !graph.defs.length) return;
+    if (V.hasVectorIndex(indexDir(cwd))) return;
+    if (vectorBuilding[cwd]) return;
+    buildVectorsBg(cwd, graph);
+  } catch {}
 }
 
 ipcMain.handle('codegraph-build', async (_e, cwd) => {
@@ -1985,7 +2092,12 @@ ipcMain.handle('vector-query', async (_e, { cwd, query: q, k }) => {
     // query runs in the persistent worker — never loads the model on the main
     // thread. hits === null means the index isn't built yet (vs. built-but-no-match).
     const m = await runVectorJob(cwd, { job: 'query', dir: indexDir(cwd), query: q, k: k || 30 });
-    return { ok: !!m.ok, ready: Array.isArray(m.hits), hits: Array.isArray(m.hits) ? m.hits : [] };
+    return {
+      ok: !!m.ok, ready: Array.isArray(m.hits),
+      hits: Array.isArray(m.hits) ? m.hits : [],
+      // when hits are absent, these say WHY: index on disk? embedder error?
+      indexed: !!m.indexed, embedErr: m.embedErr || '',
+    };
   } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e), hits: [] }; }
 });
 
@@ -2594,8 +2706,10 @@ ipcMain.handle('sessions-list', () => {
   return top;
 });
 
-// full transcript of one stored session — used when the operator resumes it
-ipcMain.handle('session-load', (_e, sessionId) => {
+// full transcript of one stored session, read back from ~/.claude/projects/*/<id>.jsonl —
+// used both when the operator resumes a session and when a stale resume needs its
+// context reconstructed (see readSessionTranscript below)
+function readSessionTranscript(sessionId, limit = 80) {
   const msgs = [];
   try {
     if (!/^[\w-]+$/.test(String(sessionId))) return msgs;
@@ -2626,8 +2740,10 @@ ipcMain.handle('session-load', (_e, sessionId) => {
     }
   } catch {}
   // a long session would flood the console — keep the most recent exchanges
-  return msgs.slice(-80);
-});
+  return msgs.slice(-limit);
+}
+
+ipcMain.handle('session-load', (_e, sessionId) => readSessionTranscript(sessionId, 80));
 
 // ===== Git integration (VS Code-style source control) =====
 // Every app-issued git command for a repo runs through a per-repo queue, so the
@@ -3362,16 +3478,38 @@ ipcMain.handle('agent-run', async (_e, cfg) => {
   if (Array.isArray(cfg.addDirs) && cfg.addDirs.length) options.additionalDirectories = cfg.addDirs;
   if (cfg.resumeSessionId) {
     options.resume = cfg.resumeSessionId;
+    // force the run cwd to the session's home so its project slug matches and the
+    // CLI can find the id — only when a real stored cwd came through. Fresh-retry
+    // paths delete cfg.resume, so they keep the original options.cwd.
+    if (typeof cfg.resumeCwd === 'string' && cfg.resumeCwd) options.cwd = cfg.resumeCwd;
     if (cfg.forkSession) options.forkSession = true;
   }
 
   const isMissingSession = (s) => /no conversation found with session id/i.test(String(s || ''));
 
+  // when a resume points at a dead session, rebuild the fresh-retry prompt from the
+  // dead session's transcript so the follow-up doesn't answer cold
+  const STALE_PREAMBLE_CAP = 12000;
+  function buildStalePrompt() {
+    const prior = cfg.resumeSessionId ? readSessionTranscript(cfg.resumeSessionId, 40) : [];
+    if (!prior.length) return { prompt: cfg.prompt, restored: false };
+    const ROLE_PREFIX = { user: 'YOU:', assistant: 'ASSISTANT:', tool: 'TOOL:' };
+    const lines = prior.map(m => `${ROLE_PREFIX[m.role] || 'TOOL:'} ${m.text}`);
+    let body = lines.join('\n');
+    while (body.length > STALE_PREAMBLE_CAP && lines.length > 1) {
+      lines.shift();
+      body = lines.join('\n');
+    }
+    const preamble = 'Prior conversation context (the stored session could not be ' +
+      'resumed — continue as if it is intact):\n' + body;
+    return { prompt: preamble + '\n\n---\n\nCurrent request:\n' + cfg.prompt, restored: true };
+  }
+
   // one pass over the SDK stream. Returns {missingSession, errored} so the caller
   // can retry from scratch when a resume points at a session that no longer exists.
-  async function runOnce(opts, forwardEvents) {
+  async function runOnce(opts, forwardEvents, promptOverride) {
     let missingSession = false, errored = false;
-    for await (const msg of query({ prompt: cfg.prompt, options: opts })) {
+    for await (const msg of query({ prompt: promptOverride || cfg.prompt, options: opts })) {
       if (msg.type === 'system' && msg.subtype === 'init') {
         if (forwardEvents) send('agent-event', { runId: cfg.runId, agentId: cfg.agentId, kind: 'init', sessionId: msg.session_id, model: msg.model });
       } else if (msg.type === 'stream_event') {
@@ -3421,23 +3559,31 @@ ipcMain.handle('agent-run', async (_e, cfg) => {
       let res = await runOnce(options, true);
       if (res.missingSession) {
         // the stored session ID is dead — drop it and start clean, once
-        send('agent-event', { runId: cfg.runId, agentId: cfg.agentId, kind: 'session-invalid', sessionId: cfg.resumeSessionId });
+        const fp = buildStalePrompt();
+        send('agent-event', {
+          runId: cfg.runId, agentId: cfg.agentId, kind: 'session-invalid',
+          sessionId: cfg.resumeSessionId, restored: fp.restored
+        });
         const fresh = { ...options };
         delete fresh.resume;
         delete fresh.forkSession;
-        await runOnce(fresh, true);
+        await runOnce(fresh, true, fp.prompt);
       }
     } catch (err) {
       const aborted = abortController.signal.aborted;
       const msg = String(err && err.message ? err.message : err);
       // same recovery when the SDK throws instead of returning a result
       if (!aborted && cfg.resumeSessionId && isMissingSession(msg)) {
-        send('agent-event', { runId: cfg.runId, agentId: cfg.agentId, kind: 'session-invalid', sessionId: cfg.resumeSessionId });
+        const fp = buildStalePrompt();
+        send('agent-event', {
+          runId: cfg.runId, agentId: cfg.agentId, kind: 'session-invalid',
+          sessionId: cfg.resumeSessionId, restored: fp.restored
+        });
         try {
           const fresh = { ...options };
           delete fresh.resume;
           delete fresh.forkSession;
-          await runOnce(fresh, true);
+          await runOnce(fresh, true, fp.prompt);
         } catch (err2) {
           send('agent-event', {
             runId: cfg.runId, agentId: cfg.agentId,

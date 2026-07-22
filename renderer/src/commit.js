@@ -155,9 +155,17 @@ async function openCommitModal(kind) {
   cmt.willStageAll = st.ok && !st.staged.length && (st.unstaged.length || st.untracked.length);
   cmt.branch = st.branch || '';
   const fileCount = cmt.willStageAll ? (st.unstaged.length + st.untracked.length) : (st.ok ? st.staged.length : 0);
-  cmtEl('cmt-title').textContent = 'COMMIT · ' + (st.branch || '');
-  cmtEl('cmt-summary').textContent = `${fileCount} file(s)${cmt.willStageAll ? ' — will stage all first' : ' staged'}`;
-  cmtEl('cmt-msg').value = cmtEl('git-msg').value.trim();
+  cmtEl('cmt-title').textContent = (kind === 'amend' ? 'AMEND · ' : 'COMMIT · ') + (st.branch || '');
+  cmtEl('cmt-summary').textContent = `${fileCount} file(s)${cmt.willStageAll ? ' — will stage all first' : ' staged'}` +
+    (kind === 'amend' ? ' — amends previous commit' : '');
+  if (kind === 'amend') {
+    // show the CURRENT last-commit message so the user edits/confirms it,
+    // instead of silently inheriting whatever stale text sits in the header box
+    const log = await window.deck.gitLog(gitRepo, 1);
+    cmtEl('cmt-msg').value = (log.ok && log.commits[0]) ? log.commits[0].subject : '';
+  } else {
+    cmtEl('cmt-msg').value = cmtEl('git-msg').value.trim();
+  }
   cmtEl('cmt-msg-block').classList.remove('hidden');
   cmtEl('cmt-pr-row').classList.add('hidden');
   cmtEl('cmt-error-wrap').classList.add('hidden');

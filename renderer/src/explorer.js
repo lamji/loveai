@@ -5,6 +5,10 @@
 // ============================================================
 const exTree = document.getElementById('ex-tree');
 let exLoaded = false;
+// dirs (full path) currently expanded — survives exLoad()/refreshWorkspace() rebuilds
+// so an add/edit under the active project doesn't collapse the tree back to root
+// (VS Code keeps expanded folders open across a refresh).
+const exExpandedDirs = new Set();
 
 // git status decoration for the tree: normalized-absolute path -> 'conflict' |
 // 'modified' | 'untracked'. Built from every repo's status in gitRefresh.
@@ -112,16 +116,22 @@ async function exRenderDir(dir, container) {
     container.appendChild(row);
 
     if (item.dir) {
+      const wasExpanded = exExpandedDirs.has(item.path);
       const kids = document.createElement('div');
-      kids.className = 'ex-children hidden';
+      kids.className = 'ex-children' + (wasExpanded ? '' : ' hidden');
       container.appendChild(kids);
       row.dataset.kids = '1';
+      if (wasExpanded) {
+        row.querySelector('.ex-caret').textContent = '▾';
+        row.querySelector('.ex-ico').textContent = '🗁';
+      }
       row.onclick = async (e) => {
         exSelect(row, item, e);
         if (e.ctrlKey || e.metaKey || e.shiftKey) return;   // multi-select click — don't toggle expand
         const collapsed = kids.classList.toggle('hidden');
         row.querySelector('.ex-caret').textContent = collapsed ? '▸' : '▾';
         row.querySelector('.ex-ico').textContent = collapsed ? '🗀' : '🗁';
+        if (collapsed) exExpandedDirs.delete(item.path); else exExpandedDirs.add(item.path);
         // children load on first expand — keeps big trees (node_modules) cheap
         if (!collapsed && !kids.dataset.loaded) {
           kids.dataset.loaded = '1';
@@ -132,6 +142,12 @@ async function exRenderDir(dir, container) {
         // (green marking still shows which folders contain uncommitted changes.)
       };
       exBindDropTarget(row, item.path);
+      // rebuild an already-expanded folder eagerly so a refresh doesn't visibly
+      // collapse it back to the root — recurses into its own expanded children too
+      if (wasExpanded) {
+        kids.dataset.loaded = '1';
+        await exRenderDir(item.path, kids);
+      }
     } else {
       row.dataset.file = item.path;
       row.onclick = (e) => {
@@ -417,6 +433,46 @@ async function exRelocateRow(oldPath, newPath, targetDir) {
   await exAutoExpand(targetRow, targetKids, targetDir);
 }
 
+// rename an already-rendered row in place — no full exLoad(), so nothing
+// else in the tree collapses/flickers. Falls back to a full reload only if
+// the row isn't currently rendered (e.g. renamed via a stale reference).
+function exRenameRowInPlace(oldPath, newPath, newName) {
+  const row = exFindRow(oldPath);
+  if (!row) return false;
+  const isDir = row.classList.contains('is-dir');
+  const kids = isDir ? row.nextElementSibling : null;
+
+  row.dataset.path = newPath;
+  if (row.dataset.file) row.dataset.file = newPath;
+  row.querySelector('.ex-name').textContent = newName;
+
+  if (isDir && kids) {
+    const oldPrefix = oldPath + exSepOf(oldPath), newPrefix = newPath + exSepOf(newPath);
+    kids.querySelectorAll('.ex-row').forEach(d => {
+      if (d.dataset.path && d.dataset.path.startsWith(oldPrefix)) {
+        d.dataset.path = newPrefix + d.dataset.path.slice(oldPrefix.length);
+        if (d.dataset.file) d.dataset.file = d.dataset.path;
+      }
+    });
+    if (exExpandedDirs.delete(oldPath)) exExpandedDirs.add(newPath);
+  }
+  exSortContainer(row.parentElement);   // name changed — re-sort into its new spot
+  markOpenRows(); decorateExplorer(); exApplySelClasses();
+  return true;
+}
+
+// remove an already-rendered row (and its children container, if a folder)
+// in place — no full exLoad().
+function exRemoveRowInPlace(path) {
+  const row = exFindRow(path);
+  if (!row) return false;
+  const kids = row.classList.contains('is-dir') ? row.nextElementSibling : null;
+  row.remove();
+  if (kids) kids.remove();
+  exExpandedDirs.delete(path);
+  return true;
+}
+
 // confirm, then move each dropped path into `targetDir`
 async function exMoveItems(paths, targetDir) {
   if (!paths || !paths.length) return;
@@ -665,11 +721,13 @@ async function exRename(item) {
   const cur = item.path.split(/[\\/]/).pop();
   const out = await askText({ title: 'RENAME', value: cur, placeholder: 'new name' });
   if (!out || out === cur) return;
-  const to = item.path.replace(/[^\\/]+$/, out);
-  const r = await window.deck.fsRename(projectDir, item.path, to);
+  const from = item.path;
+  const to = from.replace(/[^\\/]+$/, out);
+  const r = await window.deck.fsRename(projectDir, from, to);
   if (!r.ok) { toast('✗ ' + r.error, false); return; }
   toast(`✓ renamed to ${out}`);
-  await exLoad();
+  if (exSelected && exSelected.path === from) exSelected = { ...exSelected, path: to };
+  if (!exRenameRowInPlace(from, to, out)) await exLoad();
 }
 async function exDelete(item) {
   const name = item.path.split(/[\\/]/).pop();
@@ -680,7 +738,7 @@ async function exDelete(item) {
   toast(`✓ deleted ${name}`);
   if (exSelected && exSelected.path === item.path) exSelected = null;
   exSelectedPaths.delete(item.path);
-  await exLoad();
+  if (!exRemoveRowInPlace(item.path)) await exLoad();
 }
 document.getElementById('ex-new-file').onclick = () => exStartCreate(false);
 document.getElementById('ex-new-folder').onclick = () => exStartCreate(true);
@@ -691,14 +749,19 @@ async function exLoad() {
     exTree.innerHTML = '<div class="ex-msg">Import a project first (AGENT tab → ⇩ IMPORT).</div>';
     return;
   }
-  exTree.innerHTML = '<div class="ex-msg">loading...</div>';
+  // only show the loading placeholder on a true first load — a refresh (add/edit
+  // file, rename, etc.) rebuilds in place via exExpandedDirs so it doesn't flash
+  if (!exTree.children.length) exTree.innerHTML = '<div class="ex-msg">loading...</div>';
   await exRenderDir(projectDir, exTree);
   exLoaded = true;
 }
 
 function exReset() {
   exLoaded = false;
-  exTree.innerHTML = '';
+  // don't blank exTree here — that's what caused the visible "close then
+  // reopen" flash on every add/edit. exLoad()/exRenderDir already swap the
+  // DOM atomically (fetch first, replace after), so leave the old tree on
+  // screen until the fresh one is ready (VS Code-style in-place refresh).
   if (!document.getElementById('tab-explorer').classList.contains('hidden')) exLoad();
 }
 

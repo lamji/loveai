@@ -15,11 +15,38 @@ const fs = require('fs');
 const path = require('path');
 
 const MODEL_NAME = 'BGESmallENV15';
+const MODEL_FOLDER = 'fast-bge-small-en-v1.5';   // on-disk name fastembed uses
+const MODEL_FILE = 'model_optimized.onnx';
 const DIM = 384;
 const SCHEMA = 1;
 
 let _embedderPromise = null;   // singleton init (model load is expensive)
 let _embedderBroken = false;
+let _embedderError = '';       // last init failure reason, surfaced to the UI
+let _modelDirOverride = '';    // main process passes the resolved dir to the worker
+
+// main.js (which knows app.isPackaged / resourcesPath) tells the worker exactly
+// where the bundled model lives; keeps us off cwd-relative guessing.
+function setModelDir(dir) { _modelDirOverride = dir || ''; }
+
+// Resolve the ABSOLUTE dir holding model_optimized.onnx. Must never depend on
+// process.cwd(): in dev cwd is the repo root, but in the packaged app it is the
+// install dir, where fastembed's default "local_cache" would be missing and it
+// would try to DOWNLOAD the model (slow/offline-broken). We ship the model and
+// point straight at it.
+function resolveModelDir() {
+  const candidates = [
+    _modelDirOverride,
+    path.join(__dirname, 'local_cache', MODEL_FOLDER),
+    process.resourcesPath
+      ? path.join(process.resourcesPath, 'local_cache', MODEL_FOLDER)
+      : '',
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try { if (fs.existsSync(path.join(c, MODEL_FILE))) return c; } catch {}
+  }
+  return null;
+}
 
 // lazy, cached embedder. Returns null (never throws) when unavailable so the
 // caller can fall back to lexical retrieval.
@@ -28,8 +55,18 @@ async function getEmbedder() {
   if (_embedderPromise) return _embedderPromise;
   _embedderPromise = (async () => {
     const { FlagEmbedding, EmbeddingModel } = require('fastembed');
+    const dir = resolveModelDir();
+    if (!dir) {
+      throw new Error(
+        `embedding model not found (local_cache/${MODEL_FOLDER}/${MODEL_FILE})`);
+    }
+    // CUSTOM + modelAbsoluteDirPath loads the local .onnx directly and SKIPS the
+    // network download path entirely. Embeddings are identical to the named
+    // BGESmallENV15 path (same onnx, same passage:/query: prefixes, same tokenizer).
     return FlagEmbedding.init({
-      model: EmbeddingModel[MODEL_NAME],
+      model: EmbeddingModel.CUSTOM,
+      modelAbsoluteDirPath: dir,
+      modelName: MODEL_FILE,
       // symbol docs are short (~100 tokens); 256 is ample and ~3x faster than 512
       // (48min -> ~16min for a 17k-symbol monorepo), with no truncation.
       maxLength: 256,
@@ -37,7 +74,8 @@ async function getEmbedder() {
   })().catch((e) => {
     _embedderBroken = true;
     _embedderPromise = null;
-    console.error('[vectors] embedder init failed:', e && e.message);
+    _embedderError = (e && e.message) ? String(e.message) : String(e);
+    console.error('[vectors] embedder init failed:', _embedderError);
     return null;
   });
   return _embedderPromise;
@@ -82,7 +120,8 @@ async function embedDocs(emb, docs, onProgress) {
 // returns { ok, count } — or { ok:false } when the embedder is unavailable.
 async function buildVectorIndex(dir, graph, onProgress) {
   const emb = await getEmbedder();
-  if (!emb || !graph || !graph.defs || !graph.defs.length) return { ok: false };
+  if (!emb) return { ok: false, error: _embedderError || 'embedder unavailable' };
+  if (!graph || !graph.defs || !graph.defs.length) return { ok: false, error: 'empty graph' };
   const defs = graph.defs;
   const ids = defs.map((d) => d.id);
   const docs = defs.map(defDoc);
@@ -143,6 +182,10 @@ function loadIndex(dir) {
   return _cache;
 }
 
+// Why the embedder is down, if it is. Lets callers tell "no index on disk" apart
+// from "index exists but the model won't load" — two very different fixes.
+function embedderError() { return _embedderBroken ? (_embedderError || 'embedder unavailable') : ''; }
+
 function hasVectorIndex(dir) {
   try { return fs.existsSync(indexPath(dir)); } catch { return false; }
 }
@@ -182,4 +225,5 @@ module.exports = {
   MODEL_NAME, DIM,
   getEmbedder, buildVectorIndex, syncFilesVectors, queryVectors,
   hasVectorIndex, invalidateCache, defDoc,
+  setModelDir, resolveModelDir, embedderError,
 };

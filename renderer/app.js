@@ -413,7 +413,23 @@ function R(id) { return rt[id] || (rt[id] = { running: false, sessionId: null, s
 function sessKey() { return 'deckSession:' + (projectDir || 'default'); }
 function getSession() { return localStorage.getItem(sessKey()) || null; }
 function setSession(id) { if (id) localStorage.setItem(sessKey(), id); }
-function clearSession() { localStorage.removeItem(sessKey()); }
+function clearSession() {
+  localStorage.removeItem(sessKey());
+  localStorage.removeItem(sessModelKey());
+  localStorage.removeItem(sessCwdKey());
+}
+
+// model that owns the current shared session (for fork-on-switch, task-01)
+function sessModelKey() { return 'deckSessionModel:' + (projectDir || 'default'); }
+function getSessionModel() { return localStorage.getItem(sessModelKey()) || null; }
+function setSessionModel(m) { if (m) localStorage.setItem(sessModelKey(), m); }
+
+// cwd the shared session was CREATED under — the Agent SDK stores each session
+// under a project slug derived from the run cwd, so a follow-up must resume with
+// the SAME cwd or the CLI can't find the id and reports a spurious stale.
+function sessCwdKey() { return 'deckSessionCwd:' + (projectDir || 'default'); }
+function getSessionCwd() { return localStorage.getItem(sessCwdKey()) || null; }
+function setSessionCwd(cwd) { if (cwd) localStorage.setItem(sessCwdKey(), cwd); }
 
 // ===== Per-project Prompt Engineer session reuse (warm context on repeat runs) =====
 const PE_SESSIONS_KEY = 'loveai-pe-sessions';
@@ -1088,6 +1104,8 @@ function syncPane() {
   if (window.tkIsOpen && tkIsOpen()) return;
   // the notes gallery screen also owns the center area while it's open
   if (window.notesViewOpen && notesViewOpen()) return;
+  // the sandbox browser screen also owns the center area while it's open
+  if (window.browserViewOpen && browserViewOpen()) return;
   // terminal now lives in the bottom panel and no longer owns the center —
   // console/editor swap independently of whether the panel is open
   // split mode: editor and console are shown side by side, so don't hide either
@@ -1170,6 +1188,21 @@ async function memoryInject(cwd, query) {
   } catch { return ''; }
 }
 
+// Best-effort context enrichment (code graph, vector job, index walk) must NEVER
+// wedge the actual agent launch. These are IPC round-trips to native/child-process
+// work that can stall; a try/catch does not catch a hang. So race each against a
+// short timeout and fall back to the same empty value the catch path already
+// yields — the agent just launches without that one enrichment instead of the
+// whole run sitting at "initializing session..." forever.
+function withTimeout(promise, ms, fallback) {
+  let t;
+  const guard = new Promise(res => { t = setTimeout(() => res(fallback), ms); });
+  return Promise.race([
+    Promise.resolve(promise).catch(() => fallback),
+    guard,
+  ]).finally(() => clearTimeout(t));
+}
+
 async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) {
   const a = findAgent(agentId);
   const r = R(agentId);
@@ -1190,9 +1223,29 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   if (opts.onEvent) runEventSinks[r.runId] = opts.onEvent;
   r.startedAt = Date.now();
   r.lastText = '';
+  r.sessionId = null;   // per-run: set on the 'init' event; used by the watchdog
   r.curModel = model;   // for the background learner
   setRunningUI(agentId, true);
   ticker(agentId, 'initializing session...');
+  // INIT WATCHDOG — the launch is a chain of awaited best-effort IPC calls
+  // (below) followed by the subprocess spawn; the ticker sits at "initializing
+  // session..." until the first agent-event arrives. If NOTHING arrives — a
+  // stalled native call before the spawn, or a subprocess that never emits its
+  // init — the run would otherwise hang forever with r.running stuck true. This
+  // trips after a generous window, aborts anything that did spawn, resets the
+  // agent, and tells the operator to retry. Cleared on the first event (line ~1416).
+  clearTimeout(r.initWatch);
+  const watchRunId = r.runId;
+  r.initWatch = setTimeout(() => {
+    if (r.runId !== watchRunId || !r.running || r.sessionId) return;
+    feed(agentId, 'err',
+      'launch stalled — no session after 120s (context assembly or spawn hung). ' +
+      'Aborting; press ↑ to retry.', '⚠');
+    try { if (r.runId) window.deck.stopAgent(r.runId); } catch {}
+    r.running = false;
+    r.initWatch = null;
+    setRunningUI(agentId, false);
+  }, 120000);
   feed(agentId, 'sys', (plan ? 'PLAN ▸ ' : 'TASK ▸ ') + prompt, plan ? '🗺' : '🎯');
   if (model !== a.model) feed(agentId, 'sys', `model routed by complexity → ${MODEL_LABELS[model]}`, '⚖');
   // opts.effort overrides the global session setting (e.g. a per-ticket choice)
@@ -1219,7 +1272,7 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   // tokens into an already-loaded context, so all injects are skipped.
   const warm = !!(opts.resume || (opts.cont && getSession()));
   let fullPrompt = prompt;
-  if (!warm && a.role !== 'indexer' && await hasProjectMap(cwd)) {
+  if (!warm && a.role !== 'indexer' && await withTimeout(hasProjectMap(cwd), 4000, false)) {
     fullPrompt += '\n\nOrientation: read .loveai/index/PROJECT-MAP.md first and open only the files relevant to this task — do not survey the repo.';
   }
   // TOPIC MEMORY — front-load only the feature memory relevant to this run so
@@ -1227,7 +1280,7 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   // re-exploring. Light by design: at most 1-2 topics, not the whole codebase.
   // Every role reads it and (per DISCIPLINE) every role maintains it.
   if (!warm && a.role !== 'indexer' && cwd) {
-    fullPrompt += await memoryInject(cwd, prompt);
+    fullPrompt += await withTimeout(memoryInject(cwd, prompt), 4000, '');
   }
   // REGRESSION IMPACT (global) — the native code graph's blast-radius, injected
   // for EVERY non-indexer run so any agent/model sees what a change touches. The
@@ -1235,7 +1288,7 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   // front-load below, so they're excluded here to avoid a duplicate block.
   if (!warm && a.role !== 'indexer' && a.role !== 'prompt' && a.role !== 'custom' && a.role !== 'senior' && a.role !== 'uiux' && cwd) {
     try {
-      const im = await window.deck.regressionImpact(cwd, prompt);
+      const im = await withTimeout(window.deck.regressionImpact(cwd, prompt), 6000, null);
       if (im && im.ok && im.impact && im.impact.trim()) {
         fullPrompt += `\n\nREGRESSION IMPACT (auto, from the code graph — NOT ` +
           `exhaustive, verify): the symbols you may change and what calls/imports ` +
@@ -1253,24 +1306,36 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   if (!warm && (a.role === 'prompt' || a.role === 'custom' || a.role === 'senior' || a.role === 'uiux') && cwd) {
     try {
       // top 12 ranked; full CONTENT for the top 5 so the agent barely needs to Read
-      const r = await window.deck.retrieveContext(cwd, prompt, 12, 5);
+      const r = await withTimeout(window.deck.retrieveContext(cwd, prompt, 12, 5), 8000, null);
+      if (!r) throw new Error('retrieve-context timed out');
       // SEMANTIC (RAG) retrieval — vector search over the tree-sitter symbols, so
       // the agent sees files whose MEANING matches even when no identifier does.
       // LOGGED so the operator can confirm the vector index is actually being used
       // (and is warned when it isn't built yet).
       let vhits = [];
+      let vq = null;
       try {
-        const vq = await window.deck.vectorQuery(cwd, prompt, 20);
+        vq = await withTimeout(window.deck.vectorQuery(cwd, prompt, 20), 8000, null);
         if (vq && vq.ready && Array.isArray(vq.hits)) vhits = vq.hits;
       } catch {}
       const vTopFiles = [...new Set(
         vhits.map(h => h.id.slice(0, h.id.lastIndexOf('#')))
       )].slice(0, 6);
-      feed(agentId, 'sys', vhits.length
-        ? `RAG query → "${String(prompt).replace(/\s+/g, ' ').slice(0, 70)}" · ` +
-          `${vhits.length} semantic hits · top: ${vTopFiles.join(', ')}`
-        : `RAG: no vector index for this project yet — lexical only ` +
-          `(build the graph to enable semantic retrieval)`, '🧬');
+      // Say WHICH failure it is — a built index with a dead embedder is NOT the
+      // same as no index, and telling the user to "build the graph" when the
+      // vectors already exist just loops them (build succeeds, query still empty).
+      let ragMsg;
+      if (vhits.length) {
+        ragMsg = `RAG query → "${String(prompt).replace(/\s+/g, ' ').slice(0, 70)}" · ` +
+          `${vhits.length} semantic hits · top: ${vTopFiles.join(', ')}`;
+      } else if (vq && vq.indexed && vq.embedErr) {
+        ragMsg = `RAG: vector index exists but the embedder won't load ` +
+          `(${vq.embedErr}) — lexical only`;
+      } else {
+        ragMsg = `RAG: no vector index for this project yet — lexical only ` +
+          `(build the graph to enable semantic retrieval)`;
+      }
+      feed(agentId, 'sys', ragMsg, '🧬');
       if (r.ok && r.files && r.files.length) {
         // fold semantic-only files into the ranked list so they're surfaced too
         const haveRel = new Set(r.files.map(f => f.rel));
@@ -1283,7 +1348,7 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
         // relevant was found, and we transparently fall back to the whole-file
         // front-load below (hybrid). Cheap local call, no LLM.
         let sym = null;
-        try { sym = await window.deck.retrieveSymbols(cwd, prompt, 12000, false); } catch {}
+        try { sym = await withTimeout(window.deck.retrieveSymbols(cwd, prompt, 12000, false), 8000, null); } catch {}
         const symReady = !!(sym && sym.ok && sym.ready && sym.context);
 
         // 1) repo map — the symbol pack carries its own (symbol-level) map, so only
@@ -1381,13 +1446,27 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
     resumeSessionId: opts.resume ? opts.resume : (opts.cont ? getSession() : null),
     // no fork on shared-session continues: forking duplicates the transcript
     // and re-replays it; continuing in place gets prompt-cache hits instead
-    forkSession: opts.resume ? (opts.fork !== false) : fork
+    forkSession: opts.resume ? (opts.fork !== false) : fork,
+    // resume under the cwd the session was created in (its SDK slug) so the CLI
+    // finds it — the `cwd` field above stays project-scoped for context injection
+    resumeCwd: opts.cont ? getSessionCwd() : (opts.resume ? opts.cwd : null)
   });
 }
 
 function stopAgent(agentId) {
   const r = R(agentId);
-  if (r.running && r.runId) window.deck.stopAgent(r.runId);
+  if (!r.running || !r.runId) return;
+  window.deck.stopAgent(r.runId);
+  // If the run never reached its 'init' event it may still be wedged in the
+  // pre-spawn context assembly, where NO main-process run exists to abort and
+  // emit 'done' — so the stop above is a no-op and r.running would stay stuck
+  // true, blocking any re-run. Recover locally: disarm the watchdog and reset.
+  // (A real spawned run also emits 'done' shortly; that handler is idempotent.)
+  if (!r.sessionId) {
+    if (r.initWatch) { clearTimeout(r.initWatch); r.initWatch = null; }
+    r.running = false;
+    setRunningUI(agentId, false);
+  }
 }
 
 function setRunningUI(agentId, running) {
@@ -1407,6 +1486,9 @@ window.deck.onAgentEvent(ev => {
   const r = R(ev.agentId);
   if (ev.runId !== r.runId) return;
 
+  // the launch produced an event → the run is alive, disarm the init watchdog
+  if (r.initWatch) { clearTimeout(r.initWatch); r.initWatch = null; }
+
   // mirror this run's events into a modal, if one registered a sink for it
   if (runEventSinks[ev.runId]) { try { runEventSinks[ev.runId](ev); } catch {} }
 
@@ -1423,7 +1505,9 @@ window.deck.onAgentEvent(ev => {
       if (getSession() === ev.sessionId) clearSession();
       clearPESession(ev.sessionId);
       r.noShare = false;
-      feed(ev.agentId, 'sys', 'stored session was stale — starting a fresh context.', '↺');
+      feed(ev.agentId, 'sys', ev.restored
+        ? 'stored session was stale — restored prior context into a fresh session.'
+        : 'stored session was stale — starting a fresh context.', '↺');
       break;
     case 'text-delta':
       // a delta with no open stream element starts a fresh assistant message —
@@ -1472,7 +1556,10 @@ window.deck.onAgentEvent(ev => {
     case 'result': {
       hideThinking(ev.agentId);
       r.sessionId = ev.sessionId || r.sessionId;
-      if (ev.sessionId && !r.noShare) setSession(ev.sessionId);
+      if (ev.sessionId && !r.noShare) {
+        setSession(ev.sessionId); setSessionModel(r.curModel);
+        setSessionCwd(r.cpCwd);   // resume under this cwd so the SDK slug matches
+      }
       r.lastResult = ev.subtype;
       trackUsage(ev);
       const doneAgent = findAgent(ev.agentId);
@@ -2490,8 +2577,17 @@ async function sendChat() {
     // gets a real follow-up composer in the agent dock), a bare model has no
     // such UI — repeat sends here ARE its only "keep chatting" path, so they
     // must continue the shared session, not silently start fresh each time.
-    const id = ensureModelAgent(target.slice('model:'.length));
-    runAgent(id, full, false, plan, { cont: true });
+    // If the operator switched models since the shared session was created,
+    // resuming in place is rejected by the CLI (model mismatch) and wipes the
+    // session — so FORK instead: seeds a new session id with the full prior
+    // transcript under the new model. Same model: continue in place (cheaper,
+    // hits the prompt cache).
+    const model = target.slice('model:'.length);
+    const id = ensureModelAgent(model);
+    const sess = getSession();
+    const switched = sess && getSessionModel() && getSessionModel() !== model;
+    const opts = switched ? { resume: sess, fork: true } : { cont: true };
+    runAgent(id, full, false, plan, opts);
   } else {
     // background learner: manual UI/UX sends grow the UI vocabulary; a quick
     // corrective follow-up counts against the model of the previous run
@@ -2707,7 +2803,14 @@ cxInput.addEventListener('keydown', e => {
 });
 
 document.getElementById('btn-new-session').onclick = () => {
-  if (Object.values(rt).some(r => r.running)) { plog('err', 'stop all agents before resetting the session.'); return; }
+  // a real assistant's "new chat" ALWAYS works — force-stop every run instead of
+  // refusing. Covers a wedged flag (running stuck true with no live process to
+  // abort), the exact trap where the operator couldn't reset a stale session.
+  const runningIds = Object.keys(rt).filter(id => rt[id].running);
+  runningIds.forEach(id => { try { stopAgent(id); } catch {} });
+  Object.keys(rt).forEach(id => {
+    if (rt[id].running) { rt[id].running = false; setRunningUI(id, false); }
+  });
   clearSession();
   // wipe this project's visible feed (background workspaces keep their own
   // buffers untouched — see stashFeed/restoreFeed) so the reset is obvious.
@@ -2716,8 +2819,11 @@ document.getElementById('btn-new-session').onclick = () => {
   // 'SESSION' isn't in SILENT_FEED_TAGS (unlike 'PIPELINE'), so this actually
   // renders — the old plog('info', ...) call here used the silenced tag and
   // never showed up, leaving the operator with no confirmation.
+  const stopped = runningIds.length
+    ? ` (stopped ${runningIds.length} running agent(s))` : '';
   feedRaw('SESSION', 'ok',
-    `new session started — console cleared. next run (${currentTargetLabel()}) starts with a fresh context.`,
+    `new session started — console cleared${stopped}. ` +
+    `next run (${currentTargetLabel()}) starts with a fresh context.`,
     '↺');
 };
 
@@ -3088,6 +3194,9 @@ function renderRail() {
   mc.onclick = () =>
     plog('info', 'Mission Control lands in Phase 4 — the all-projects live dashboard.');
   rail.appendChild(mc);
+  // sandbox browser groups its tabs by project — keep those groups in sync
+  // (projects added / removed / renamed / recolored all flow through here)
+  if (window.browserProjectsChanged) window.browserProjectsChanged();
 }
 
 // re-bind every project-scoped view to the active workspace
@@ -3097,6 +3206,7 @@ function refreshProjectBindings() {
   renderWelcome();   // Get Started screen when there's no folder
   applyFilter();     // console filter
   gitDetect();       // source control for this repo
+  if (typeof exExpandedDirs !== 'undefined') exExpandedDirs.clear();   // new project, fresh tree
   exReset();         // file explorer
   loadSlashItems();  // project skills / commands
   // ticket workspace is per-project — rebind (or close if no folder)

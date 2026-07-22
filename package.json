@@ -1,6 +1,6 @@
 {
   "name": "loveai",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "LoveAi — futuristic multi-agent desktop console for Claude Code",
   "author": "Anthropic",
   "main": "main.js",
@@ -33,6 +33,8 @@
       "preload.js",
       "auth.js",
       "config.js",
+      "vectors.js",
+      "vectors-worker.js",
       "renderer/**/*",
       "node_modules/**/*"
     ],
@@ -41,9 +43,17 @@
       "node_modules/@lydell/**",
       "node_modules/web-tree-sitter/**",
       "node_modules/tree-sitter-wasms/**",
+      "node_modules/onnxruntime-node/**",
       "**/*.exe",
       "**/*.node",
+      "**/*.dll",
       "**/*.wasm"
+    ],
+    "extraResources": [
+      {
+        "from": "local_cache",
+        "to": "local_cache"
+      }
     ],
     "win": {
       "target": [

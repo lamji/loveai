@@ -255,6 +255,7 @@
     }
     // only one center screen at a time — leave the notes gallery first
     if (window.closeNotesView) window.closeNotesView();
+    if (window.closeBrowserView) window.closeBrowserView();
     tk = tkLoad();
     isOpen = true;
     view.classList.remove('hidden');

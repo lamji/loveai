@@ -146,9 +146,13 @@ async function newTerm(shell, cwd) {
   });
   const fit = new FitAddon.FitAddon();
   xt.loadAddon(fit);
-  // URLs in the terminal become real links: ctrl+click opens the OS browser
+  // URLs in the terminal become real links: ctrl+click opens the in-app browser
   xt.loadAddon(new WebLinksAddon.WebLinksAddon((e, uri) => {
-    if (e.ctrlKey || e.metaKey) { hideLinkTip(); window.deck.openExternal(uri); }
+    if (e.ctrlKey || e.metaKey) {
+      hideLinkTip();
+      if (window.openUrlInBrowser) window.openUrlInBrowser(uri);
+      else window.deck.openExternal(uri);
+    }
   }, { hover: showLinkTip, leave: hideLinkTip }));
   xt.open(pane);
   // Clipboard, terminal-style: Ctrl+C copies the SELECTION (and falls through to

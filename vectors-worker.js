@@ -8,10 +8,14 @@
 // Protocol: main posts { id, job, dir, ... }; we reply { id, type:'progress',... }
 // zero or more times, then exactly one { id, type:'done', ok, ... }.
 
-const { parentPort } = require('worker_threads');
+const { parentPort, workerData } = require('worker_threads');
 const fs = require('fs');
 const path = require('path');
 const V = require('./vectors');
+
+// main knows app.isPackaged / resourcesPath; it hands us the resolved model dir
+// so the embedder never has to guess relative to process.cwd().
+if (workerData && workerData.modelDir) V.setModelDir(workerData.modelDir);
 
 let chain = Promise.resolve();   // serial job queue
 
@@ -21,9 +25,13 @@ function handle(msg) {
     try {
       if (job === 'query') {
         const hits = await V.queryVectors(dir, msg.query, msg.k || 20);
-        // hits === null means "no index built" — keep it null so main can tell
-        // that apart from "index exists but no matches".
-        parentPort.postMessage({ id, type: 'done', ok: true, hits });
+        // hits === null is ambiguous on its own — it means EITHER no index on disk
+        // OR the embedder won't load. Report both facts so main/UI can say which,
+        // instead of always blaming "no index built" and sending the user to rebuild.
+        parentPort.postMessage({
+          id, type: 'done', ok: true, hits,
+          indexed: V.hasVectorIndex(dir), embedErr: V.embedderError(),
+        });
         return;
       }
       const graph = JSON.parse(fs.readFileSync(path.join(dir, 'codegraph.json'), 'utf8'));

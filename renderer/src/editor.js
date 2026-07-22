@@ -61,25 +61,32 @@ async function openFile(path) {
     if (isImageFile(path)) {
       const r = await window.deck.fsReadImage(projectDir, path);
       if (!r.ok) { feedRaw('EXPLORER', 'err', `${baseName(path)}: ${r.error}`, '🗀'); return; }
-      openFiles.push({
-        path, kind: 'image', dataUrl: r.dataUrl,
-        zoom: 100, panX: 0, panY: 0,
-        dirty: false, diskChanged: false
-      });
+      // re-check after the await — a fast double-click can race two openFile
+      // calls; the first to finish wins the tab, the second just re-opens it
+      if (!openFiles.some(f => f.path === path)) {
+        openFiles.push({
+          path, kind: 'image', dataUrl: r.dataUrl,
+          zoom: 100, panX: 0, panY: 0,
+          dirty: false, diskChanged: false
+        });
+        syncWatchedFiles();
+      }
     } else {
       const r = await window.deck.fsRead(projectDir, path, shikiTheme());
       if (!r.ok) { feedRaw('EXPLORER', 'err', `${baseName(path)}: ${r.error}`, '🗀'); return; }
-      openFiles.push({
-        path, lang: r.lang,
-        content: r.content,          // what's on disk
-        value: r.content,            // what's in the buffer
-        html: shikiInner(r.html),
-        indent: detectIndent(r.content),
-        dirty: false,
-        diskChanged: false
-      });
+      if (!openFiles.some(f => f.path === path)) {
+        openFiles.push({
+          path, lang: r.lang,
+          content: r.content,          // what's on disk
+          value: r.content,            // what's in the buffer
+          html: shikiInner(r.html),
+          indent: detectIndent(r.content),
+          dirty: false,
+          diskChanged: false
+        });
+        syncWatchedFiles();
+      }
     }
-    syncWatchedFiles();
   }
   activeFile = path;
   paneOverride = 'editor';

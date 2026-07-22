@@ -216,6 +216,15 @@
           <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01A1.7 1.7 0 0 0 10 3.09V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.55h.01a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1.03z"/>
         </svg>
       </button>
+      <button id="btn-browser" class="git-badge head-ico"
+              title="Sandbox browser — browse &amp; debug in-app">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/>
+          <path d="M3 12h18M12 3c2.5 2.7 2.5 15.3 0 18
+                   M12 3c-2.5 2.7-2.5 15.3 0 18"/>
+        </svg>
+      </button>
       <button id="btn-term" class="git-badge head-ico" title="Interactive terminal — toggles the console area">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <rect x="2.5" y="4" width="19" height="16" rx="2.5"/>
@@ -470,6 +479,39 @@
       </div>
     </div>
 
+    <!-- Sandbox browser — a light in-app browser screen for browsing & debugging -->
+    <div id="browser-view" class="browser-view hidden">
+      <!-- tab strip: shows only the active project's tabs (isolated, like notes/board) -->
+      <div id="bw-tabs" class="bw-tabs"></div>
+      <div class="bw-toolbar">
+        <button id="bw-back" class="bw-btn" title="Back">◀</button>
+        <button id="bw-forward" class="bw-btn" title="Forward">▶</button>
+        <button id="bw-reload" class="bw-btn" title="Reload">↻</button>
+        <button id="bw-home" class="bw-btn" title="Home">⌂</button>
+        <input id="bw-url" class="bw-url" type="text"
+               placeholder="Type a URL or search…" />
+        <button id="bw-newtab" class="bw-btn" title="New tab">＋</button>
+        <button id="bw-devtools" class="bw-btn" title="Open devtools">⚙</button>
+        <button id="bw-fullview" class="bw-btn" title="Full view">⛶</button>
+        <button id="bw-close" class="bw-btn bw-close" title="Close browser">✕</button>
+      </div>
+      <div id="bw-progress" class="bw-progress hidden"></div>
+      <!-- one <webview> per tab is created here at runtime; only the
+           active tab's guest is visible, the rest stay alive but hidden -->
+      <div id="bw-stack" class="bw-stack">
+        <div id="bw-empty" class="bw-empty hidden">
+          No tabs yet — click ＋ to open one for this project.
+        </div>
+        <div id="bw-error" class="bw-error hidden">
+          <div class="bw-error-icon">⚠</div>
+          <div id="bw-error-title" class="bw-error-title">This site can't be reached</div>
+          <div id="bw-error-msg" class="bw-error-msg"></div>
+          <div id="bw-error-url" class="bw-error-url"></div>
+          <button id="bw-error-retry" class="bw-btn bw-error-retry">Try again</button>
+        </div>
+      </div>
+    </div>
+
     </div><!-- /#editor-area -->
 
     <!-- draggable divider between editor area and the bottom panel -->
@@ -484,8 +526,8 @@
         </div>
         <div class="panel-bar-actions">
           <span id="panel-term-actions">
-            <button id="tv-new-bash" class="mini-btn" title="New Git Bash tab">＋ BASH</button>
-            <button id="tv-new-ps" class="mini-btn" title="New PowerShell tab">＋ PS</button>
+            <button id="tv-new-bash" class="mini-btn icon-only" title="New Git Bash tab">$</button>
+            <button id="tv-new-ps" class="mini-btn icon-only" title="New PowerShell tab">&gt;_</button>
           </span>
           <button id="panel-min" class="icon-btn" title="Minimize panel">▁</button>
           <button id="panel-fullscreen" class="icon-btn" title="Full screen (terminal only)">⛶</button>
@@ -1118,6 +1160,7 @@
   <script src="src/statusbar.js"></script>
   <script src="src/workspace.js"></script>
   <script src="src/notes.js"></script>
+  <script src="src/browser.js"></script>
   <script src="src/palette.js"></script>
   <script src="src/profile.js"></script>
   <script src="src/onboarding.js"></script>

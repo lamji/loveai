@@ -94,6 +94,8 @@ contextBridge.exposeInMainWorld('deck', {
   sessionsList: () => ipcRenderer.invoke('sessions-list'),
   sessionLoad: (sessionId) => ipcRenderer.invoke('session-load', sessionId),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
+  openAuthWindow: (url, returnOrigin) =>
+    ipcRenderer.invoke('open-auth-window', { url, returnOrigin }),
   authLogin: () => ipcRenderer.invoke('auth-login'),
   authLogout: () => ipcRenderer.invoke('auth-logout'),
   fileToPath: (file) => { try { return webUtils.getPathForFile(file); } catch { return file.path || null; } },
