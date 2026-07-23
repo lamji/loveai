@@ -212,9 +212,10 @@ const settingsModal = document.getElementById('settings-modal');
 document.querySelectorAll('.set-tab').forEach(tab => {
   tab.onclick = () => {
     document.querySelectorAll('.set-tab').forEach(t => t.classList.toggle('active', t === tab));
-    for (const pane of ['mcp', 'skills', 'creator']) {
+    for (const pane of ['mcp', 'skills', 'creator', 'agents']) {
       document.getElementById('set-' + pane).classList.toggle('hidden', pane !== tab.dataset.set);
     }
+    if (tab.dataset.set === 'agents' && typeof renderRoster === 'function') renderRoster();
   };
 });
 
@@ -303,7 +304,11 @@ document.getElementById('sk-create').onclick = async () => {
   loadSettings();
 };
 
-document.getElementById('btn-settings').onclick = () => { settingsModal.classList.remove('hidden'); loadSettings(); };
+document.getElementById('btn-settings').onclick = () => {
+  settingsModal.classList.remove('hidden');
+  loadSettings();
+  if (typeof renderRoster === 'function') renderRoster();
+};
 document.getElementById('set-close').onclick = () => settingsModal.classList.add('hidden');
 document.getElementById('set-refresh').onclick = loadSettings;
 

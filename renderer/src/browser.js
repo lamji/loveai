@@ -59,6 +59,7 @@
       'The connection timed out. The site may be too slow or unavailable.',
     ERR_CONNECTION_RESET: 'The connection was reset.',
     ERR_CONNECTION_CLOSED: 'The connection was reset.',
+    PAGE_CRASHED: 'The page crashed. Hit "Try again" to reload it.',
   };
 
   let browserOpen = false;
@@ -74,7 +75,8 @@
     } catch { return []; }
   }
   function saveTabs() {
-    const slim = tabs.map(t => ({ id: t.id, wsId: t.wsId, url: t.url, title: t.title }));
+    const slim = tabs.map(t =>
+      ({ id: t.id, wsId: t.wsId, url: t.url, title: t.title, fav: t.fav || '' }));
     localStorage.setItem(TABS_KEY, JSON.stringify(slim));
   }
   function loadActiveByWs() {
@@ -110,27 +112,6 @@
   }
   function safeUrl(wv) { try { return wv.getURL() || ''; } catch { return ''; } }
 
-  // OAuth providers routed to a native shared-session window (main.js AUTH_HOSTS
-  // is the source of truth — keep these two lists in sync).
-  const AUTH_HOSTS = new Set([
-    'accounts.google.com', 'accounts.youtube.com', 'oauth.googleusercontent.com',
-    'login.microsoftonline.com', 'login.live.com', 'appleid.apple.com',
-  ]);
-  function isAuthUrl(u) {
-    try {
-      const url = new URL(u);
-      return url.protocol === 'https:' && AUTH_HOSTS.has(url.hostname);
-    } catch { return false; }
-  }
-  // Open the OAuth flow in a native window sharing persist:sandbox, then reload
-  // the active webview so it picks up the freshly-shared login cookie.
-  async function openAuthPopup(authUrl) {
-    let origin = '';
-    try { origin = new URL(safeUrl(activeWv())).origin; } catch {}
-    try { await window.deck.openAuthWindow(authUrl, origin); } catch {}
-    try { activeWv().reload(); } catch {}
-  }
-
   function tabLabel(t) {
     if (t.title) return t.title;
     try { const h = new URL(t.url).hostname; if (h) return h; } catch { /* not a url */ }
@@ -143,7 +124,12 @@
     if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) return s;
     const looksHost = /^localhost(:\d+)?(\/.*)?$/i.test(s) ||
       /^[^\s/]+\.[^\s/]+(:\d+)?(\/.*)?$/.test(s);
-    if (looksHost) return 'https://' + s;
+    if (looksHost) {
+      // dev servers are plain http — https://localhost:5173 would SSL-error
+      const host = s.split(/[/:]/)[0];
+      const local = /^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0)$/i.test(host);
+      return (local ? 'http://' : 'https://') + s;
+    }
     return 'https://www.google.com/search?q=' + encodeURIComponent(s);
   }
 
@@ -219,6 +205,11 @@
       const t = getTab(tabId);
       if (t) { t.title = e.title || ''; saveTabs(); renderTabs(); }
     });
+    wv.addEventListener('page-favicon-updated', e => {
+      const t = getTab(tabId);
+      const fav = (e.favicons && e.favicons[0]) || '';
+      if (t && t.fav !== fav) { t.fav = fav; saveTabs(); renderTabs(); }
+    });
     wv.addEventListener('did-start-loading', () => {
       wv._loading = true;
       wv._error = null;
@@ -236,14 +227,26 @@
       wv._error = { url: e.validatedURL || safeUrl(wv), desc: e.errorDescription };
       if (isActive()) showError(wv);
     });
-    // window.open OAuth popups (Google et al.) must NOT be re-hosted as an
-    // embedded webview — route them to a native shared-session window instead.
-    // Normal target=_blank links still open as an in-app tab.
-    wv.addEventListener('new-window', e => {
-      e.preventDefault();
-      if (isAuthUrl(e.url)) { openAuthPopup(e.url); return; }
+    // NOTE: popups (window.open / target=_blank / OAuth) are routed by MAIN —
+    // the webview `new-window` DOM event was removed in Electron 22. See the
+    // web-contents-created handler in main.js + onBrowserPopup below.
+    // ring buffer of the guest's console output — read by the bridge
+    // (`console` op) so AI/e2e runs can see page errors without devtools
+    wv._console = [];
+    const CONSOLE_LEVELS = ['debug', 'info', 'warning', 'error'];
+    wv.addEventListener('console-message', e => {
+      const level = typeof e.level === 'number'
+        ? (CONSOLE_LEVELS[e.level] || String(e.level)) : String(e.level || 'info');
+      wv._console.push({
+        ts: Date.now(), level, message: e.message,
+        source: e.sourceId ? `${e.sourceId}:${e.line}` : ''
+      });
+      if (wv._console.length > 500) wv._console.splice(0, wv._console.length - 500);
+    });
+    wv.addEventListener('render-process-gone', () => {
       const t = getTab(tabId);
-      newTab(t ? t.wsId : activeWorkspaceId, e.url);
+      wv._error = { url: safeUrl(wv) || (t && t.url) || '', desc: 'PAGE_CRASHED' };
+      if (isActive()) showError(wv);
     });
   }
 
@@ -258,11 +261,12 @@
   function syncUrlBar() {
     if (document.activeElement === urlInput) return; // don't clobber typing
     const wv = activeWv();
-    if (!wv) { urlInput.value = ''; return; }
-    try {
-      const u = wv.getURL();
-      urlInput.value = (!u || u === HOME_URL) ? '' : u; // blank start shows empty
-    } catch { /* not attached yet */ }
+    const t = getTab(curActiveId());
+    if (!wv && !t) { urlInput.value = ''; return; }
+    let u = '';
+    if (wv) { try { u = wv.getURL() || ''; } catch { /* not attached yet */ } }
+    if (!u && t) u = t.url || ''; // webview not attached → fall back to stored url
+    urlInput.value = (!u || u === HOME_URL) ? '' : u; // blank start shows empty
   }
 
   // ---- tab strip (active project only) ----------------------------------
@@ -300,6 +304,17 @@
     if (wv && wv._loading) cls += ' loading';
     const chip = el('div', cls);
     chip.title = t.url || tabLabel(t);
+    // favicon slot — spinner while loading, site icon, or a dim dot
+    const ico = el('span', 'bw-tab-ico');
+    if (wv && wv._loading) {
+      ico.classList.add('spin');
+    } else if (t.fav) {
+      const img = el('img', 'bw-tab-fav');
+      img.src = t.fav;
+      img.onerror = () => img.remove();
+      ico.appendChild(img);
+    }
+    chip.appendChild(ico);
     const lbl = el('span', 'bw-tab-label');
     lbl.textContent = tabLabel(t);
     chip.appendChild(lbl);
@@ -309,6 +324,8 @@
     x.onclick = e => { e.stopPropagation(); closeTab(t.id); };
     chip.appendChild(x);
     chip.onclick = () => setActiveTab(t.id);
+    // middle-click closes, like Chrome
+    chip.onauxclick = e => { if (e.button === 1) closeTab(t.id); };
     return chip;
   }
 
@@ -381,7 +398,10 @@
       const cur = curActiveId();
       setActiveTab((cur && getTab(cur)) ? cur : wsTabs[0].id);
     }
-    urlInput.focus();
+    // focus the url bar only on an empty tab — a loaded page keeps its url
+    // visible (syncUrlBar skips updates while the bar is focused)
+    const act = getTab(curActiveId());
+    if (!act || !act.url || act.url === HOME_URL) urlInput.focus();
   }
   function closeBrowserView() {
     if (!browserOpen) return;
@@ -408,9 +428,11 @@
 
   urlInput.addEventListener('keydown', e => {
     if (e.key !== 'Enter') return;
-    const target = normalizeUrl(urlInput.value); // capture before newTab clears it
-    if (!curActiveId()) newTab(activeWorkspaceId, '');
-    load(activeWv(), target);
+    const target = normalizeUrl(urlInput.value);
+    // no active tab → open one straight onto the URL (a blank newTab would
+    // clear + refocus the url bar, leaving it empty while the page loads)
+    if (!curActiveId()) newTab(activeWorkspaceId, target);
+    else load(activeWv(), target);
   });
   backBtn.onclick = () => {
     const w = activeWv();
@@ -445,17 +467,88 @@
   // initial paint so the strip is correct even before the first open
   renderTabs();
 
+  // popups routed from main (setWindowOpenHandler on the guest — the webview
+  // `new-window` DOM event no longer exists): open as a tab in the OPENER's
+  // project so background-project popups don't hijack the current screen
+  window.deck.onBrowserPopup(({ url, openerId }) => {
+    let wsId = activeWorkspaceId;
+    wvById.forEach((wv, tid) => {
+      try {
+        if (wv.getWebContentsId() === openerId) {
+          const t = getTab(tid);
+          if (t) wsId = t.wsId;
+        }
+      } catch { /* not attached yet */ }
+    });
+    newTab(wsId, url);
+  });
+
+  // hotkeys forwarded from main — keys pressed INSIDE the guest page never
+  // bubble to this document, so Esc/Ctrl+T/W/L would die once the page has focus
+  window.deck.onBrowserHotkey(({ key, mod }) => {
+    if (!browserOpen) return;
+    if (key === 'escape') {
+      if (view.classList.contains('fullview')) setFullview(false);
+      else closeBrowserView();
+    } else if (mod && key === 't') newTab(activeWorkspaceId, '');
+    else if (mod && key === 'w' && curActiveId()) closeTab(curActiveId());
+    else if (mod && key === 'l') { urlInput.focus(); urlInput.select(); }
+  });
+
   window.browserViewOpen = () => browserOpen;
   window.closeBrowserView = closeBrowserView;
-  // terminal link ctrl+click → open in-app instead of the OS browser
+  const stripSlash = u => String(u || '').replace(/\/$/, '');
+  // terminal link ctrl+click → open in-app instead of the OS browser.
+  // Reuse before create: an existing tab on the same URL is focused (repeat
+  // clicks on a dev-server link must not spam tabs), an empty "New Tab" is
+  // navigated in place, and only then does a fresh tab open.
   window.openUrlInBrowser = (url) => {
+    const isEmpty = t => t && (!t.url || t.url === HOME_URL);
+    const existing = tabs.find(t =>
+      t.wsId === activeWorkspaceId && stripSlash(t.url) === stripSlash(url));
+    const act = getTab(curActiveId());
+    // reuse ANY empty "New Tab" in this project (active one first) — a
+    // non-active empty tab must not linger while a fresh tab opens beside it
+    const empty = isEmpty(act) ? act
+      : tabs.find(t => t.wsId === activeWorkspaceId && isEmpty(t)) || null;
+    let tab = existing || empty || newTab(activeWorkspaceId, url);
     openBrowserView();
-    newTab(activeWorkspaceId, url);
+    setActiveTab(tab.id);
+    if (tab === empty) {
+      tab.url = url;
+      saveTabs();
+      load(ensureWv(tab), url);
+      renderTabs();
+    }
+    // show the target immediately and give focus to the page, not the url
+    // bar — a focused bar blocks syncUrlBar on every later did-navigate,
+    // leaving it blank until a manual refresh
+    urlInput.blur();
+    urlInput.value = url;
+    return tab;
   };
   // projects added / removed / renamed / recolored / switched → re-sync strip
   window.browserProjectsChanged = () => {
     pruneTabs();
     if (browserOpen) setActiveTab(curActiveId());
     renderTabs();
+  };
+
+  // internals for the automation bridge (renderer/src/bridge.js) — the bridge
+  // drives the same tabs/webviews the user sees, it is not a parallel browser
+  window.__bw = {
+    tabs: () => tabs,
+    getTab,
+    wvById,
+    ensureWv,
+    newTab,
+    setActiveTab,
+    closeTab,
+    curActiveId,
+    openBrowserView,
+    closeBrowserView,
+    isOpen: () => browserOpen,
+    normalizeUrl,
+    HOME_URL,
   };
 })();

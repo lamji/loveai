@@ -233,9 +233,34 @@ document.getElementById('sb-project').onclick = () => { if (window.openRecentPro
 // Shows whether the regression-impact graph is precomputed, whether its fs
 // watcher is running, and when it was last built. Click = rebuild (progress
 // bar). Status IPC is throttled (not the 1s tick); progress comes from events.
-const sbGraph = { building: false, pct: 0, lastError: '', phase: 'graph' };
+const sbGraph = {
+  building: false, pct: 0, lastError: '', phase: 'graph',
+  startedAt: 0,       // when this build began (drives the label alternation)
+  lastProgressAt: 0,  // last progress event (detects a stalled-looking phase)
+};
 let sbGraphFetchAt = 0;
 let sbGraphProj = null;
+
+// plain-language build notes — the status label alternates between the
+// percentage and one of these every few seconds, so a long-running build on a
+// large codebase reads as "working, be patient" instead of "stuck at 0%"
+function sbHumanMsg(now) {
+  const stalled = now - (sbGraph.lastProgressAt || now) > 8000;
+  if (sbGraph.phase === 'count') return 'scanning project files…';
+  if (sbGraph.phase === 'vectors') {
+    if (!sbGraph.pct) return 'loading embedding model — can take a minute…';
+    if (stalled) return 'still embedding — large codebase, hang tight…';
+    return sbGraph.resumed
+      ? 'resumed previous embedding — continuing…'
+      : 'embedding symbols — large repos take minutes…';
+  }
+  if (!sbGraph.pct) {
+    return stalled ? 'still initializing the parser…' : 'starting code parse…';
+  }
+  return stalled
+    ? 'still parsing — big repo, this takes time…'
+    : 'parsing code — large repos can take minutes…';
+}
 
 function graphAgo(ts) {
   if (!ts) return '';
@@ -255,12 +280,25 @@ function paintGraph(st) {
   item.classList.remove('hidden');
   if (sbGraph.building || (st && st.building)) {
     item.classList.add('building');
+    const now = Date.now();
+    if (!sbGraph.startedAt) sbGraph.startedAt = now;
     const lbl = sbGraph.phase === 'vectors' ? 'vectors' : 'graph';
-    txt.textContent = lbl + ' ⏳ ' + (sbGraph.pct || 0) + '%';
+    const pctTxt = sbGraph.phase === 'count'
+      ? 'graph ⏳ scanning…'
+      : lbl + ' ⏳ ' + (sbGraph.pct || 0) + '%';
+    // after the first few seconds, ALTERNATE the label between the percentage
+    // and a human note every ~4s (per the 1s repaint tick) until finished —
+    // long builds keep re-announcing that they're alive and expected to be slow
+    let label = pctTxt;
+    if (now - sbGraph.startedAt > 5000 && Math.floor(now / 4000) % 2 === 1) {
+      label = sbHumanMsg(now);
+    }
+    txt.textContent = label;
     if (bar) { bar.classList.remove('hidden'); bar.querySelector('i').style.width = (sbGraph.pct || 0) + '%'; }
-    item.title = sbGraph.phase === 'vectors'
+    item.title = (sbGraph.phase === 'vectors'
       ? 'Embedding symbols for semantic search…'
-      : 'Building code graph…';
+      : 'Building code graph…')
+      + '\nLarge codebases can take several minutes — progress keeps updating here.';
     return;
   }
   item.classList.remove('building');
@@ -305,7 +343,12 @@ async function refreshGraphStatus(force) {
     sbGraph.pct = 0;
     sbGraph.phase = 'graph';
     sbGraph.lastError = '';
+    sbGraph.startedAt = 0;
+    sbGraph.lastProgressAt = 0;
+    sbGraph.resumed = false;
   }
+  // animate the alternating build label on every 1s tick (paint is cheap)
+  if (sbGraph.building) paintGraph({ building: true });
   const now = Date.now();
   if (!force && now - sbGraphFetchAt < 4000) return;            // throttle — not every 1s tick
   sbGraphFetchAt = now;
@@ -316,10 +359,14 @@ document.getElementById('sb-graph').onclick = async () => {
   const pd = (typeof projectDir !== 'undefined') && projectDir;
   if (!pd || sbGraph.building) return;
   sbGraph.building = true; sbGraph.pct = 0; sbGraph.phase = 'graph';
+  sbGraph.startedAt = Date.now(); sbGraph.lastProgressAt = Date.now();
   paintGraph({ building: true });
   // keep the result — a failed build repainted as "no graph yet" otherwise
   let r = null;
   try { r = await window.deck.codegraphBuild(pd); } catch {}
+  // "already building" = a background rebuild is running; its progress events
+  // now stream into this same bar — that's a wait, not an error
+  if (r && !r.ok && r.error === 'already building') return;
   sbGraph.building = false;   // 'codegraph-updated' also finalizes; guards a silent finish
   sbGraph.lastError = (r && !r.ok && r.error) ? r.error : '';
   refreshGraphStatus(true);
@@ -327,7 +374,26 @@ document.getElementById('sb-graph').onclick = async () => {
 window.deck.onCodegraphProgress((p) => {
   const pd = (typeof projectDir !== 'undefined') && projectDir;
   if (!pd || p.cwd !== pd) return;
-  sbGraph.building = true; sbGraph.phase = 'graph';
+  const now = Date.now();
+  if (p.phase === 'done') {
+    // graph finished (background builds included — they stream here now). If a
+    // vector build follows, its own progress events re-open the bar as 'vectors'.
+    sbGraph.building = false; sbGraph.pct = 100; sbGraph.phase = 'graph';
+    sbGraph.startedAt = 0; sbGraph.lastProgressAt = 0;
+    refreshGraphStatus(true);
+    return;
+  }
+  if (p.phase === 'error') {
+    sbGraph.building = false; sbGraph.phase = 'graph';
+    sbGraph.startedAt = 0; sbGraph.lastProgressAt = 0;
+    sbGraph.lastError = p.error || 'build failed';
+    refreshGraphStatus(true);
+    return;
+  }
+  sbGraph.building = true;
+  sbGraph.phase = (p.phase === 'count' || p.phase === 'init') ? 'count' : 'graph';
+  if (!sbGraph.startedAt) sbGraph.startedAt = now;
+  sbGraph.lastProgressAt = now;
   sbGraph.pct = p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
   paintGraph({ building: true });
 });
@@ -339,6 +405,8 @@ window.deck.onCodegraphUpdated((p) => {
   // bar keeps running until vectors.json actually exists. Otherwise the user sees
   // "100%" while the vector index is still missing.
   sbGraph.building = true; sbGraph.phase = 'vectors'; sbGraph.pct = 0;
+  sbGraph.startedAt = Date.now(); sbGraph.lastProgressAt = Date.now();
+  sbGraph.resumed = false;   // the first vector-progress jump re-detects it
   paintGraph({ building: true });
 });
 // vector-embedding progress (second half of a build)
@@ -346,6 +414,11 @@ window.deck.onVectorProgress((p) => {
   const pd = (typeof projectDir !== 'undefined') && projectDir;
   if (!pd || p.cwd !== pd) return;
   sbGraph.building = true; sbGraph.phase = 'vectors';
+  if (!sbGraph.startedAt) sbGraph.startedAt = Date.now();
+  sbGraph.lastProgressAt = Date.now();
+  // a big first jump (bar was at 0, suddenly ≥5%) = a checkpoint resumed —
+  // the alternating label then says so instead of implying a fresh build
+  if (!sbGraph.pct && p.total && p.done / p.total >= 0.05) sbGraph.resumed = true;
   sbGraph.pct = p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
   paintGraph({ building: true });
 });
@@ -356,6 +429,7 @@ window.deck.onVectorUpdated((p) => {
   // build (vectors phase) should finalize the bar.
   if (sbGraph.phase !== 'vectors' || !sbGraph.building) return;
   sbGraph.building = false; sbGraph.pct = 100; sbGraph.phase = 'graph';
+  sbGraph.startedAt = 0; sbGraph.lastProgressAt = 0; sbGraph.resumed = false;
   sbGraph.lastError = (p && p.ok === false)
     ? ('vector embedding failed' + (p.error ? ': ' + p.error : '')) : '';
   refreshGraphStatus(true);

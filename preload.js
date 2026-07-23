@@ -73,7 +73,9 @@ contextBridge.exposeInMainWorld('deck', {
   symbolEnsure: (cwd) => ipcRenderer.invoke('symbol-ensure', cwd),
   symbolWatch: (cwd) => ipcRenderer.invoke('symbol-watch', cwd),
   onSymbolUpdated: (cb) => ipcRenderer.on('symbol-updated', (_e, p) => cb(p)),
-  retrieveContext: (cwd, query, k, withContent) => ipcRenderer.invoke('retrieve-context', { cwd, query, k, withContent }),
+  retrieveContext: (cwd, query, k) => ipcRenderer.invoke('retrieve-context', { cwd, query, k }),
+  evalLog: (cwd, entry) => ipcRenderer.invoke('eval-log', { cwd, entry }),
+  evalStats: (cwd) => ipcRenderer.invoke('eval-stats', cwd),
   retrieveSymbols: (cwd, query, budget, comments) => ipcRenderer.invoke('retrieve-symbols', { cwd, query, budget, comments }),
   regressionImpact: (cwd, prompt) => ipcRenderer.invoke('regression-impact', { cwd, prompt }),
   codegraphStatus: (cwd) => ipcRenderer.invoke('codegraph-status', cwd),
@@ -116,5 +118,9 @@ contextBridge.exposeInMainWorld('deck', {
   saasSkillsPush: () => ipcRenderer.invoke('saas-skills-push'),
   saasSkillsPull: () => ipcRenderer.invoke('saas-skills-pull'),
   onAuthChanged: (cb) => ipcRenderer.on('auth-changed', (_e, p) => cb(p)),
+  onBridgeCmd: (cb) => ipcRenderer.on('bridge-cmd', (_e, p) => cb(p)),
+  bridgeReply: (id, result) => ipcRenderer.send('bridge-reply', { id, result }),
+  onBrowserPopup: (cb) => ipcRenderer.on('browser-popup', (_e, p) => cb(p)),
+  onBrowserHotkey: (cb) => ipcRenderer.on('browser-hotkey', (_e, p) => cb(p)),
   claudeSetupCheck: () => ipcRenderer.invoke('claude-setup-check')
 });

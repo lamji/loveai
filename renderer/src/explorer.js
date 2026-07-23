@@ -649,9 +649,9 @@ async function exCopyRelativePath(item) {
   toast('✓ relative path copied');
 }
 
-// ----- send a reference into the main chat composer, like typing @path -----
+// ----- send a reference into the main chat composer (the dock), like typing @path -----
 function exSendToChat(item) {
-  const ci = document.getElementById('chat-input');
+  const ci = document.getElementById('ad-input');
   if (!ci) return;
   const rel = exRelPath(item.path);
   const sep = ci.value && !/\s$/.test(ci.value) ? ' ' : '';

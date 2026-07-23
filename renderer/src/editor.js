@@ -625,7 +625,7 @@ sendAiBtn.addEventListener('click', () => {
   if (window.toggleSidebar && document.getElementById('sidebar').classList.contains('collapsed')) {
     window.toggleSidebar();
   }
-  const ci = document.getElementById('chat-input');
+  const ci = document.getElementById('ad-input');
   if (ci) ci.focus();
   if (window.toast) toast('Selection attached as context', true);
 });

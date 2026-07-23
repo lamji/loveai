@@ -338,6 +338,20 @@
     finishTicketRun(id);
   }
 
+  // persist the ticket's session linkage the INSTANT the run gets a session id
+  // (runAgent's onSession, fired on 'init'), not only at graceful onDone — a run
+  // the operator kills by restarting the app never reaches onDone, and the
+  // follow-up would then start cold with no context. Store agentId too so the
+  // resume guard (t.lastAgentId === aid) still matches on the next run.
+  function onTicketSession(id, agentId, sid) {
+    const t = ticketById(id);
+    if (t && sid) {
+      t.lastAgentId = agentId;
+      t.lastSessionId = sid;
+      tkSave();
+    }
+  }
+
   // each project's pipeline is independent — when ONE ends, only clear the
   // ticket(s) that were waiting on THAT project's pipeline, not every
   // pipeline-driven ticket across every open project.
@@ -382,6 +396,7 @@
         effort,
         resume: resume || undefined,
         fork: resume ? false : undefined,
+        onSession: sid => onTicketSession(id, aid, sid),
         onDone: () => onTicketAgentDone(id, aid)
       });
       navAgentId = aid;
@@ -401,6 +416,7 @@
         effort,
         resume: resume || undefined,
         fork: resume ? false : undefined,
+        onSession: sid => onTicketSession(id, a.id, sid),
         onDone: () => onTicketAgentDone(id, a.id)
       });
       navAgentId = a.id;
@@ -451,6 +467,7 @@
       runAgent(agentId, text, false, false, {
         resume: t.lastSessionId || undefined,
         fork: false,
+        onSession: sid => onTicketSession(id, agentId, sid),
         onDone: () => onTicketAgentDone(id, agentId)
       });
       // follow the resumed session into the console instead of leaving the

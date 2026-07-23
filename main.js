@@ -3,9 +3,18 @@ const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, session } =
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const http = require('http');
+const crypto = require('crypto');
 const { execFile, spawn } = require('child_process');
-let query;
-const sdkReady = import('@anthropic-ai/claude-agent-sdk').then(m => { query = m.query; });
+let query, sdkTool, createSdkMcpServer;
+const sdkReady = import('@anthropic-ai/claude-agent-sdk').then(m => {
+  query = m.query;
+  sdkTool = m.tool;                            // in-process MCP tool builder
+  createSdkMcpServer = m.createSdkMcpServer;   // in-process MCP server wrapper
+});
+// zod — schema lib the SDK's tool() helper requires (ships with the SDK)
+let z = null;
+try { ({ z } = require('zod')); } catch {}
 
 // The Claude Code native binary (claude.exe) ships as a sibling package of the
 // SDK. Inside a packaged app it lives under app.asar — but a binary can't be
@@ -113,6 +122,8 @@ function configureSandboxSession() {
 app.whenReady().then(() => {
   saas.init(send);
   configureSandboxSession();
+  wireNetworkLog();
+  startBridgeServer();
   createWindow();
   // cold start via the protocol link (app wasn't running): URL is in OUR argv
   const url = deepLinkIn(process.argv);
@@ -234,8 +245,8 @@ const AUTH_WEBPREFS = {
 // "Sign in with Google" popups need a REAL desktop-Chrome window (Google
 // rejects embedded webviews). We share persist:sandbox so the session cookie
 // it sets is visible to the sandbox <webview> after the window closes.
-ipcMain.handle('open-auth-window', (_e, { url, returnOrigin } = {}) => {
-  if (!isAuthHost(url)) return { ok: false };
+function openAuthWindow(url, returnOrigin) {
+  if (!isAuthHost(url)) return Promise.resolve({ ok: false });
   return new Promise(resolve => {
     try {
       const w = new BrowserWindow({
@@ -259,7 +270,198 @@ ipcMain.handle('open-auth-window', (_e, { url, returnOrigin } = {}) => {
       w.loadURL(url);
     } catch (error) { resolve({ ok: false, error: String(error) }); }
   });
+}
+ipcMain.handle('open-auth-window', (_e, { url, returnOrigin } = {}) =>
+  openAuthWindow(url, returnOrigin));
+
+// ===== Sandbox popup routing + guest hotkeys ==============================
+// The <webview> `new-window` DOM event was REMOVED in Electron 22, so popup
+// handling must live here. window.open / target=_blank from a sandbox guest:
+// OAuth hosts get the native shared-session window; other http(s) URLs become
+// an in-app tab in the opener's project (renderer maps openerId → tab).
+app.on('web-contents-created', (_e, contents) => {
+  if (contents.getType() !== 'webview') return;
+  let sandbox = false;
+  try {
+    sandbox = contents.session === session.fromPartition('persist:sandbox');
+  } catch {}
+  if (!sandbox) return;
+  contents.setWindowOpenHandler(({ url }) => {
+    if (isAuthHost(url)) {
+      let origin = '';
+      try { origin = new URL(contents.getURL()).origin; } catch {}
+      // after sign-in the shared cookie is set — reload so the page sees it
+      openAuthWindow(url, origin).then(() => {
+        try { contents.reload(); } catch {}
+      });
+    } else if (/^https?:\/\//i.test(String(url))) {
+      send('browser-popup', { url, openerId: contents.id });
+    }
+    return { action: 'deny' };
+  });
+  // keys pressed while the guest page has focus never reach the host DOM —
+  // forward the browser screen's few shortcuts (Esc, Ctrl+T/W/L)
+  contents.on('before-input-event', (_ev, input) => {
+    if (input.type !== 'keyDown') return;
+    const mod = !!(input.control || input.meta);
+    const key = String(input.key || '').toLowerCase();
+    if (key === 'escape' || (mod && ['t', 'w', 'l'].includes(key))) {
+      send('browser-hotkey', { key, mod });
+    }
+  });
 });
+
+// ===== BROWSER BRIDGE =====================================================
+// In-app Playwright alternative: drives the sandbox browser's REAL <webview>
+// guests through the renderer (renderer/src/bridge.js executes each command
+// against the live page — no separate browser spawn, so it's near-instant).
+// Exposed two ways:
+//   1. an in-process MCP server for agent runs (buildBrowserServer below)
+//   2. a token-gated localhost HTTP endpoint for CLIs (browserctl.js) — the
+//      port/token land in every in-app terminal's env and in
+//      ~/.loveai/browser-bridge.json for external Claude Code sessions.
+const bridgePending = new Map();   // id → { resolve, timer }
+let bridgeSeq = 0;
+
+function browserCmd(cmd, timeoutMs) {
+  return new Promise(resolve => {
+    if (!win || win.isDestroyed()) {
+      return resolve({ ok: false, error: 'app window not available' });
+    }
+    const id = ++bridgeSeq;
+    const timer = setTimeout(() => {
+      bridgePending.delete(id);
+      resolve({ ok: false, error: `bridge timeout on "${cmd && cmd.op}"` });
+    }, timeoutMs || 15000);
+    bridgePending.set(id, { resolve, timer });
+    win.webContents.send('bridge-cmd', { id, cmd });
+  });
+}
+ipcMain.on('bridge-reply', (_e, { id, result } = {}) => {
+  const p = bridgePending.get(id);
+  if (!p) return;
+  clearTimeout(p.timer);
+  bridgePending.delete(id);
+  p.resolve(result || { ok: false, error: 'empty bridge reply' });
+});
+
+// passive network log for the sandbox partition (ring buffer, newest last) —
+// served straight from main, no renderer round-trip
+const NET_LOG_MAX = 400;
+const netLog = [];
+const netStarts = new Map();       // requestId → start ts
+function pushNet(entry) {
+  netLog.push(entry);
+  if (netLog.length > NET_LOG_MAX) netLog.splice(0, netLog.length - NET_LOG_MAX);
+}
+function wireNetworkLog() {
+  try {
+    const wr = session.fromPartition('persist:sandbox').webRequest;
+    const filter = { urls: ['http://*/*', 'https://*/*'] };
+    wr.onBeforeRequest(filter, (d, cb) => {
+      netStarts.set(d.id, Date.now());
+      cb({});
+    });
+    wr.onCompleted(filter, d => {
+      const t0 = netStarts.get(d.id);
+      netStarts.delete(d.id);
+      pushNet({
+        ts: Date.now(), method: d.method, url: d.url, status: d.statusCode,
+        type: d.resourceType, ms: t0 ? Date.now() - t0 : null,
+        fromCache: !!d.fromCache
+      });
+    });
+    wr.onErrorOccurred(filter, d => {
+      const t0 = netStarts.get(d.id);
+      netStarts.delete(d.id);
+      pushNet({
+        ts: Date.now(), method: d.method, url: d.url, error: d.error,
+        type: d.resourceType, ms: t0 ? Date.now() - t0 : null
+      });
+    });
+  } catch (e) { console.error('bridge network log failed', e); }
+}
+
+// single entry point used by BOTH the MCP tools and the HTTP endpoint
+async function bridgeDispatch(cmd) {
+  const op = cmd && cmd.op;
+  if (!op) return { ok: false, error: 'missing op' };
+  if (op === 'network') {
+    const q = String(cmd.filter || '').toLowerCase();
+    let list = netLog.slice();
+    if (q) list = list.filter(e => e.url.toLowerCase().includes(q));
+    if (cmd.since > 0) list = list.filter(e => e.ts >= cmd.since);
+    return { ok: true, now: Date.now(), requests: list.slice(-(cmd.limit || 50)) };
+  }
+  // per-op IPC timeouts: waitFor polls up to its own timeout in the renderer,
+  // open/navigate can wait attach (10s) + load settle (8s) on a cold tab
+  const timeout = op === 'waitFor' ? (Number(cmd.timeoutMs) || 15000) + 5000
+    : (op === 'open' || op === 'navigate' || op === 'screenshot') ? 30000
+    : undefined;
+  const r = await browserCmd(cmd, timeout);
+  if (r && r.ok && op === 'screenshot' && r.dataUrl) {
+    try {
+      const b64 = String(r.dataUrl).split(',')[1] || '';
+      const file = (cmd.path && path.isAbsolute(String(cmd.path)))
+        ? String(cmd.path)
+        : path.join(os.tmpdir(), 'loveai-shots', `shot-${Date.now()}.png`);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, Buffer.from(b64, 'base64'));
+      delete r.dataUrl;
+      r.path = file;
+    } catch (e) {
+      return { ok: false, error: 'screenshot save failed: ' + (e.message || e) };
+    }
+  }
+  return r;
+}
+
+// ---- localhost HTTP endpoint (token-gated, loopback only) ----------------
+const BRIDGE_TOKEN = crypto.randomBytes(16).toString('hex');
+let BRIDGE_PORT = 0;
+const bridgeInfoFile = () =>
+  path.join(os.homedir(), '.loveai', 'browser-bridge.json');
+
+function startBridgeServer() {
+  const server = http.createServer((req, res) => {
+    const respond = (code, obj) => {
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    const u = new URL(req.url, 'http://127.0.0.1');
+    const token = req.headers['x-bridge-token'] || u.searchParams.get('token');
+    if (token !== BRIDGE_TOKEN) return respond(401, { ok: false, error: 'bad token' });
+    if (req.method === 'GET' && u.pathname === '/health') {
+      return respond(200, { ok: true, app: 'loveai', pid: process.pid });
+    }
+    if (req.method !== 'POST') {
+      return respond(405, { ok: false, error: 'POST a JSON command to /cmd' });
+    }
+    let body = '';
+    req.on('data', c => {
+      body += c;
+      if (body.length > 2e6) req.destroy();
+    });
+    req.on('end', async () => {
+      let cmd;
+      try { cmd = JSON.parse(body || '{}'); }
+      catch { return respond(400, { ok: false, error: 'invalid JSON' }); }
+      try { respond(200, await bridgeDispatch(cmd)); }
+      catch (e) { respond(500, { ok: false, error: String(e.message || e) }); }
+    });
+  });
+  server.on('error', e => console.error('bridge server error', e));
+  server.listen(0, '127.0.0.1', () => {
+    BRIDGE_PORT = server.address().port;
+    try {
+      fs.mkdirSync(path.dirname(bridgeInfoFile()), { recursive: true });
+      fs.writeFileSync(bridgeInfoFile(), JSON.stringify({
+        port: BRIDGE_PORT, token: BRIDGE_TOKEN, pid: process.pid,
+        started: Date.now()
+      }, null, 2));
+    } catch (e) { console.error('bridge info write failed', e); }
+  });
+}
 
 // clipboard lives in the main process — a sandboxed preload can't touch it directly
 ipcMain.handle('clipboard-read', () => { try { return clipboard.readText(); } catch { return ''; } });
@@ -431,50 +633,36 @@ function indexDir(cwd) {
   return path.join(cwd || process.env.USERPROFILE, '.loveai', 'index');
 }
 
-const INDEX_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.loveai', '.next', 'coverage']);
-const INDEX_EXTS = new Set(['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'json', 'html', 'css', 'scss', 'md', 'py', 'go', 'rs', 'java', 'cs', 'php', 'rb', 'vue', 'svelte', 'yml', 'yaml', 'toml', 'sql']);
-const INDEX_MAX_FILES = 5000;
+// Walk rules (skip dirs, gitignore awareness, caps) + the UNIFIED traversal
+// live in walker.js — shared with the codegraph parse worker so every indexer
+// skips and caps identically instead of four hand-rolled walkers drifting.
+const {
+  INDEX_SKIP_DIRS, INDEX_EXTS, INDEX_MAX_FILES, SYMBOL_MAX_BYTES,
+  skipDir, walkRepo,
+} = require('./walker');
 
-function projectFingerprint(cwd) {
+// ASYNC (unified walker) — this was the one remaining SYNCHRONOUS tree walk
+// on the main process; index-status hit it per call. Keys are forward-slash
+// rels now (one-time staleness vs old backslash-keyed fingerprints, which
+// self-heals on the next index-mark).
+async function projectFingerprint(cwd) {
   const root = cwd || process.env.USERPROFILE;
   const fp = {};
-  let count = 0;
-
-  function walk(dir) {
-    if (count >= INDEX_MAX_FILES) return;
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const d of entries) {
-      if (count >= INDEX_MAX_FILES) return;
-      if (d.isDirectory()) {
-        if (d.name.startsWith('.') || INDEX_SKIP_DIRS.has(d.name)) continue;
-        walk(path.join(dir, d.name));
-      } else if (d.isFile()) {
-        const ext = path.extname(d.name).slice(1).toLowerCase();
-        if (!INDEX_EXTS.has(ext)) continue;
-        const full = path.join(dir, d.name);
-        try {
-          const stat = fs.statSync(full);
-          const rel = path.relative(root, full);
-          fp[rel] = `${stat.mtimeMs}:${stat.size}`;
-          count++;
-        } catch {}
-      }
-    }
-  }
-
-  try { walk(root); } catch {}
+  await walkRepo(root, { exts: INDEX_EXTS }, async ({ full, rel }) => {
+    const stat = await fs.promises.stat(full);
+    fp[rel] = `${stat.mtimeMs}:${stat.size}`;
+  });
   return fp;
 }
 
-ipcMain.handle('index-status', (_e, cwd) => {
+ipcMain.handle('index-status', async (_e, cwd) => {
   try {
     const dir = indexDir(cwd);
     const mapExists = fs.existsSync(path.join(dir, 'PROJECT-MAP.md'));
     const stored = readJson(path.join(dir, 'fingerprint.json'));
     if (!stored || !mapExists) return { exists: false, stale: false, changedFiles: [] };
 
-    const current = projectFingerprint(cwd);
+    const current = await projectFingerprint(cwd);
     const changedFiles = [];
     for (const rel of Object.keys(current)) {
       if (stored[rel] !== current[rel]) changedFiles.push(rel);
@@ -494,11 +682,11 @@ ipcMain.handle('index-status', (_e, cwd) => {
   }
 });
 
-ipcMain.handle('index-mark', (_e, cwd) => {
+ipcMain.handle('index-mark', async (_e, cwd) => {
   try {
     const dir = indexDir(cwd);
     fs.mkdirSync(dir, { recursive: true });
-    const fp = projectFingerprint(cwd);
+    const fp = await projectFingerprint(cwd);
     fs.writeFileSync(path.join(dir, 'fingerprint.json'), JSON.stringify(fp, null, 2), 'utf8');
     buildSymbolIndexOnce(cwd).catch(() => {});   // rebuild lexical index in background (non-blocking)
     return true;
@@ -510,7 +698,6 @@ ipcMain.handle('index-mark', (_e, cwd) => {
 // ===== Lexical retrieval — symbol index + BM25 (no embeddings, no Python) =====
 // Gives the Prompt Engineer the files most likely involved in an issue up front,
 // so it reads a handful instead of grepping the whole repo. Pure Node, offline.
-const SYMBOL_MAX_BYTES = 400 * 1024;
 const STOP = new Set(['the', 'and', 'for', 'with', 'this', 'that', 'from', 'into', 'when', 'then', 'not', 'but', 'you', 'are', 'was', 'will', 'add', 'fix', 'use', 'get', 'set', 'new', 'now', 'has', 'have', 'should', 'need', 'want', 'make', 'change', 'update', 'issue', 'bug', 'feature', 'file', 'code', 'function', 'const', 'let', 'var', 'return', 'import', 'export']);
 
 // null-prototype map for identifier-keyed lookups. Source symbols are OFTEN
@@ -546,48 +733,31 @@ function extractSymbols(text) {
 // ASYNC + yielding: reads files with fs.promises and hands control back to the
 // event loop every batch, so indexing a big repo NEVER freezes the main process
 // (which froze the whole window — "Not Responding" — when this ran synchronously).
-let symbolBuilding = null;   // in-flight build per app (dedupe concurrent calls)
+const symbolBuilding = {};   // cwd -> in-flight build promise (dedupe per PROJECT —
+                             // a single global here handed project B project A's index)
 const symbolCache = {};      // cwd -> index kept in memory (fast reuse + incremental updates)
 const symbolWatchers = {};   // cwd -> { watcher, timer, pending:Set }
 async function buildSymbolIndex(cwd) {
   const root = cwd || process.env.USERPROFILE;
   const files = {};
-  let count = 0, sinceYield = 0;
-  const yieldSoon = () => new Promise((r) => setImmediate(r));
-  async function walk(dir) {
-    if (count >= INDEX_MAX_FILES) return;
-    let entries;
-    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
-    for (const d of entries) {
-      if (count >= INDEX_MAX_FILES) return;
-      if (d.isDirectory()) {
-        if (!d.name.startsWith('.') && !INDEX_SKIP_DIRS.has(d.name)) await walk(path.join(dir, d.name));
-        continue;
-      }
-      const ext = path.extname(d.name).slice(1).toLowerCase();
-      if (!INDEX_EXTS.has(ext) || ext === 'json') continue;   // json rarely useful to rank
-      const full = path.join(dir, d.name);
-      try {
-        const stat = await fs.promises.stat(full);
-        if (stat.size > SYMBOL_MAX_BYTES) continue;
-        const text = await fs.promises.readFile(full, 'utf8');
-        const rel = path.relative(root, full).replace(/\\/g, '/');
-        const symbols = extractSymbols(text);
-        const tf = dict();
-        const bump = (s, w) => { for (const t of tokenize(s)) tf[t] = (tf[t] || 0) + w; };
-        for (const s of symbols) bump(s, 4);          // symbol names weigh most
-        bump(rel.replace(/[\/.]/g, ' '), 3);          // path + filename
-        const ids = text.match(/[A-Za-z_$][\w$]{2,}/g) || [];
-        let len = 0;
-        for (const id of ids) { for (const t of tokenize(id)) { tf[t] = (tf[t] || 0) + 1; len++; } }
-        files[rel] = { symbols: symbols.slice(0, 30), tf, len: len || 1 };
-        count++;
-        if (++sinceYield >= 30) { sinceYield = 0; await yieldSoon(); }   // keep UI responsive
-      } catch {}
-    }
-  }
-  await walk(root);
-  const idx = { built: Date.now(), avgLen: 1, files };
+  const count = await walkRepo(root, { exts: INDEX_EXTS }, async ({ full, rel, ext }) => {
+    if (ext === 'json') return false;   // json rarely useful to rank
+    const stat = await fs.promises.stat(full);
+    if (stat.size > SYMBOL_MAX_BYTES) return false;
+    const text = await fs.promises.readFile(full, 'utf8');
+    const symbols = extractSymbols(text);
+    const tf = dict();
+    const bump = (s, w) => { for (const t of tokenize(s)) tf[t] = (tf[t] || 0) + w; };
+    for (const s of symbols) bump(s, 4);          // symbol names weigh most
+    bump(rel.replace(/[\/.]/g, ' '), 3);          // path + filename
+    const ids = text.match(/[A-Za-z_$][\w$]{2,}/g) || [];
+    let len = 0;
+    for (const id of ids) { for (const t of tokenize(id)) { tf[t] = (tf[t] || 0) + 1; len++; } }
+    files[rel] = { symbols: symbols.slice(0, 30), tf, len: len || 1 };
+  });
+  // surfaced in the repo map + search_code so agents never mistake a capped
+  // index for full coverage on a big repo
+  const idx = { built: Date.now(), avgLen: 1, truncated: count >= INDEX_MAX_FILES, files };
   recomputeAvgLen(idx);
   symbolCache[cwd] = idx;
   await persistIndex(cwd, idx);
@@ -607,11 +777,13 @@ async function persistIndex(cwd, idx) {
     repoMapFromIndex(idx, cwd) + '\n';
   await fs.promises.writeFile(path.join(dir, 'repo-map.md'), md, 'utf8');
 }
-// dedupe: never run two builds for the same import at once
+// dedupe: never run two builds for the same PROJECT at once (keyed by cwd —
+// different projects may build concurrently and must never share a promise)
 function buildSymbolIndexOnce(cwd) {
-  if (symbolBuilding) return symbolBuilding;
-  symbolBuilding = buildSymbolIndex(cwd).finally(() => { symbolBuilding = null; });
-  return symbolBuilding;
+  if (symbolBuilding[cwd]) return symbolBuilding[cwd];
+  symbolBuilding[cwd] = buildSymbolIndex(cwd)
+    .finally(() => { delete symbolBuilding[cwd]; });
+  return symbolBuilding[cwd];
 }
 // use the cached index (memory → disk → build) — the "check if available, else create"
 async function loadOrBuildIndex(cwd) {
@@ -626,7 +798,7 @@ async function indexOneFile(cwd, abs) {
   const idx = symbolCache[cwd]; if (!idx) return false;
   const rel = path.relative(cwd, abs).replace(/\\/g, '/');
   if (rel.startsWith('..')) return false;
-  if (rel.split('/').some((p) => p.startsWith('.') || INDEX_SKIP_DIRS.has(p))) return false;
+  if (rel.split('/').some((p) => skipDir(cwd, p))) return false;
   const ext = path.extname(abs).slice(1).toLowerCase();
   if (!INDEX_EXTS.has(ext) || ext === 'json') return false;
   try {
@@ -642,6 +814,7 @@ async function indexOneFile(cwd, abs) {
     let len = 0;
     for (const id of ids) { for (const t of tokenize(id)) { tf[t] = (tf[t] || 0) + 1; len++; } }
     idx.files[rel] = { symbols: symbols.slice(0, 30), tf, len: len || 1 };
+    invCache.delete(idx);   // file contents changed → cached inverted map is stale
     return true;
   } catch { return false; }
 }
@@ -794,6 +967,10 @@ function dirPurpose(dir, list, idx, cwd) {
 // compact repo map from the index (dirs by file count + top files by symbol
 // density) — gives the agent instant orientation without exploring the tree
 function repoMapFromIndex(idx, cwd) {
+  const capNote = idx.truncated
+    ? `[PARTIAL INDEX — capped at ${INDEX_MAX_FILES} files; unlisted areas exist. ` +
+      `Fall back to Glob/Grep for anything not shown.]\n`
+    : '';
   const dirs = dict();
   for (const rel of Object.keys(idx.files)) {
     const cut = rel.lastIndexOf('/');
@@ -803,7 +980,7 @@ function repoMapFromIndex(idx, cwd) {
   const entries = Object.entries(dirs)
     .sort((a, b) => b[1].length - a[1].length)
     .slice(0, 30);
-  return entries.map(([dir, list]) => {
+  return capNote + entries.map(([dir, list]) => {
     const top = list.sort((a, b) => b.syms - a.syms).slice(0, 3)
       .map(f => f.rel.slice(f.rel.lastIndexOf('/') + 1)).join(', ');
     const purpose = dirPurpose(dir, list, idx, cwd);
@@ -840,364 +1017,78 @@ function retrieve(idx, query, k) {
   return out.slice(0, k || 8);
 }
 
-// ===== NATIVE code knowledge graph — tree-sitter, in-process (GitNexus-style) =====
-// "If you change this symbol, what references it?" A deterministic blast-radius the
-// Prompt Engineer sees BEFORE editing. WASM tree-sitter parses each source file into
-// def nodes (functions/methods/classes) + call/import edges resolved by NAME; we keep
-// an in-memory REVERSE adjacency (def -> {callers, importers}), cached per cwd and
-// persisted to codegraph.json. NOT MCP, NOT a graph DB. If the runtime or a grammar is
-// missing it degrades to a lexical tf reverse-map — a run NEVER blocks on the graph.
+// ===== NATIVE code knowledge graph — tree-sitter, parsed in a WORKER =====
+// "If you change this symbol, what references it?" A deterministic blast-radius
+// the Prompt Engineer sees BEFORE editing. WASM tree-sitter parses each source
+// file into def nodes + call/import edges resolved by NAME. Parsing lives in
+// codegraph-parse.js and runs inside codegraph-worker.js (pure CPU — it used to
+// stutter the main process even with yielding); main keeps assembly, the
+// in-memory REVERSE adjacency (def -> {callers, importers}), caches and
+// persistence (codegraph.json). If the worker/runtime/grammar is unavailable it
+// degrades to the lexical tf reverse-map — a run NEVER blocks on the graph.
+const { LANG_GRAMMAR } = require('./codegraph-parse');
 
-// ext -> prebuilt grammar (tree-sitter-wasms). Only these langs get an AST graph;
-// unknown exts fall through to the lexical fallback. Grammars load LAZILY (below).
-const LANG_GRAMMAR = {
-  js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
-  ts: 'typescript', tsx: 'tsx', py: 'python', go: 'go', rs: 'rust', java: 'java',
-};
-// tree-sitter queries per grammar: def (declarations), call (references), imp (named
-// imports). tsx reuses the typescript set. Each string is compiled independently and
-// skipped on error, so a grammar version drift can't break the whole build.
-const TS_QUERIES_JS = {
-  def: [
-    '(function_declaration name:(identifier)@n)',
-    '(class_declaration name:(identifier)@n)',
-    '(method_definition name:(property_identifier)@n)',
-    '(variable_declarator name:(identifier)@n value:[(arrow_function)(function_expression)])',
-  ],
-  call: [
-    '(call_expression function:(identifier)@n)',
-    '(call_expression function:(member_expression property:(property_identifier)@n))',
-    '(new_expression constructor:(identifier)@n)',   // constructor dependency (new Foo())
-  ],
-  imp: ['(import_specifier name:(identifier)@n)', '(import_clause (identifier)@n)'],
-};
-const TS_QUERIES_TS = {
-  def: [
-    '(function_declaration name:(identifier)@n)',
-    '(class_declaration name:(type_identifier)@n)',
-    '(interface_declaration name:(type_identifier)@n)',
-    '(enum_declaration name:(identifier)@n)',
-    '(method_definition name:(property_identifier)@n)',
-    '(variable_declarator name:(identifier)@n value:[(arrow_function)(function_expression)])',
-  ],
-  call: TS_QUERIES_JS.call,
-  imp: TS_QUERIES_JS.imp,
-};
-const TS_QUERIES = {
-  javascript: TS_QUERIES_JS,
-  typescript: TS_QUERIES_TS,
-  tsx: TS_QUERIES_TS,
-  python: {
-    def: ['(function_definition name:(identifier)@n)', '(class_definition name:(identifier)@n)'],
-    call: [
-      '(call function:(identifier)@n)',
-      '(call function:(attribute attribute:(identifier)@n))',
-    ],
-    imp: ['(import_from_statement name:(dotted_name (identifier)@n))'],
-  },
-  go: {
-    def: [
-      '(function_declaration name:(identifier)@n)',
-      '(method_declaration name:(field_identifier)@n)',
-      '(type_spec name:(type_identifier)@n)',
-    ],
-    call: [
-      '(call_expression function:(identifier)@n)',
-      '(call_expression function:(selector_expression field:(field_identifier)@n))',
-    ],
-    imp: [],
-  },
-  rust: {
-    def: [
-      '(function_item name:(identifier)@n)',
-      '(struct_item name:(type_identifier)@n)',
-      '(enum_item name:(type_identifier)@n)',
-    ],
-    call: [
-      '(call_expression function:(identifier)@n)',
-      '(call_expression function:(scoped_identifier name:(identifier)@n))',
-      '(call_expression function:(field_expression field:(field_identifier)@n))',
-    ],
-    imp: [],
-  },
-  java: {
-    def: [
-      '(method_declaration name:(identifier)@n)',
-      '(class_declaration name:(identifier)@n)',
-      '(interface_declaration name:(identifier)@n)',
-    ],
-    call: ['(method_invocation name:(identifier)@n)'],
-    imp: [],
-  },
-};
-
-// tree-sitter runtime state (all lazy — nothing loads until the first build).
-let tsMod = null;             // the web-tree-sitter module (required lazily)
-let tsReady = null;           // Parser.init() promise (run once)
-let tsParser = null;          // reused Parser instance (setLanguage per file)
-let tsBroken = false;         // runtime/grammar totally unavailable → skip tree-sitter
-let tsInitError = '';         // last real tsInit failure, surfaced via codegraph-status
-let tsInitErrorLogged = false; // log a given failure once per session, not per file
-const tsLangs = {};           // grammar name -> Language (null = failed)
-const tsQueryCache = {};      // grammar name -> { def:[Query], call:[Query], imp:[Query] }
+// mirrors of the worker's tree-sitter health, surfaced via codegraph-status
+let tsBroken = false;          // runtime/grammar totally unavailable → skip tree-sitter
+let tsInitError = '';          // last real init failure, shown in the status bar
+let tsInitErrorLogged = false; // log a given failure once per session, not per build
 const graphCache = {};        // cwd -> in-memory graph
 const graphBuilding = {};     // cwd -> in-flight build promise (dedupe)
 
-// resolve a bundled .wasm, preferring the asar.unpacked copy in a packaged build
-function tsAsset(p) {
-  const unpacked = p.replace('app.asar', 'app.asar.unpacked');
-  try { if (fs.existsSync(unpacked)) return unpacked; } catch {}
-  return p;
-}
-function grammarWasm(name) {
-  return tsAsset(path.join(__dirname, 'node_modules', 'tree-sitter-wasms', 'out',
-    `tree-sitter-${name}.wasm`));
-}
-async function tsInit() {
-  if (tsReady) return tsReady;
-  tsReady = (async () => {
-    try {
-      try {
-        tsMod = require('web-tree-sitter');
-        if (!tsMod || !tsMod.Parser) throw new Error('web-tree-sitter: Parser missing');
-      } catch {
-        // exports-map may resolve oddly under Electron — fall back to the explicit CJS entry
-        tsMod = require('web-tree-sitter/tree-sitter.cjs');
-      }
-      // read the runtime WASM as bytes: passing a path lets the glue code try
-      // fetch() under Electron's renderer-flavored globals, which fails silently
-      const wasmPath = tsAsset(path.join(__dirname, 'node_modules', 'web-tree-sitter',
-        'tree-sitter.wasm'));
-      const wasmBinary = fs.readFileSync(wasmPath);
-      await tsMod.Parser.init({
-        wasmBinary,
-        locateFile(name) {
-          return tsAsset(path.join(__dirname, 'node_modules', 'web-tree-sitter', name));
-        },
-      });
-    } catch (err) {
-      tsInitError = String(err && err.message ? err.message : err);
-      if (!tsInitErrorLogged) {
-        console.error('[codegraph] tree-sitter init failed:', err);
-        tsInitErrorLogged = true;
-      }
-      tsReady = null;   // allow a later retry (e.g. a manual rebuild) to re-attempt
-      throw err;
-    }
-  })();
-  return tsReady;
-}
-async function loadLang(name) {
-  if (name in tsLangs) return tsLangs[name];
-  try {
-    tsLangs[name] = await tsMod.Language.load(fs.readFileSync(grammarWasm(name)));
-  } catch (err) {
-    tsLangs[name] = null;
-    console.error(`[codegraph] grammar load failed (${name}):`, err);
-  }
-  return tsLangs[name];
-}
-function compiledQueries(name, lang) {
-  if (tsQueryCache[name]) return tsQueryCache[name];
-  const spec = TS_QUERIES[name] || {};
-  const out = { def: [], call: [], imp: [] };
-  for (const cat of ['def', 'call', 'imp']) {
-    for (const q of (spec[cat] || [])) {
-      try { out[cat].push(new tsMod.Query(lang, q)); }
-      catch (err) { console.error(`[codegraph] query compile failed (${name}/${cat}):`, err); }
-    }
-  }
-  tsQueryCache[name] = out;
-  return out;
-}
-// ===== Rich symbol records — from a def name node up to its declaration =====
-// A def query captures a NAME identifier; the symbol's extent/type/parent live on
-// the enclosing declaration node. These maps + helpers derive the full record
-// (type, line range, parent, visibility, doc, language) WITHOUT storing source —
-// source is read lazily by line range when a symbol is actually packed, keeping
-// the index small (a Performance goal). Node API per web-tree-sitter 0.25.
-const DECL_TYPES = new Set([
-  'function_declaration', 'function_definition', 'function_item',
-  'generator_function_declaration', 'function_expression', 'arrow_function',
-  'class_declaration', 'class_definition',
-  'method_definition', 'method_declaration',
-  'interface_declaration', 'enum_declaration', 'enum_item',
-  'struct_item', 'trait_item', 'type_spec', 'type_alias_declaration',
-  'variable_declarator', 'lexical_declaration', 'public_field_definition',
-]);
-// enclosing nodes that make a symbol a CHILD (its parent symbol)
-const CONTAINER_TYPES = new Set([
-  'class_declaration', 'class_definition', 'interface_declaration',
-  'struct_item', 'trait_item', 'enum_declaration', 'impl_item',
-  'namespace_declaration', 'internal_module', 'module',
-]);
-// declaration node type -> our coarse symbol.type label
-const TYPE_OF = {
-  function_declaration: 'function', function_definition: 'function',
-  function_item: 'function', generator_function_declaration: 'function',
-  function_expression: 'function', arrow_function: 'function',
-  variable_declarator: 'function', lexical_declaration: 'function',
-  method_definition: 'method', method_declaration: 'method',
-  class_declaration: 'class', class_definition: 'class',
-  interface_declaration: 'interface',
-  enum_declaration: 'enum', enum_item: 'enum',
-  struct_item: 'struct', trait_item: 'trait',
-  type_spec: 'type', type_alias_declaration: 'type',
-  public_field_definition: 'field',
-};
-// walk up from a captured name node to the declaration that owns its extent
-function enclosingDecl(nameNode) {
-  let n = nameNode;
-  while (n && !DECL_TYPES.has(n.type)) n = n.parent;
-  return n || nameNode.parent || nameNode;
-}
-function nodeName(node) {
-  try { const id = node.childForFieldName('name'); if (id && id.text) return id.text; }
-  catch {}
-  return '';
-}
-// nearest enclosing class/interface/struct/namespace name (for symbol.parent)
-function parentSymbol(decl) {
-  let n = decl.parent;
-  while (n) {
-    if (CONTAINER_TYPES.has(n.type)) { const nm = nodeName(n); if (nm) return nm.slice(0, 80); }
-    n = n.parent;
-  }
-  return '';
-}
-// visibility heuristic — accessibility modifier > export/pub > python underscore
-function visibilityOf(decl, grammar, name) {
-  try {
-    for (const c of (decl.namedChildren || [])) {
-      if (!c) continue;
-      if (c.type === 'accessibility_modifier') return c.text;   // TS/Java public/private/protected
-      if (c.type === 'visibility_modifier') return 'pub';        // Rust
-    }
-  } catch {}
-  let n = decl, hops = 0;
-  while (n && hops < 4) {
-    if (n.type === 'export_statement') return 'exported';
-    n = n.parent; hops++;
-  }
-  if (grammar === 'python') return name.startsWith('_') ? 'private' : 'public';
-  return 'public';
-}
-// leading line-comment(s) immediately above the declaration → short doc string
-function leadingDoc(decl) {
-  let n = decl.previousNamedSibling;
-  if (!n && decl.parent && decl.parent.type === 'export_statement') {
-    n = decl.parent.previousNamedSibling;
-  }
-  const parts = [];
-  while (n && n.type === 'comment' && parts.length < 6) {
-    parts.unshift(n.text);
-    n = n.previousNamedSibling;
-  }
-  let doc = parts.join(' ').replace(/^[\/*#\s]+|[*\/\s]+$/g, '').replace(/\s+/g, ' ').trim();
-  if (doc.length > 200) doc = doc.slice(0, 200) + '…';
-  return doc;
-}
-// build the rich record for one captured name node (rel/id filled by the assembler)
-function defRecord(nameNode, grammar, langName) {
-  const name = (nameNode.text || '').slice(0, 80);
-  if (!name) return null;
-  const decl = enclosingDecl(nameNode);
-  const sp = decl.startPosition || { row: 0 };
-  const ep = decl.endPosition || { row: 0 };
-  return {
-    name,
-    type: TYPE_OF[decl.type] || 'symbol',
-    sl: sp.row + 1,
-    el: ep.row + 1,
-    parent: parentSymbol(decl),
-    vis: visibilityOf(decl, grammar, name),
-    doc: leadingDoc(decl),
-    lang: langName,
+// ----- persistent PARSE worker (same protocol/pattern as the vectors worker) -----
+let _cgWorker = null;
+const _cgReqs = new Map();
+let _cgReqId = 0;
+function cgWorker() {
+  if (_cgWorker) return _cgWorker;
+  const w = new Worker(path.join(__dirname, 'codegraph-worker.js'));
+  w.on('message', (m) => {
+    const req = _cgReqs.get(m.id);
+    if (!req) return;
+    if (m.type === 'progress') { if (req.onProgress) req.onProgress(m.done, m.total, m.phase); }
+    else if (m.type === 'done') { _cgReqs.delete(m.id); req.resolve(m); }
+  });
+  const fail = (err) => {
+    // a superseded worker (resetGraphWorker respawned a new one) must NOT
+    // clobber the new worker's state — its exit event arrives late and used
+    // to clear the FRESH build's pending request, killing it at 0%
+    if (_cgWorker !== w) return;
+    for (const [, req] of _cgReqs) req.resolve({ ok: false, error: String(err) });
+    _cgReqs.clear(); _cgWorker = null;   // allow a fresh spawn next request
   };
+  w.on('error', (e) => fail(e && e.message || e));
+  w.on('exit', () => fail('codegraph worker exited'));
+  _cgWorker = w;
+  return w;
 }
-
-// parse one file → { symbols, calls, imps }. symbols are rich def records (deduped
-// by name, first wins — matches the prior name-Set behavior so ids stay unique per
-// file); calls/imps stay name-only for NAME-resolved edge linking. null on failure.
-async function extractFileGraph(text, grammar) {
-  const lang = await loadLang(grammar);
-  if (!lang) return null;
-  if (!tsParser) tsParser = new tsMod.Parser();
-  tsParser.setLanguage(lang);
-  let tree;
-  try { tree = tsParser.parse(text); } catch { return null; }
-  if (!tree) return null;
-  const q = compiledQueries(grammar, lang);
-  const langName = grammar === 'tsx' ? 'typescript' : grammar;
-  const grab = (queries) => {
-    const seen = new Set();
-    for (const query of queries) {
-      let caps; try { caps = query.captures(tree.rootNode); } catch { continue; }
-      for (const c of caps) {
-        const t = c.node.text;
-        if (t && t.length <= 80) seen.add(t);
-      }
-    }
-    return [...seen];
-  };
-  const byName = new Map();
-  for (const query of q.def) {
-    let caps; try { caps = query.captures(tree.rootNode); } catch { continue; }
-    for (const c of caps) {
-      const rec = defRecord(c.node, grammar, langName);
-      if (rec && !byName.has(rec.name)) byName.set(rec.name, rec);
-    }
+function runGraphJob(payload, onProgress) {
+  return new Promise((resolve) => {
+    const id = ++_cgReqId;
+    _cgReqs.set(id, { resolve, onProgress });
+    try { cgWorker().postMessage({ id, ...payload }); }
+    catch (e) { _cgReqs.delete(id); resolve({ ok: false, error: String(e && e.message || e) }); }
+  });
+}
+// a manual rebuild is the retry gesture — kill the worker so a fresh spawn
+// re-attempts tree-sitter init instead of staying broken for the session.
+// Detach BEFORE terminating: the old worker's async 'exit' event must never
+// fire into state that now belongs to the replacement worker.
+function resetGraphWorker() {
+  const w = _cgWorker;
+  _cgWorker = null;
+  for (const [, req] of _cgReqs) req.resolve({ ok: false, error: 'parse worker restarted' });
+  _cgReqs.clear();
+  if (w) {
+    try { w.removeAllListeners(); } catch {}
+    try { w.terminate(); } catch {}
   }
-  const symbols = [...byName.values()];
-  // FORWARD deps: bucket each call/new capture into the INNERMOST enclosing def
-  // (by line range) → per-symbol `calls`. This is what lets the packer expand
-  // "load login() AND what it calls" without reading whole files. Callee names
-  // resolve to def ids by NAME at query time (see forwardReach).
-  const callCaps = [];
-  for (const query of q.call) {
-    let caps; try { caps = query.captures(tree.rootNode); } catch { continue; }
-    for (const c of caps) {
-      const t = c.node.text;
-      const row = (c.node.startPosition ? c.node.startPosition.row : 0) + 1;
-      if (t && t.length <= 80) callCaps.push({ name: t, row });
-    }
-  }
-  const fwd = symbols.map(() => new Set());
-  for (const cc of callCaps) {
-    let bestI = -1, bestSpan = Infinity;
-    for (let i = 0; i < symbols.length; i++) {
-      const s = symbols[i];
-      if (cc.row >= s.sl && cc.row <= s.el) {
-        const span = s.el - s.sl;
-        if (span < bestSpan) { bestSpan = span; bestI = i; }
-      }
-    }
-    if (bestI >= 0 && cc.name !== symbols[bestI].name) fwd[bestI].add(cc.name);
-  }
-  symbols.forEach((s, i) => { s.calls = [...fwd[i]].slice(0, 30); });
-  // CONSTRUCTOR DEPENDENCIES: reaching a class via `new Class()` should expand to
-  // what its constructor builds. Members' calls bucket to the member (e.g. the
-  // constructor def), not the class — so merge a class's constructor calls up onto
-  // the class itself, letting forwardReach follow class → constructor deps.
-  for (const s of symbols) {
-    if (s.type !== 'class' && s.type !== 'struct' && s.type !== 'interface') continue;
-    const isCtor = (m) => m.name === 'constructor' || m.name === s.name;
-    const members = symbols.filter((m) => m !== s && m.parent === s.name);
-    const merged = new Set(s.calls);
-    // constructor deps first (they matter most for `new Class()`), then other methods
-    for (const m of members) if (isCtor(m)) for (const c of m.calls) merged.add(c);
-    for (const m of members) if (!isCtor(m) && m.type === 'method') for (const c of m.calls) merged.add(c);
-    s.calls = [...merged].slice(0, 30);
-  }
-  const res = { symbols, calls: grab(q.call), imps: grab(q.imp) };
-  try { tree.delete(); } catch {}
-  return res;
 }
 
 // persisted codegraph schema version. Bumped to 2 when def records became RICH
-// symbols (type/lines/parent/visibility/doc/lang). A v1 file on disk is ignored
-// (treated as absent) so it gets rebuilt into the richer shape in the background.
-const GRAPH_SCHEMA = 2;
+// symbols (type/lines/parent/visibility/doc/lang); to 3 for collision-safe ids
+// (rel#name@line on duplicates) + import-scoped edge resolution. A stale file
+// on disk is ignored (treated as absent) so it gets rebuilt in the background.
+const GRAPH_SCHEMA = 3;
 function emptyGraph() { return { v: GRAPH_SCHEMA, built: 0, defs: [], callers: {}, importers: {} }; }
 // read a persisted graph only if it matches the current schema, else null
 function loadGraphDisk(cwd) {
@@ -1220,9 +1111,39 @@ function indexGraph(graph) {
   graph.importers = graph.importers || {};
   return graph;
 }
+// resolve one import specifier to a repo rel path (extension/index guessing).
+// Relative specs resolve against the importing file's dir; bare dotted names
+// try the python module layout. Returns null when it isn't a repo file.
+function resolveSpec(fromRel, spec, fileSet) {
+  if (spec.startsWith('.') && !spec.startsWith('..') && !spec.startsWith('./') &&
+      !spec.startsWith('.\\')) {
+    // python relative `from .mod import x` → sibling module
+    const base = fromRel.slice(0, fromRel.lastIndexOf('/') + 1);
+    const p = base + spec.replace(/^\.+/, '').replace(/\./g, '/') + '.py';
+    return fileSet.has(p) ? p : null;
+  }
+  if (spec.startsWith('.')) {
+    const base = fromRel.slice(0, fromRel.lastIndexOf('/') + 1);
+    const norm = path.posix.normalize(base + spec);
+    const tries = [norm];
+    for (const ext of ['js', 'ts', 'tsx', 'jsx', 'mjs', 'cjs', 'py']) tries.push(`${norm}.${ext}`);
+    for (const ext of ['js', 'ts', 'tsx', 'jsx']) tries.push(`${norm}/index.${ext}`);
+    for (const t of tries) if (fileSet.has(t)) return t;
+    return null;
+  }
+  // bare dotted python module (`from a.b import c`) → a/b.py from the root
+  if (/^[\w.]+$/.test(spec) && spec.includes('.')) {
+    const p = spec.replace(/\./g, '/') + '.py';
+    if (fileSet.has(p)) return p;
+  }
+  return null;
+}
 // resolve one file's call/import names to def ids by NAME (GitNexus-style) and record
 // the referring file on each def's reverse edge list. Skips self-references, overly
 // ambiguous names (>25 defs), and caps each edge list so a common name can't explode.
+// IMPORT-SCOPED: when the referrer's resolved imports include files that define the
+// name, only those defs get the edge — a bare-name match across unrelated modules
+// (`init`, `close`, …) no longer inflates the blast radius.
 function linkEdges(graph, byName, raw) {
   const relOf = (id) => id.slice(0, id.lastIndexOf('#'));
   const addEdge = (map, id) => {
@@ -1232,29 +1153,46 @@ function linkEdges(graph, byName, raw) {
   };
   const link = (names, map) => {
     for (const name of names) {
-      const ids = byName[name];
-      if (!ids || ids.length > 25) continue;
+      let ids = byName[name];
+      if (!ids) continue;
+      if (raw.impRels && raw.impRels.size && ids.length > 1) {
+        const scoped = ids.filter((id) => raw.impRels.has(relOf(id)));
+        if (scoped.length) ids = scoped;
+      }
+      if (ids.length > 25) continue;
       for (const id of ids) addEdge(map, id);
     }
   };
   link(raw.calls, graph.callers);
   link(raw.imps, graph.importers);
 }
-// stamp rel + id onto a raw file's rich symbols (id = rel#name, unique per file)
+// stamp rel + id onto a raw file's rich symbols. Ids are rel#name, with an @line
+// suffix ONLY when the file has same-named defs — keeps common ids stable while
+// making every id unique (the packer/vectors key on it).
 function stampSymbols(raw) {
-  for (const s of raw.symbols) { s.rel = raw.rel; s.id = raw.rel + '#' + s.name; }
+  const counts = dict();
+  for (const s of raw.symbols) counts[s.name] = (counts[s.name] || 0) + 1;
+  for (const s of raw.symbols) {
+    s.rel = raw.rel;
+    s.id = raw.rel + '#' + s.name + (counts[s.name] > 1 ? '@' + s.sl : '');
+  }
   return raw.symbols;
 }
 // full assembly: all defs first (so edges can resolve against the whole repo), then edges
 function assembleGraph(graph, raws) {
   const byName = dict();
+  const fileSet = new Set(raws.map((r) => r.rel));
   for (const r of raws) {
     for (const s of stampSymbols(r)) {
       graph.defs.push(s);
       (byName[s.name] = byName[s.name] || []).push(s.id);
     }
   }
-  for (const r of raws) linkEdges(graph, byName, r);
+  for (const r of raws) {
+    r.impRels = new Set((r.specs || [])
+      .map((s) => resolveSpec(r.rel, s, fileSet)).filter(Boolean));
+    linkEdges(graph, byName, r);
+  }
 }
 async function persistGraph(cwd, graph) {
   try {
@@ -1265,85 +1203,40 @@ async function persistGraph(cwd, graph) {
     await fs.promises.writeFile(path.join(dir, 'codegraph.json'), JSON.stringify(data), 'utf8');
   } catch {}
 }
-// walk the repo (same skip/size rules as buildSymbolIndex) parsing each grammar file,
-// then assemble the reverse graph. ASYNC + yielding so it never freezes the main process.
-// quick file count (readdir only — no read/parse) so a manual rebuild can show
-// a determinate progress bar in the status bar
-async function countGraphFiles(root) {
-  let n = 0;
-  async function w(dir) {
-    if (n >= INDEX_MAX_FILES) return;
-    let entries;
-    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
-    for (const d of entries) {
-      if (n >= INDEX_MAX_FILES) return;
-      if (d.isDirectory()) {
-        if (!d.name.startsWith('.') && !INDEX_SKIP_DIRS.has(d.name)) await w(path.join(dir, d.name));
-        continue;
-      }
-      if (LANG_GRAMMAR[path.extname(d.name).slice(1).toLowerCase()]) n++;
-    }
-  }
-  await w(root);
-  return n;
-}
+// build via the PARSE WORKER, then assemble/persist here. The main process only
+// does cheap assembly (name→id edge linking) on the returned raws — all WASM
+// parsing (and the pre-count for the progress bar) happens off-thread.
 async function buildCodeGraph(cwd, onProgress) {
   const root = cwd || process.env.USERPROFILE;
   const graph = emptyGraph();
-  try {
-    await tsInit();
-  } catch (err) {
+  // EVERY build streams progress to the status bar — including background
+  // rebuilds (schema bump, first open), which used to run completely silent
+  // and read as "stuck at 0%". Phases: init → count → parse → done|error.
+  const report = (done, total, phase) => {
+    send('codegraph-progress', { cwd, done, total, phase: phase || 'parse' });
+    if (onProgress) onProgress(done, total);
+  };
+  report(0, 0, 'init');
+  const m = await runGraphJob({ job: 'build', root, countFirst: true }, report);
+  if (!m.ok) {
     tsBroken = true;
+    tsInitError = m.error || 'tree-sitter unavailable';
     if (!tsInitErrorLogged) {
-      console.error('[codegraph] buildCodeGraph: tsInit failed:', err);
+      console.error('[codegraph] build failed:', tsInitError);
       tsInitErrorLogged = true;
     }
+    send('codegraph-progress', { cwd, done: 0, total: 0, phase: 'error', error: tsInitError });
     return graph;
   }
-  if (!tsMod) {
-    tsBroken = true;
-    if (!tsInitError) tsInitError = 'tree-sitter module failed to load';
-    return graph;
-  }
-  const raws = [];
-  // pre-count parseable files so a manual rebuild can render a determinate bar
-  const total = onProgress ? await countGraphFiles(root) : 0;
-  let count = 0, sinceYield = 0;
-  const yieldSoon = () => new Promise((r) => setImmediate(r));
-  async function walk(dir) {
-    if (count >= INDEX_MAX_FILES) return;
-    let entries;
-    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
-    for (const d of entries) {
-      if (count >= INDEX_MAX_FILES) return;
-      if (d.isDirectory()) {
-        if (!d.name.startsWith('.') && !INDEX_SKIP_DIRS.has(d.name)) await walk(path.join(dir, d.name));
-        continue;
-      }
-      const ext = path.extname(d.name).slice(1).toLowerCase();
-      const grammar = LANG_GRAMMAR[ext];
-      if (!grammar) continue;
-      const full = path.join(dir, d.name);
-      try {
-        const stat = await fs.promises.stat(full);
-        if (stat.size > SYMBOL_MAX_BYTES) continue;
-        const text = await fs.promises.readFile(full, 'utf8');
-        const rel = path.relative(root, full).replace(/\\/g, '/');
-        const raw = await extractFileGraph(text, grammar);
-        if (raw) { raw.rel = rel; raws.push(raw); }
-        count++;
-        if (onProgress && count % 10 === 0) onProgress(count, total);
-        if (++sinceYield >= 20) { sinceYield = 0; await yieldSoon(); }
-      } catch {}
-    }
-  }
-  await walk(root);
-  if (onProgress) onProgress(count, total || count);
-  assembleGraph(graph, raws);
+  tsBroken = false; tsInitError = '';
+  assembleGraph(graph, m.raws || []);
   graph.built = Date.now();
+  graph.truncated = !!m.truncated;
   indexGraph(graph);
   graphCache[cwd] = graph;
   await persistGraph(cwd, graph);
+  const n = (m.raws || []).length;
+  send('codegraph-progress', { cwd, done: n, total: n, phase: 'done' });
   return graph;
 }
 // background build/refresh — memory → disk → build, deduped. NEVER awaited on a hot path.
@@ -1368,11 +1261,17 @@ function getGraphForQuery(cwd) {
 // add one file's defs + outgoing edges to an existing graph (incremental re-parse)
 function addFileToGraph(graph, raw) {
   const byName = dict();
-  for (const d of graph.defs) (byName[d.name] = byName[d.name] || []).push(d.id);
+  const fileSet = new Set([raw.rel]);
+  for (const d of graph.defs) {
+    (byName[d.name] = byName[d.name] || []).push(d.id);
+    fileSet.add(d.rel);
+  }
   for (const s of stampSymbols(raw)) {
     graph.defs.push(s);
     (byName[s.name] = byName[s.name] || []).push(s.id);
   }
+  raw.impRels = new Set((raw.specs || [])
+    .map((s) => resolveSpec(raw.rel, s, fileSet)).filter(Boolean));
   linkEdges(graph, byName, raw);
 }
 // drop everything a file contributed: its own defs and its appearances as a referrer
@@ -1391,27 +1290,21 @@ function removeFileFromGraph(graph, rel) {
     }
   }
 }
-// re-parse a single changed file into the in-memory graph — mirrors indexOneFile
+// re-parse a single changed file into the in-memory graph — mirrors indexOneFile.
+// Parsing happens in the worker; only remove/add/re-index run here.
 async function reparseFileInGraph(cwd, abs) {
   const graph = graphCache[cwd];
-  if (!graph || tsBroken || !tsMod) return false;
+  if (!graph || tsBroken) return false;
   const rel = path.relative(cwd, abs).replace(/\\/g, '/');
   if (rel.startsWith('..')) return false;
-  if (rel.split('/').some((p) => p.startsWith('.') || INDEX_SKIP_DIRS.has(p))) return false;
-  const grammar = LANG_GRAMMAR[path.extname(abs).slice(1).toLowerCase()];
-  if (!grammar) return false;
-  try {
-    const stat = await fs.promises.stat(abs);
-    if (!stat.isFile() || stat.size > SYMBOL_MAX_BYTES) return false;
-    const text = await fs.promises.readFile(abs, 'utf8');
-    const raw = await extractFileGraph(text, grammar);
-    if (!raw) return false;
-    raw.rel = rel;
-    removeFileFromGraph(graph, rel);
-    addFileToGraph(graph, raw);
-    indexGraph(graph);
-    return true;
-  } catch { return false; }
+  if (rel.split('/').some((p) => skipDir(cwd, p))) return false;
+  if (!LANG_GRAMMAR[path.extname(abs).slice(1).toLowerCase()]) return false;
+  const m = await runGraphJob({ job: 'parse', abs, rel });
+  if (!m.ok || !m.raw) return false;
+  removeFileFromGraph(graph, rel);
+  addFileToGraph(graph, m.raw);
+  indexGraph(graph);
+  return true;
 }
 
 // reverse-reachability: files that (transitively, ≤depth hops) reference a def, via
@@ -1480,11 +1373,19 @@ function fmtImpactLine(name, rel, users) {
 }
 // LEXICAL FALLBACK — token→files inverted map when the graph is cold or a grammar is
 // missing. A symbol is "used by" any OTHER file whose tf contains all of its tokens.
+// The inverted map is O(all tokens × all files) to build and this runs on every
+// agent launch while the graph is cold — cache it per index object (WeakMap so a
+// rebuilt index gets a fresh map without explicit invalidation on replace).
+const invCache = new WeakMap();   // idx -> token→Set(files)
 function lexicalImpact(idx, files) {
   if (!idx || !idx.files) return '';
-  const inv = dict();
-  for (const rel of Object.keys(idx.files)) {
-    for (const t of Object.keys(idx.files[rel].tf)) (inv[t] = inv[t] || new Set()).add(rel);
+  let inv = invCache.get(idx);
+  if (!inv) {
+    inv = dict();
+    for (const rel of Object.keys(idx.files)) {
+      for (const t of Object.keys(idx.files[rel].tf)) (inv[t] = inv[t] || new Set()).add(rel);
+    }
+    invCache.set(idx, inv);
   }
   const lines = [];
   const seen = new Set();
@@ -1650,6 +1551,12 @@ function selectSymbols(graph, query, files, opts) {
       if (tokenize(d.name).some((t) => qtokens.has(t))) { seen.add(id); seeds.push(id); }
     }
   }
+  // SEMANTIC seeds — vector-matched def ids from the caller. These carry the
+  // meaning-based matches ("timezone bug" → formatUnixDate) that the lexical
+  // name-token match above structurally cannot find.
+  for (const id of (opts.vectorIds || [])) {
+    if (graph.defById[id] && !seen.has(id)) { seen.add(id); seeds.push(id); }
+  }
   if (!seeds.length) {   // no name match → exported/public top-level symbols of the top files
     for (const rel of rankedFiles.slice(0, 2)) {
       for (const id of (graph.fileDefs[rel] || [])) {
@@ -1675,7 +1582,8 @@ function selectSymbols(graph, query, files, opts) {
 function packSymbols(cwd, graph, idx, query, opts = {}) {
   if (!graph || !graph.defs || !graph.defs.length) return null;
   const files = retrieve(idx, query, opts.rankFiles || 12);
-  if (!files.length) return null;
+  // no lexical hits is fine when the caller brought semantic seeds
+  if (!files.length && !(opts.vectorIds && opts.vectorIds.length)) return null;
   const { seeds, deps } = selectSymbols(graph, query, files, opts);
   if (!seeds.length) return null;
 
@@ -1786,7 +1694,7 @@ ipcMain.handle('symbol-watch', async (_e, cwd) => {
             if (await reparseFileInGraph(cwd, abs)) gChanged = true;
           }
         } catch {                      // gone → remove from index + graph
-          if (idx.files[rel]) { delete idx.files[rel]; changed++; }
+          if (idx.files[rel]) { delete idx.files[rel]; invCache.delete(idx); changed++; }
           if (graph) { removeFileFromGraph(graph, rel); indexGraph(graph); gChanged = true; }
         }
       }
@@ -1802,7 +1710,15 @@ ipcMain.handle('symbol-watch', async (_e, cwd) => {
         // and forget; the watcher must not block on it.
         if (V.hasVectorIndex(indexDir(cwd))) {
           const rels = paths.map((abs) => path.relative(cwd, abs).replace(/\\/g, '/'));
-          runVectorJob(cwd, { job: 'sync', dir: indexDir(cwd), rels })
+          // ship the changed files' defs with the job — the worker then skips
+          // re-reading + JSON.parsing the whole codegraph.json per save burst
+          const defs = [];
+          for (const rel of rels) {
+            for (const id of (graph.fileDefs[rel] || [])) {
+              if (graph.defById[id]) defs.push(graph.defById[id]);
+            }
+          }
+          runVectorJob(cwd, { job: 'sync', dir: indexDir(cwd), rels, defs })
             .then((m) => {
               if (m && m.ok) { V.invalidateCache(); send('vector-updated', { cwd, count: m.count }); }
             })
@@ -1815,7 +1731,7 @@ ipcMain.handle('symbol-watch', async (_e, cwd) => {
       watcher = fs.watch(cwd, { recursive: true }, (_evt, filename) => {
         if (!filename) return;
         const rel = String(filename).replace(/\\/g, '/');
-        if (rel.split('/').some((p) => p.startsWith('.') || INDEX_SKIP_DIRS.has(p))) return;
+        if (rel.split('/').some((p) => skipDir(cwd, p))) return;
         const ext = path.extname(rel).slice(1).toLowerCase();
         if (ext && !INDEX_EXTS.has(ext)) return;   // ignore non-indexable file types
         state.pending.add(path.join(cwd, filename));
@@ -1963,9 +1879,10 @@ ipcMain.handle('codegraph-build', async (_e, cwd) => {
   if (!cwd) return { ok: false, error: 'no project open' };
   if (graphManualBuilding[cwd] || graphBuilding[cwd]) return { ok: false, error: 'already building' };
   graphManualBuilding[cwd] = true;
-  // a manual rebuild is the retry gesture — clear any prior stuck failure so the
-  // (possibly now-fixed) tree-sitter init gets re-attempted instead of staying broken
-  tsBroken = false; tsReady = null; tsInitError = ''; tsInitErrorLogged = false;
+  // a manual rebuild is the retry gesture — clear any prior stuck failure and
+  // respawn the parse worker so tree-sitter init gets re-attempted fresh
+  tsBroken = false; tsInitError = ''; tsInitErrorLogged = false;
+  resetGraphWorker();
   try {
     delete graphCache[cwd];   // force a fresh parse (buildCodeGraph repopulates + persists)
     const graph = await buildCodeGraph(cwd, (done, total) => send('codegraph-progress', { cwd, done, total }));
@@ -2016,27 +1933,53 @@ ipcMain.handle('watch-files', (_e, { root, files }) => {
 });
 
 // return the top-ranked files for an issue (builds the index lazily if missing).
-// withContent = N → also read and attach the content of the top N files, so the
-// agent gets the actual code up front and skips most Read round-trips.
-ipcMain.handle('retrieve-context', async (_e, { cwd, query, k, withContent }) => {
+// NAMES + SYMBOLS only, never file contents — the push is a map by design; the
+// agent pulls code via mcp__deck__* (the old withContent inlining is gone so
+// nothing can quietly regress back to whole-file dumping).
+ipcMain.handle('retrieve-context', async (_e, { cwd, query, k }) => {
   try {
     const idx = await loadOrBuildIndex(cwd);
     const files = retrieve(idx, query, k || 8);
-    if (withContent > 0) {
-      for (const f of files.slice(0, withContent)) {
-        try {
-          const abs = path.join(cwd, f.rel);
-          const stat = await fs.promises.stat(abs);
-          if (stat.size <= 80 * 1024) f.content = await fs.promises.readFile(abs, 'utf8');
-        } catch {}
-      }
-    }
     // regression blast-radius from the cached code graph (never triggers a build here);
     // background-refresh it for next time so a cold first run still returns via fallback.
     const impact = regressionImpact(getGraphForQuery(cwd), idx, files);
     ensureGraph(cwd).catch(() => {});
     return { ok: true, files, repoMap: repoMapFromIndex(idx, cwd), impact };
   } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e), files: [] }; }
+});
+
+// ===== Retrieval eval loop — hit@k of pre-ranked files vs files actually edited =====
+// The runs themselves generate labels for free: the renderer records what
+// retrieval PREDICTED at launch and which files the agent actually EDITED, and
+// logs one JSONL line per qualifying run here. This is the measurement loop
+// for retrieval quality — read .loveai/index/retrieval-eval.jsonl (or call
+// eval-stats) before/after tuning ranking to see whether a change helped.
+ipcMain.handle('eval-log', async (_e, { cwd, entry }) => {
+  try {
+    if (!cwd || !entry) return { ok: false };
+    const dir = indexDir(cwd);
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.appendFile(path.join(dir, 'retrieval-eval.jsonl'),
+      JSON.stringify(entry) + '\n', 'utf8');
+    return { ok: true };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+ipcMain.handle('eval-stats', async (_e, cwd) => {
+  try {
+    const p = path.join(indexDir(cwd), 'retrieval-eval.jsonl');
+    const lines = (await fs.promises.readFile(p, 'utf8')).trim().split('\n');
+    const entries = lines.slice(-200)
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
+    const n = entries.length;
+    const avg = (f) => n
+      ? +(entries.reduce((a, e) => a + (f(e) || 0), 0) / n).toFixed(3) : 0;
+    return {
+      ok: true, runs: n,
+      hit5: avg((e) => e.hit5), hit10: avg((e) => e.hit10),
+      last: entries.slice(-5),
+    };
+  } catch { return { ok: true, runs: 0, hit5: 0, hit10: 0, last: [] }; }
 });
 
 // SYMBOL-LEVEL context (tree-sitter): the minimum symbols a request needs +
@@ -2050,8 +1993,10 @@ ipcMain.handle('retrieve-symbols', async (_e, { cwd, query, budget, comments }) 
     const graph = getGraphForQuery(cwd);
     ensureGraph(cwd).catch(() => {});           // warm for next time; never blocks
     if (!graph || !graph.defs || !graph.defs.length) return { ok: true, ready: false };
+    // semantic seeds close the gap where no query token matches any symbol name
+    const vectorIds = (await workerVectorHits(cwd, query || '', 24)).map((h) => h.id);
     const pack = packSymbols(cwd, graph, idx, query || '', {
-      budget: budget || 12000, comments: !!comments,
+      budget: budget || 12000, comments: !!comments, vectorIds,
     });
     if (!pack) return { ok: true, ready: false };
     return {
@@ -2101,13 +2046,21 @@ ipcMain.handle('vector-query', async (_e, { cwd, query: q, k }) => {
   } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e), hits: [] }; }
 });
 
+// vector hits for a query via the persistent WORKER — the main process must
+// NEVER call V.queryVectors directly: that lazily loads a second copy of the
+// ONNX model on the main thread (seconds of jank + double memory).
+async function workerVectorHits(cwd, q, k) {
+  const m = await runVectorJob(cwd, { job: 'query', dir: indexDir(cwd), query: q, k });
+  return (m && Array.isArray(m.hits)) ? m.hits : [];
+}
+
 // Fuse semantic (vector) + lexical (BM25) file rankings via reciprocal-rank fusion.
 // Vector catches meaning ("timezone bug" -> formatUnixDate); BM25 nails exact
 // identifiers. Pure local math, no LLM. Returns { idx, files:[{rel,...}], symbolHits }.
 async function fuseRetrieval(cwd, q, k) {
   const idx = await loadOrBuildIndex(cwd);
   const bm = retrieve(idx, q, (k || 8) * 2);
-  const symbolHits = (await V.queryVectors(indexDir(cwd), q, (k || 8) * 4)) || [];
+  const symbolHits = await workerVectorHits(cwd, q, (k || 8) * 4);
   const vBest = new Map();
   for (const h of symbolHits) {
     const rel = h.id.slice(0, h.id.lastIndexOf('#'));
@@ -3354,8 +3307,15 @@ ipcMain.handle('term-start', (_e, { termId, cwd, cols, rows, shell }) => {
     rows: rows || 24,
     cwd: cwd || process.env.USERPROFILE,
     // user's core.editor may be a Windows abs path MINGW can't parse;
-    // override per-terminal only (no global git config writes)
-    env: { ...process.env, GIT_EDITOR: 'notepad', GIT_SEQUENCE_EDITOR: 'notepad' }
+    // override per-terminal only (no global git config writes).
+    // LOVEAI_BRIDGE_* lets any CLI in this terminal drive the in-app browser
+    // (browserctl.js / raw HTTP) without hunting for the info file.
+    env: {
+      ...process.env,
+      GIT_EDITOR: 'notepad', GIT_SEQUENCE_EDITOR: 'notepad',
+      LOVEAI_BRIDGE_PORT: String(BRIDGE_PORT || ''),
+      LOVEAI_BRIDGE_TOKEN: BRIDGE_TOKEN
+    }
   });
   terms.set(termId, p);
   p.onData(d => send('term-data', { termId, data: d }));
@@ -3435,6 +3395,317 @@ ipcMain.handle('ai-generate', async (_e, { prompt, model, cwd }) => {
   }
 });
 
+// ============================================================
+// DECK RETRIEVAL TOOLS — in-process MCP server (pull-model context)
+// ============================================================
+// Instead of front-loading a big pre-computed context blob into the first
+// prompt (push), the agent queries the project's LOCAL index mid-task, when
+// it knows what it's actually looking for. Handlers run in this process —
+// no network, no subprocess; typical answer in milliseconds. All tools are
+// read-only so the model can batch them with other reads.
+function deckToolText(text) {
+  return { content: [{ type: 'text', text: String(text || '(no results)') }] };
+}
+function deckToolErr(text) {
+  return { content: [{ type: 'text', text: String(text) }], isError: true };
+}
+
+// score topics the way the renderer's memoryInject does: token overlap on
+// title/keywords/files, phrase-boost on keywords. Local heuristic, no LLM.
+function deckTopicHits(cwd, q, n) {
+  const dir = path.join(cwd, '.loveai', 'memory', 'topics');
+  if (!fs.existsSync(dir)) return [];
+  const qtokens = String(q).toLowerCase().split(/\W+/).filter(w => w.length > 2);
+  const ql = String(q).toLowerCase();
+  const scored = [];
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.endsWith('.md')) continue;
+    const t = memParseTopic(fs.readFileSync(path.join(dir, f), 'utf8'));
+    const hay = `${t.title} ${t.keywords} ${t.files.join(' ')}`.toLowerCase();
+    let s = 0;
+    for (const w of qtokens) if (hay.includes(w)) s++;
+    for (const kw of (t.keywords || '').toLowerCase().split(',')) {
+      const k = kw.trim(); if (k && ql.includes(k)) s += 2;
+    }
+    if (s > 0) scored.push({ t: { ...t, slug: f.replace(/\.md$/, '') }, s });
+  }
+  return scored.sort((a, b) => b.s - a.s).slice(0, n).map(x => x.t);
+}
+
+function buildDeckServer(cwd) {
+  if (!sdkTool || !createSdkMcpServer || !z || !cwd) return null;
+  const RO = { annotations: { readOnlyHint: true } };
+
+  const searchCode = sdkTool(
+    'search_code',
+    'Search this project\'s prebuilt code index (BM25 lexical + semantic ' +
+    'vector fusion). Returns ranked files with their symbols plus the top ' +
+    'symbol-level matches. Instant and indexed — prefer this over Glob/Grep ' +
+    'for DISCOVERY; use Grep/Read to verify exact code afterwards.',
+    {
+      query: z.string().describe('What you are looking for — feature, symbol, error text, concept'),
+      k: z.number().int().min(1).max(30).default(10).describe('How many files to return')
+    },
+    async (args) => {
+      try {
+        const { idx, files, symbolHits } = await fuseRetrieval(cwd, args.query, args.k);
+        if (!files.length && !symbolHits.length) {
+          return deckToolText('No index matches — fall back to Grep/Glob.');
+        }
+        const fLines = files.map(f =>
+          `- ${f.rel}${f.symbols && f.symbols.length ? ' — ' + f.symbols.slice(0, 8).join(', ') : ''}`);
+        const sLines = symbolHits.slice(0, 12).map(h => `- ${h.id} (${h.score.toFixed(2)})`);
+        const capNote = idx && idx.truncated
+          ? `\n\n[PARTIAL INDEX — capped at ${INDEX_MAX_FILES} files; a miss here ` +
+            `does not mean the code doesn't exist. Verify with Grep.]`
+          : '';
+        return deckToolText(
+          `RANKED FILES (lexical+semantic fusion):\n${fLines.join('\n')}` +
+          (sLines.length ? `\n\nTOP SYMBOL MATCHES:\n${sLines.join('\n')}` : '') +
+          capNote);
+      } catch (e) { return deckToolErr('search_code failed: ' + (e && e.message ? e.message : e)); }
+    },
+    RO
+  );
+
+  const getSymbols = sdkTool(
+    'get_symbols',
+    'Get the tree-sitter SYMBOL PACK for a topic: the implementations a ' +
+    'request needs plus their dependencies, extracted from the code graph — ' +
+    'actual code, not just file names. Use after search_code narrows the area.',
+    {
+      query: z.string().describe('Feature/symbol/topic to pull implementations for'),
+      budget: z.number().int().min(2000).max(30000).default(12000)
+        .describe('Max characters of code to return')
+    },
+    async (args) => {
+      try {
+        const idx = await loadOrBuildIndex(cwd);
+        const graph = getGraphForQuery(cwd);
+        ensureGraph(cwd).catch(() => {});
+        if (!graph || !graph.defs || !graph.defs.length) {
+          return deckToolText('Code graph not built yet — use search_code + Read instead.');
+        }
+        // fuse in semantic seeds so meaning-only queries (no name overlap) pack too
+        const vectorIds = (await workerVectorHits(cwd, args.query, 24)).map((h) => h.id);
+        const pack = packSymbols(cwd, graph, idx, args.query, {
+          budget: args.budget, vectorIds,
+        });
+        if (!pack) return deckToolText('Nothing relevant in the graph for that query.');
+        return deckToolText(formatSymbolContext(pack));
+      } catch (e) { return deckToolErr('get_symbols failed: ' + (e && e.message ? e.message : e)); }
+    },
+    RO
+  );
+
+  const whoReferences = sdkTool(
+    'who_references',
+    'Regression blast-radius: which symbols match this query and what ' +
+    'calls/imports them across the project (from the cached code graph). ' +
+    'Check BEFORE changing a shared symbol.',
+    { query: z.string().describe('Symbol name, file, or feature you intend to change') },
+    async (args) => {
+      try {
+        const idx = await loadOrBuildIndex(cwd);
+        const files = retrieve(idx, args.query, 8);
+        const impact = regressionImpact(getGraphForQuery(cwd), idx, files);
+        ensureGraph(cwd).catch(() => {});
+        return deckToolText(impact && impact.trim()
+          ? impact : 'No reference data (graph cold or no matches).');
+      } catch (e) { return deckToolErr('who_references failed: ' + (e && e.message ? e.message : e)); }
+    },
+    RO
+  );
+
+  const topicMemory = sdkTool(
+    'topic_memory',
+    'Feature notes previous runs recorded in .loveai/memory/topics — flows, ' +
+    'key paths, step-by-steps. Check before re-exploring a known feature.',
+    { query: z.string().describe('Feature or area you are working on') },
+    async (args) => {
+      try {
+        const hits = deckTopicHits(cwd, args.query, 2);
+        if (!hits.length) return deckToolText('No topic memory matches.');
+        return deckToolText(hits.map(t =>
+          `=== MEMORY: ${t.title || t.slug} ===\n${t.body}`).join('\n\n'));
+      } catch (e) { return deckToolErr('topic_memory failed: ' + (e && e.message ? e.message : e)); }
+    },
+    RO
+  );
+
+  return createSdkMcpServer({
+    name: 'deck',
+    version: '1.0.0',
+    tools: [searchCode, getSymbols, whoReferences, topicMemory]
+  });
+}
+
+// ===== browser MCP server — the bridge as in-process agent tools ==========
+// Same idea as Playwright MCP but against the app's OWN sandbox browser:
+// zero spawn cost, instant commands, shares the user's live session/tabs.
+let browserServerCache = null;
+function buildBrowserServer() {
+  if (!sdkTool || !createSdkMcpServer || !z) return null;
+  if (browserServerCache) return browserServerCache;
+  const RO = { annotations: { readOnlyHint: true } };
+  const out = r => deckToolText(typeof r === 'string' ? r : JSON.stringify(r));
+  const run = async cmd => {
+    try { return out(await bridgeDispatch(cmd)); }
+    catch (e) { return deckToolErr('bridge failed: ' + (e.message || e)); }
+  };
+  const target = {
+    tabId: z.string().optional()
+      .describe('Tab id from browser_tabs — omit for the active tab')
+  };
+
+  const tabsTool = sdkTool(
+    'browser_tabs',
+    'List the in-app sandbox browser tabs (id, url, title, project, active). ' +
+    'Start here to pick a target tab.',
+    {},
+    () => run({ op: 'tabs' }),
+    RO
+  );
+  const openTool = sdkTool(
+    'browser_open',
+    'Open a URL in the in-app browser. Reuses an existing tab showing the ' +
+    'same URL unless reuse=false. Returns the tab id.',
+    {
+      url: z.string().describe('URL — bare hosts get a scheme (localhost → http)'),
+      reuse: z.boolean().default(true)
+        .describe('Focus an existing tab with this URL instead of opening a duplicate')
+    },
+    a => run({ op: 'open', url: a.url, reuse: a.reuse }),
+  );
+  const navTool = sdkTool(
+    'browser_navigate',
+    'Navigate the active (or given) tab: to a URL, or back / forward / reload.',
+    {
+      ...target,
+      url: z.string().optional().describe('Destination URL (omit when using action)'),
+      action: z.enum(['back', 'forward', 'reload']).optional()
+    },
+    a => run({ op: 'navigate', tabId: a.tabId, url: a.url, action: a.action }),
+  );
+  const snapshotTool = sdkTool(
+    'browser_snapshot',
+    'Accessibility-style outline of the page: headings + every interactive ' +
+    'element with a stable ref (ref=eN). Use refs with browser_click / ' +
+    'browser_fill. Retake after navigation — refs reset. mode "full" also ' +
+    'includes visible text blocks.',
+    {
+      ...target,
+      mode: z.enum(['interactive', 'full']).default('interactive'),
+      maxChars: z.number().int().min(1000).max(60000).default(20000)
+    },
+    a => run({ op: 'snapshot', tabId: a.tabId, mode: a.mode, maxChars: a.maxChars }),
+    RO
+  );
+  const clickTool = sdkTool(
+    'browser_click',
+    'Click an element — by snapshot ref (best), CSS selector, or visible text.',
+    {
+      ...target,
+      ref: z.string().optional().describe('ref from browser_snapshot, e.g. "e12"'),
+      selector: z.string().optional().describe('CSS selector'),
+      text: z.string().optional().describe('visible text of the element')
+    },
+    a => run({ op: 'click', tabId: a.tabId, ref: a.ref, selector: a.selector, text: a.text }),
+  );
+  const fillTool = sdkTool(
+    'browser_fill',
+    'Set an input / textarea / select / contenteditable value (fires proper ' +
+    'input+change events so React/Vue see it). submit=true presses Enter after.',
+    {
+      ...target,
+      ref: z.string().optional(),
+      selector: z.string().optional(),
+      value: z.string(),
+      submit: z.boolean().default(false)
+    },
+    a => run({
+      op: 'fill', tabId: a.tabId, ref: a.ref, selector: a.selector,
+      value: a.value, submit: a.submit
+    }),
+  );
+  const pressTool = sdkTool(
+    'browser_press',
+    'Send a REAL key event to the page (goes through Chromium input, so ' +
+    'default actions like form submit fire). Keys: Enter, Tab, Escape, ' +
+    'ArrowDown, a, … Optionally focus a ref/selector first.',
+    { ...target, key: z.string(), ref: z.string().optional(), selector: z.string().optional() },
+    a => run({ op: 'press', tabId: a.tabId, key: a.key, ref: a.ref, selector: a.selector }),
+  );
+  const evalTool = sdkTool(
+    'browser_eval',
+    'Evaluate JavaScript in the page and return the JSON-serialized result. ' +
+    'Accepts an expression or statements (use `return` with statements).',
+    { ...target, code: z.string() },
+    a => run({ op: 'eval', tabId: a.tabId, code: a.code }),
+  );
+  const consoleTool = sdkTool(
+    'browser_console',
+    'Read the page\'s buffered console messages (level, message, source). ' +
+    'clear=true empties the buffer after reading.',
+    {
+      ...target,
+      limit: z.number().int().min(1).max(500).default(50),
+      clear: z.boolean().default(false)
+    },
+    a => run({ op: 'console', tabId: a.tabId, limit: a.limit, clear: a.clear }),
+    RO
+  );
+  const networkTool = sdkTool(
+    'browser_network',
+    'Recent network requests from the sandbox browser (method, url, status, ' +
+    'ms, errors). Filter by URL substring.',
+    {
+      filter: z.string().optional(),
+      limit: z.number().int().min(1).max(200).default(50),
+      since: z.number().optional().describe('only requests after this epoch-ms')
+    },
+    a => run({ op: 'network', filter: a.filter, limit: a.limit, since: a.since }),
+    RO
+  );
+  const screenshotTool = sdkTool(
+    'browser_screenshot',
+    'Screenshot the tab to a PNG file and return its absolute path (activates ' +
+    'the tab first — hidden guests capture blank). View it with the Read tool.',
+    { ...target, path: z.string().optional().describe('absolute .png path (default: temp)') },
+    a => run({ op: 'screenshot', tabId: a.tabId, path: a.path }),
+    RO
+  );
+  const waitTool = sdkTool(
+    'browser_wait_for',
+    'Wait until a condition holds: selector present, text visible, URL ' +
+    'contains, selector gone, or page load finished.',
+    {
+      ...target,
+      selector: z.string().optional(),
+      text: z.string().optional(),
+      urlContains: z.string().optional(),
+      gone: z.string().optional().describe('CSS selector that must disappear'),
+      load: z.boolean().optional().describe('true = wait for loading to finish'),
+      timeoutMs: z.number().int().min(100).max(60000).default(10000)
+    },
+    a => run({
+      op: 'waitFor', tabId: a.tabId, selector: a.selector, text: a.text,
+      urlContains: a.urlContains, gone: a.gone, load: a.load, timeoutMs: a.timeoutMs
+    }),
+    RO
+  );
+
+  browserServerCache = createSdkMcpServer({
+    name: 'browser',
+    version: '1.0.0',
+    tools: [
+      tabsTool, openTool, navTool, snapshotTool, clickTool, fillTool,
+      pressTool, evalTool, consoleTool, networkTool, screenshotTool, waitTool
+    ]
+  });
+  return browserServerCache;
+}
+
 ipcMain.handle('agent-run', async (_e, cfg) => {
   // cfg: { runId, agentId, prompt, model, cwd, rules, permissionMode, resumeSessionId }
   await sdkReady;
@@ -3484,6 +3755,20 @@ ipcMain.handle('agent-run', async (_e, cfg) => {
     if (typeof cfg.resumeCwd === 'string' && cfg.resumeCwd) options.cwd = cfg.resumeCwd;
     if (cfg.forkSession) options.forkSession = true;
   }
+  // PULL RETRIEVAL — the project's local index as in-process tools the agent
+  // calls mid-task (bound to the PROJECT cwd, not the session-slug cwd).
+  // Replaces most of the old front-loaded context blob; see buildDeckServer.
+  const deckServer = buildDeckServer(cfg.cwd);
+  if (deckServer) {
+    options.mcpServers = { deck: deckServer };
+    options.allowedTools = ['mcp__deck__*'];
+  }
+  // in-app browser bridge — every agent can see/drive the sandbox browser
+  const browserServer = buildBrowserServer();
+  if (browserServer) {
+    options.mcpServers = { ...(options.mcpServers || {}), browser: browserServer };
+    options.allowedTools = [...(options.allowedTools || []), 'mcp__browser__*'];
+  }
 
   const isMissingSession = (s) => /no conversation found with session id/i.test(String(s || ''));
 
@@ -3505,10 +3790,69 @@ ipcMain.handle('agent-run', async (_e, cfg) => {
     return { prompt: preamble + '\n\n---\n\nCurrent request:\n' + cfg.prompt, restored: true };
   }
 
+  // locate each edit hunk's starting line by reading the target file — the
+  // tool_use event fires before the edit lands, so old_string is normally
+  // still present; new_string covers the already-applied race. null = unknown.
+  function hunkLine(txt, probe) {
+    if (!txt || !probe) return null;
+    const idx = txt.indexOf(probe);
+    return idx < 0 ? null : txt.slice(0, idx).split('\n').length;
+  }
+  function editStartLines(tool, input) {
+    try {
+      if (tool === 'Write') return [1];
+      const file = input.file_path || input.path || '';
+      const txt = fs.readFileSync(file, 'utf8');
+      const edits = (tool === 'MultiEdit' && Array.isArray(input.edits))
+        ? input.edits : [input];
+      return edits.map(e => {
+        const ln = hunkLine(txt, e.old_string);
+        return ln !== null ? ln : hunkLine(txt, e.new_string);
+      });
+    } catch { return null; }
+  }
+
+  // flatten a tool_result block's content (string OR [{type:'text',text}]) to text
+  function toolResultText(block) {
+    const c = block.content;
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) {
+      return c.map(x => (x && x.type === 'text') ? x.text : '').join('\n');
+    }
+    return '';
+  }
+  // one-line outcome for the console (what the Read/Grep/Bash actually returned)
+  function summarizeTool(name, text, input, isError) {
+    const t = String(text == null ? '' : text);
+    const lines = t ? t.split('\n').filter(l => l.trim() !== '').length : 0;
+    if (isError) {
+      const first = t.split('\n').map(s => s.trim()).find(Boolean) || 'failed';
+      return { ok: false, summary: first.slice(0, 60) };
+    }
+    const n = (k, one) => lines ? `${lines} ${k}${lines === 1 ? '' : one}` : '';
+    switch (name) {
+      case 'Read': return { ok: true, summary: n('line', 's') || 'empty file' };
+      case 'Grep': {
+        const content = input && input.output_mode === 'content';
+        if (!lines) return { ok: true, summary: 'nothing found' };
+        return { ok: true, summary: content
+          ? `found ${lines} match${lines === 1 ? '' : 'es'}`
+          : `found in ${lines} file${lines === 1 ? '' : 's'}` };
+      }
+      case 'Glob': return { ok: true, summary: n('file', 's') || 'nothing found' };
+      case 'Bash': case 'PowerShell':
+        return { ok: true, summary: 'done' };
+      default: return { ok: true, summary: n('line', 's') || 'done' };
+    }
+  }
+
   // one pass over the SDK stream. Returns {missingSession, errored} so the caller
   // can retry from scratch when a resume points at a session that no longer exists.
   async function runOnce(opts, forwardEvents, promptOverride) {
     let missingSession = false, errored = false;
+    // tool_use id -> {name,input}, so the tool_result (a later 'user' message)
+    // can be summarized per-tool and routed back to the right console row
+    const toolMeta = {};
     for await (const msg of query({ prompt: promptOverride || cfg.prompt, options: opts })) {
       if (msg.type === 'system' && msg.subtype === 'init') {
         if (forwardEvents) send('agent-event', { runId: cfg.runId, agentId: cfg.agentId, kind: 'init', sessionId: msg.session_id, model: msg.model });
@@ -3520,17 +3864,59 @@ ipcMain.handle('agent-run', async (_e, cfg) => {
       } else if (msg.type === 'assistant') {
         for (const block of msg.message.content || []) {
           if (block.type === 'tool_use') {
-            send('agent-event', {
+            toolMeta[block.id] = { name: block.name, input: block.input };
+            const evt = {
               runId: cfg.runId, agentId: cfg.agentId, kind: 'tool',
+              id: block.id,
               tool: block.name,
               input: JSON.stringify(block.input).slice(0, 400)
-            });
+            };
+            // edit tools carry their FULL input (plus each hunk's real start
+            // line, found by reading the target file) so the renderer can draw
+            // a line-numbered diff card — the 400-char cap above truncates
+            // old/new_string and would break JSON.parse in the renderer
+            if (/^(Edit|MultiEdit|Write)$/.test(block.name)) {
+              evt.editInput = JSON.stringify(block.input).slice(0, 400000);
+              evt.editLines = editStartLines(block.name, block.input);
+            }
+            send('agent-event', evt);
           }
         }
         send('agent-event', { runId: cfg.runId, agentId: cfg.agentId, kind: 'text-end' });
+      } else if (msg.type === 'user') {
+        // tool_result blocks land here — summarize each and route it back to the
+        // console row of the tool_use that produced it (matched by tool_use_id)
+        const content = msg.message && msg.message.content;
+        if (forwardEvents && Array.isArray(content)) {
+          for (const block of content) {
+            if (!block || block.type !== 'tool_result') continue;
+            const meta = toolMeta[block.tool_use_id] || {};
+            const { ok, summary } = summarizeTool(
+              meta.name || '', toolResultText(block), meta.input, !!block.is_error);
+            send('agent-event', {
+              runId: cfg.runId, agentId: cfg.agentId, kind: 'tool-result',
+              id: block.tool_use_id, tool: meta.name || '', ok, summary
+            });
+          }
+        }
       } else if (msg.type === 'result') {
         // a resume against a vanished session fails immediately with this result
         if (msg.subtype !== 'success' && (isMissingSession(msg.result) || isMissingSession(msg.error))) {
+          missingSession = true;
+          break;   // don't forward — the caller retries fresh
+        }
+        // a resume that returns "success" with ZERO turns AND zero input tokens
+        // never actually reached the model — the SDK resolved the resumed
+        // session as a no-op (e.g. its transcript lives under a different cwd
+        // slug). Forwarding it prints a misleading "SUCCESS · 0 turns" and
+        // silently drops the message. Treat it exactly like a vanished session:
+        // don't forward, let the caller retry fresh (with restored context).
+        // Guarded on opts.resume so the fresh-retry pass never loops.
+        const noopResume = opts.resume
+          && msg.subtype === 'success'
+          && (msg.num_turns || 0) === 0
+          && (!msg.usage || (msg.usage.input_tokens || 0) === 0);
+        if (noopResume) {
           missingSession = true;
           break;   // don't forward — the caller retries fresh
         }

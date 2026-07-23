@@ -10,6 +10,8 @@
 }
 
 :root, :root[data-theme="dark"] {
+  /* native widgets (select popups, scrollbars) render dark, not OS-white */
+  color-scheme: dark;
   --bg: #0A2947;            /* app base */
   --surface: #0C3054;       /* panels, cards */
   --surface-2: #082038;     /* inputs, wells, code */
@@ -40,6 +42,7 @@
 }
 
 :root[data-theme="light"] {
+  color-scheme: light;
   --bg: #F3F6F9;
   --surface: #FFFFFF;
   --surface-2: #ECF1F6;
@@ -529,6 +532,38 @@ body {
 .roster-card:hover .rc-actions { opacity: 1; }
 .roster-card .icon-btn { font-size: 11px; padding: 2px 3px; }
 
+/* ===== Chat sessions list (sidebar) ===== */
+#chat-list { display: flex; flex-direction: column; gap: 4px; }
+.chat-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-radius: 8px; cursor: pointer;
+  border: 1px solid transparent; transition: background .12s, border-color .12s;
+}
+.chat-row:hover { background: var(--hover); }
+.chat-row.active { background: var(--accent-weak); border-color: var(--accent-line); }
+.chat-row .cr-spin {
+  width: 12px; height: 12px; flex: none; border-radius: 50%;
+  border: 2px solid var(--stroke); border-top-color: var(--accent);
+  opacity: 0; transition: opacity .12s;
+}
+.chat-row.running .cr-spin,
+.chat-row.loading .cr-spin { opacity: 1; animation: spin .7s linear infinite; }
+.cr-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.cr-title {
+  font-size: 12.5px; color: var(--fg); font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cr-sub {
+  font-family: var(--mono); font-size: 9px; letter-spacing: .5px;
+  color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cr-del { flex: none; opacity: 0; font-size: 11px; }
+.chat-row:hover .cr-del { opacity: .7; }
+.cr-del:hover { opacity: 1; color: var(--red); }
+
+/* ===== Settings › AGENTS tab ===== */
+.set-agents-head { display: flex; justify-content: flex-end; padding: 2px 0 8px; }
+
 /* terminal link tooltip — "hold ctrl + click" */
 #link-tip {
   position: fixed; z-index: 300; pointer-events: none;
@@ -764,6 +799,15 @@ body {
 .feed .txt { color: var(--text); white-space: pre-wrap; word-break: break-word; }
 .feed .ok { color: var(--green); }
 .feed .err { color: var(--red); }
+/* outcome chip on a tool row — "142 lines" / "8 matches" / "ok" / "failed" */
+.feed .ev .tres {
+  flex: none; margin-left: auto; align-self: flex-start;
+  font-size: 9px; letter-spacing: .3px;
+  color: var(--dim); background: var(--surface-2);
+  border: 1px solid var(--stroke); border-radius: 999px;
+  padding: 1px 7px; white-space: nowrap;
+}
+.feed .ev .tres.err { color: var(--red); border-color: var(--red); }
 
 /* task bar */
 .agent-task { display: flex; gap: 10px; padding: 12px 18px 16px; }
@@ -848,6 +892,7 @@ body {
 .agent-dock {
   flex: none; position: relative;
   background: transparent; border: none; padding: 4px 2px 2px;
+  margin-bottom: 40px;   /* clear the 24px status bar with breathing room */
 }
 .ad-head { display: flex; align-items: center; gap: 8px; margin: 0 6px 6px; }
 .ad-avatar { font-size: 15px; }
@@ -867,6 +912,17 @@ body {
 }
 .ad-composer #ad-input:focus { outline: none; }
 .ad-composer .composer-icon { align-self: flex-end; }
+/* dock control row: agent/model · reasoning · PLAN · full-screen */
+.ad-controls {
+  display: flex; align-items: center; gap: 6px;
+  margin: 8px 8px 0; padding: 0 2px;
+}
+.ad-controls .composer-target,
+.ad-controls .think-select {
+  height: 24px; font-family: var(--mono); font-size: 10px;
+}
+.ad-controls .ad-controls-spacer { flex: 1; }
+.ad-controls #ad-plan-toggle { cursor: pointer; }
 .console-title {
   font-size: 12px; letter-spacing: 4px; color: var(--violet);
   padding: 10px 0; white-space: nowrap;
@@ -926,16 +982,16 @@ body {
 /* console feed fills remaining space */
 #console-feed {
   flex: 1; min-height: 0; max-height: none;
-  margin: 0; padding: 0 20px; overflow-y: auto;
+  margin: 0; padding: 0 20px 16px; overflow-y: auto;
   position: relative;
 }
 
 /* Centered reading column — feed rows, diff cards and the per-agent dock are
-   wrapped to a ~70% width and centered so the content reads as one column
-   instead of stretching edge to edge. #console-head is the full-width
-   toolbar (title/chips/account bar) and must stay excluded — its
-   .head-spacer relies on the header spanning the whole console width to
-   push controls to the right edge. */
+   capped to a ~70% width and CENTERED so the content reads as one column
+   (ChatGPT-style), with the dock composer aligned to the same column.
+   #console-head is the full-width toolbar (title/chips/account bar) and must
+   stay excluded — its .head-spacer relies on the header spanning the whole
+   console width to push controls to the right edge. */
 :root { --console-col: 70%; --console-col-max: 1080px; }
 #agent-dock,
 #console-feed > *:not(.feed-empty) {
@@ -951,6 +1007,8 @@ body {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   padding-top: 2px;
 }
+/* single-chat view — every row is the same agent, so the name column is noise */
+#console-feed.one-agent .tag { display: none; }
 .feed-empty {
   position: absolute; inset: 0;
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
@@ -1227,12 +1285,25 @@ body.browser-fullscreen .ws-rail { display: none; }
   0% { background-position: 200% 0; }
   100% { background-position: -200% 0; }
 }
-/* tab strip — tabs grouped under a per-project header */
-.bw-tabs {
-  flex: none; display: flex; align-items: center; gap: 6px;
-  padding: 6px 10px; overflow-x: auto; white-space: nowrap;
-  border-bottom: 1px solid var(--border); background: var(--surface);
+/* tab strip — Chrome-style: tabs sit on a darker "frame" row; the active
+   tab shares the toolbar's background and merges into it seamlessly */
+.bw-tabbar {
+  flex: none; display: flex; align-items: flex-end;
+  padding: 7px 8px 0; background: var(--surface-2);
 }
+.bw-tabs {
+  display: flex; align-items: flex-end; min-width: 0;
+  overflow-x: auto; overflow-y: hidden; white-space: nowrap;
+  scrollbar-width: none;
+}
+.bw-tabs::-webkit-scrollbar { display: none; }
+.bw-newtab {
+  flex: none; width: 26px; height: 26px; margin: 0 4px 4px 6px;
+  border: 0; border-radius: 50%; cursor: pointer;
+  background: transparent; color: var(--fg-dim);
+  font-size: 15px; line-height: 1;
+}
+.bw-newtab:hover { background: var(--hover); color: var(--fg); }
 .bw-group {
   display: flex; align-items: center; gap: 4px;
   padding-right: 8px; border-right: 1px solid var(--border);
@@ -1253,22 +1324,65 @@ body.browser-fullscreen .ws-rail { display: none; }
   color: var(--fg); border-color: var(--border-hi); background: var(--hover);
 }
 .bw-tab {
-  flex: none; display: flex; align-items: center; gap: 6px;
-  max-width: 200px; padding: 5px 8px; border-radius: 8px; cursor: pointer;
-  background: var(--surface-2); border: 1px solid transparent; color: var(--fg-dim);
+  position: relative; flex: 0 1 220px; min-width: 96px;
+  display: flex; align-items: center; gap: 7px;
+  height: 33px; padding: 0 6px 0 10px;
+  border-radius: 10px 10px 0 0; cursor: pointer;
+  background-color: transparent; color: var(--fg-dim);
 }
-.bw-tab:hover { color: var(--fg); }
-.bw-tab.active { color: var(--fg); border-color: var(--border-hi); background: var(--bg); }
-.bw-tab.loading .bw-tab-label { opacity: .7; }
+/* thin separator between neighboring inactive tabs (Chrome's divider) */
+.bw-tab:not(.active) + .bw-tab:not(.active) {
+  background-image: linear-gradient(var(--border-hi), var(--border-hi));
+  background-size: 1px 15px; background-position: 0 center;
+  background-repeat: no-repeat;
+}
+.bw-tab:not(.active):hover {
+  background-color: var(--hover); color: var(--fg);
+}
+.bw-tab.active {
+  background-color: var(--surface); color: var(--fg); z-index: 2;
+}
+/* inverted bottom corners — the active tab flares outward into the toolbar */
+.bw-tab.active::before, .bw-tab.active::after {
+  content: ''; position: absolute; bottom: 0; width: 10px; height: 10px;
+  pointer-events: none;
+}
+.bw-tab.active::before {
+  left: -10px;
+  background: radial-gradient(circle at 0 0, transparent 10px, var(--surface) 10.5px);
+}
+.bw-tab.active::after {
+  right: -10px;
+  background: radial-gradient(circle at 100% 0, transparent 10px, var(--surface) 10.5px);
+}
+/* favicon slot: site icon, or a spinner while loading, or a dim dot */
+.bw-tab-ico {
+  flex: none; width: 16px; height: 16px; position: relative;
+  display: flex; align-items: center; justify-content: center;
+}
+.bw-tab-ico:empty::before {
+  content: ''; width: 8px; height: 8px; border-radius: 50%;
+  border: 1.5px solid var(--fg-dim); opacity: .55;
+}
+.bw-tab-ico.spin::before {
+  content: ''; width: 12px; height: 12px; border-radius: 50%;
+  border: 2px solid var(--border-hi); border-top-color: var(--cyan);
+  animation: bw-tab-spin .8s linear infinite;
+}
+@keyframes bw-tab-spin { to { transform: rotate(360deg); } }
+.bw-tab-fav { width: 16px; height: 16px; border-radius: 3px; }
 .bw-tab-label {
-  font-size: 12px; max-width: 150px; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0; font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* close button fades in on hover / active, like Chrome */
 .bw-tab-close {
-  flex: none; width: 16px; height: 16px; border-radius: 4px; opacity: .6;
-  display: flex; align-items: center; justify-content: center; font-size: 11px;
+  flex: none; width: 18px; height: 18px; border-radius: 50%; opacity: 0;
+  display: flex; align-items: center; justify-content: center; font-size: 10px;
+  transition: opacity .1s;
 }
-.bw-tab-close:hover { opacity: 1; background: var(--hover); color: var(--err); }
+.bw-tab:hover .bw-tab-close, .bw-tab.active .bw-tab-close { opacity: .65; }
+.bw-tab-close:hover { opacity: 1 !important; background: var(--hover); color: var(--err); }
 /* stack — one <webview> per tab, only the active one visible */
 .bw-stack { position: relative; flex: 1; min-height: 0; }
 .bw-view { position: absolute; inset: 0; width: 100%; height: 100%; border: none; }
@@ -1768,7 +1882,6 @@ body.browser-fullscreen .ws-rail { display: none; }
 .diff-head:hover { background: var(--hover); }
 .diff-caret { flex: none; font-size: 9px; color: var(--dim); transition: transform .15s; }
 .diff-card.open .diff-caret { transform: rotate(90deg); }
-.diff-ico { flex: none; }
 .diff-file {
   flex: 1; min-width: 0; color: var(--cyan);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -1776,6 +1889,10 @@ body.browser-fullscreen .ws-rail { display: none; }
 .diff-stat { flex: none; font-size: 10px; letter-spacing: .5px; }
 .diff-stat .add { color: var(--green); }
 .diff-stat .del { color: var(--red); }
+.diff-sum {
+  padding: 0 11px 5px 24px;
+  font-family: var(--mono); font-size: 10px; color: var(--dim);
+}
 .diff-body {
   display: none; max-height: 340px; overflow: auto;
   border-top: 1px solid var(--stroke);
@@ -1783,11 +1900,18 @@ body.browser-fullscreen .ws-rail { display: none; }
 }
 .diff-card.open .diff-body { display: block; }
 .dl { display: flex; gap: 6px; padding: 0 11px; }
+.dl > em {
+  flex: none; min-width: 34px; text-align: right;
+  font-style: normal; color: var(--fg-dim); opacity: .8; user-select: none;
+}
 .dl > i { flex: none; width: 8px; font-style: normal; opacity: .7; }
 .dl > span { white-space: pre-wrap; word-break: break-word; }
 .dl-add { background: rgba(63, 185, 80, .12); color: var(--green); }
+.dl-add > em { color: var(--green); }
 .dl-del { background: rgba(248, 81, 73, .12); color: var(--red); }
+.dl-del > em { color: var(--red); }
 .dl-ctx { color: var(--dim); }
+.dl-cut { color: var(--dim); font-style: italic; }
 .dl-sep { height: 6px; }
 
 /* ================= Plan result card (in the console feed) ================= */
@@ -1876,13 +2000,6 @@ body.browser-fullscreen .ws-rail { display: none; }
   transition: border-color .15s, box-shadow .15s;
 }
 .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
-.composer #chat-input {
-  width: 100%; min-height: 68px; max-height: 220px; resize: none;
-  background: transparent; color: var(--text);
-  border: none; padding: 6px 6px 2px;
-  font-family: var(--sans); font-size: 13px; line-height: 1.5;
-}
-.composer #chat-input:focus { outline: none; }
 .composer .attach-chips:not(:empty) { padding: 4px 4px 0; }
 
 /* bottom toolbar row inside the composer */
@@ -1899,38 +2016,6 @@ body.browser-fullscreen .ws-rail { display: none; }
 .composer-target:hover { border-color: var(--stroke-hi); }
 .composer-target:focus { outline: none; border-color: var(--accent); }
 
-/* themed target dropdown (replaces the native select popup) */
-.ctgt-native { display: none !important; }
-.ctgt { position: relative; flex: 0 1 auto; min-width: 0; max-width: 150px; }
-.ctgt-btn {
-  display: flex; align-items: center; gap: 4px; width: 100%; max-width: none;
-}
-.ctgt-btn .ctgt-label {
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
-}
-.ctgt-btn .ctgt-caret { flex: none; opacity: .7; }
-.ctgt-btn.open { border-color: var(--accent); }
-.ctgt-menu {
-  position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 60;
-  min-width: 180px; max-height: 300px; overflow-y: auto;
-  background: var(--surface); color: var(--fg);
-  border: 1px solid var(--stroke); border-radius: 12px;
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4);
-  padding: 5px;
-}
-.ctgt-menu.hidden { display: none; }
-.ctgt-group {
-  font-family: var(--mono); font-size: 8.5px; letter-spacing: 1.5px;
-  color: var(--dim); padding: 8px 10px 4px; text-transform: uppercase;
-}
-.ctgt-item {
-  font-family: var(--mono); font-size: 10.5px; letter-spacing: .3px;
-  color: var(--fg-dim); padding: 7px 10px; border-radius: 8px; cursor: pointer;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.ctgt-item:hover { background: var(--hover); color: var(--fg); }
-.ctgt-item.active { background: var(--accent); color: #fff; }
-
 /* icon buttons (attach / stop) */
 .composer-icon {
   display: inline-flex; align-items: center; justify-content: center;
@@ -1941,8 +2026,6 @@ body.browser-fullscreen .ws-rail { display: none; }
 }
 .composer-icon svg { width: 16px; height: 16px; }
 .composer-icon:hover { background: var(--hover); color: var(--fg); }
-.composer-stop { color: var(--red); }
-.composer-stop:hover { background: rgba(255,107,107,.14); color: var(--red); }
 
 /* plan-mode toggle pill (replaces the raw checkbox) */
 .composer-pill {
@@ -1973,6 +2056,11 @@ body.browser-fullscreen .ws-rail { display: none; }
 .composer-send:hover { filter: brightness(1.12); }
 .composer-send:active { transform: scale(.94); }
 .composer-send:disabled { opacity: .45; cursor: default; filter: none; }
+/* running → the send arrow becomes a red stop square (ChatGPT-style) */
+.composer-send .stop-ico { display: none; }
+.composer-send.stop { background: var(--err); }
+.composer-send.stop .send-ico { display: none; }
+.composer-send.stop .stop-ico { display: block; }
 
 /* plan revision box */
 .pr-revise { display: flex; gap: 10px; flex: none; align-items: stretch; }

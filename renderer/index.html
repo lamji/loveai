@@ -84,51 +84,10 @@
       </div>
     </section>
 
-    <!-- Roster -->
+    <!-- Chats -->
     <section class="side-block grow">
-      <div class="side-title">◈ AGENT ROSTER <button id="btn-new-agent" class="mini-btn">+ NEW</button></div>
-      <div id="roster"></div>
-    </section>
-
-    <!-- Chatbox (bottom) -->
-    <section class="side-block chatbox">
-      <div class="side-title">
-        <span class="side-mark">◈</span>
-        <span class="side-actions">
-          <label id="chat-plan-toggle" class="head-pill" data-tip="Plan mode — the agent reads and plans only; nothing is written until you approve">
-            <input type="checkbox" id="chat-plan" />
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-            <span>PLAN</span>
-          </label>
-          <!-- options injected from EFFORT_LEVELS (single source of truth) -->
-          <select id="chat-think" class="think-select"
-            data-tip="Reasoning effort for this session and all agents (Claude effort levels)"></select>
-          <button id="btn-chat-expand" class="mini-btn icon-only" data-tip="Open in a wider view">⛶</button>
-          <button id="btn-new-session" class="mini-btn icon-only" data-tip="Start a fresh shared session (clears context for all agents)">↺</button>
-        </span>
-      </div>
-      <div class="composer">
-        <div id="slash-menu" class="slash-menu hidden"></div>
-        <div id="chat-mention" class="mention-menu hidden"></div>
-        <textarea id="chat-input" placeholder="Describe the issue or task…   @ files · / skills · ! shell · ⌃⏎ send"></textarea>
-        <div id="attach-chips" class="attach-chips"></div>
-        <div class="composer-bar">
-          <select id="chat-target" class="composer-target" title="Target">
-            <option value="__pipeline__">⟢ AUTO PIPELINE</option>
-          </select>
-          <button id="btn-attach" class="composer-icon" title="Attach files or images">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-          </button>
-          <input type="file" id="file-in" multiple hidden />
-          <div class="composer-spacer"></div>
-          <button id="btn-pipeline-stop" class="composer-icon composer-stop hidden" title="Abort pipeline">
-            <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-          </button>
-          <button id="btn-send" class="composer-send" title="Send  (Ctrl+Enter)">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
-          </button>
-        </div>
-      </div>
+      <div class="side-title">◈ CHATS <button id="btn-new-chat" class="mini-btn">+ NEW</button></div>
+      <div id="chat-list"></div>
     </section>
 
     </div><!-- /tab-agent -->
@@ -158,6 +117,8 @@
       <div class="console-title">◈ CENTRAL CONSOLE</div>
       <div id="console-chips" class="console-chips hidden"></div>
       <div class="head-spacer"></div>
+      <input type="file" id="file-in" multiple hidden />
+      <button id="btn-new-session" class="mini-btn icon-only" title="Start a fresh shared session (clears context for all agents)">↺</button>
       <div class="account-bar" id="account-bar" title="Your LoveAi account">
         <div class="acct-avatar" id="acct-avatar"><span id="acct-initial">·</span></div>
         <div class="acct-info">
@@ -365,10 +326,23 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
           </button>
           <textarea id="ad-input" rows="1" placeholder="Follow up with this agent…   @ files · / skills · ! shell" spellcheck="false"></textarea>
+          <!-- ChatGPT-style: the arrow morphs into a STOP square while running -->
           <button id="ad-send" class="composer-send" title="Send  (Ctrl+Enter)">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+            <svg class="send-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+            <svg class="stop-ico" viewBox="0 0 24 24" fill="currentColor"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/></svg>
           </button>
         </div>
+      </div>
+      <!-- control row lives OUTSIDE the rounded input box -->
+      <div class="ad-controls">
+        <select id="ad-target" class="composer-target" title="Agent / model"></select>
+        <select id="ad-effort" class="think-select" title="Reasoning effort"></select>
+        <label id="ad-plan-toggle" class="head-pill" title="Plan mode — read &amp; plan only; nothing is written until you approve">
+          <input type="checkbox" id="ad-plan" />
+          <span>PLAN</span>
+        </label>
+        <div class="ad-controls-spacer"></div>
+        <button id="ad-expand" class="mini-btn icon-only" title="Full-screen chat">⛶</button>
       </div>
     </div>
 
@@ -482,7 +456,10 @@
     <!-- Sandbox browser — a light in-app browser screen for browsing & debugging -->
     <div id="browser-view" class="browser-view hidden">
       <!-- tab strip: shows only the active project's tabs (isolated, like notes/board) -->
-      <div id="bw-tabs" class="bw-tabs"></div>
+      <div class="bw-tabbar">
+        <div id="bw-tabs" class="bw-tabs"></div>
+        <button id="bw-newtab" class="bw-newtab" title="New tab (Ctrl+T)">＋</button>
+      </div>
       <div class="bw-toolbar">
         <button id="bw-back" class="bw-btn" title="Back">◀</button>
         <button id="bw-forward" class="bw-btn" title="Forward">▶</button>
@@ -490,7 +467,6 @@
         <button id="bw-home" class="bw-btn" title="Home">⌂</button>
         <input id="bw-url" class="bw-url" type="text"
                placeholder="Type a URL or search…" />
-        <button id="bw-newtab" class="bw-btn" title="New tab">＋</button>
         <button id="bw-devtools" class="bw-btn" title="Open devtools">⚙</button>
         <button id="bw-fullview" class="bw-btn" title="Full view">⛶</button>
         <button id="bw-close" class="bw-btn bw-close" title="Close browser">✕</button>
@@ -650,6 +626,13 @@
         <button class="set-tab active" data-set="mcp">MCP SERVERS</button>
         <button class="set-tab" data-set="skills">SKILLS</button>
         <button class="set-tab" data-set="creator">SKILL CREATOR</button>
+        <button class="set-tab" data-set="agents">AGENTS</button>
+      </div>
+
+      <div id="set-agents" class="set-pane hidden">
+        <div class="set-hint">The agent roster for this project. <b>+ NEW</b> deploys an agent; click a card to configure it. Chats in the sidebar can target any of these agents.</div>
+        <div class="set-agents-head"><button id="btn-new-agent" class="mini-btn">+ NEW</button></div>
+        <div id="roster"></div>
       </div>
 
       <div id="set-mcp" class="set-pane">
@@ -1190,6 +1173,7 @@
   <script src="src/workspace.js"></script>
   <script src="src/notes.js"></script>
   <script src="src/browser.js"></script>
+  <script src="src/bridge.js"></script>
   <script src="src/palette.js"></script>
   <script src="src/profile.js"></script>
   <script src="src/onboarding.js"></script>

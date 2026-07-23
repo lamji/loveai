@@ -177,6 +177,12 @@ const TOOL_ICON = {
   Bash: '⌨', PowerShell: '⌨', Read: '📄', Edit: '✏', Write: '✏', MultiEdit: '✏',
   Glob: '🔎', Grep: '🔎', WebSearch: '🌐', WebFetch: '🌐', Task: '🤖', Agent: '🤖', TodoWrite: '☑'
 };
+// rotating friendly lead-ins so a run of tool calls reads like a person
+// narrating their work ("Let me check…", "Now looking at…") instead of a
+// robotic "Read <path>" list. Rotated by narrTick for light variety.
+const READ_LEADS = ['Let me check', 'Reading', 'Now looking at', 'Checking'];
+const FIND_LEADS = ['Searching for', 'Looking for', 'Hunting for'];
+let narrTick = 0;
 
 // ===== State =====
 // ============================================================
@@ -333,8 +339,15 @@ const rt = {};
 let editingId = null;
 let feedFilter = null; // agentId or null = all
 const streamEls = {};  // agentId -> current streaming feed element
+const toolRowEls = {}; // tool_use id -> its console row, so its result chip lands there
 const runDoneCallbacks = {};  // runId -> one-shot (result, finalText) callback
 const runEventSinks = {};     // runId -> per-event sink (streams a run into a modal)
+// runId -> (sessionId) callback fired the INSTANT the session id is known (the
+// 'init' event), NOT at graceful 'done'. A run killed mid-flight — the operator
+// restarting the app because a stop button hung, a crash — never emits 'done',
+// so an onDone-only persist would drop the session linkage and the next message
+// would start cold with no context. Persisting on init keeps the thread intact.
+const runSessionCallbacks = {};
 
 const modal = document.getElementById('modal');
 // the VISIBLE console — always shows the active workspace's feed. Background
@@ -462,7 +475,8 @@ function clearPESession(sessionId) {
 // ============================================================
 function render() {
   renderRoster();
-  renderTargets();
+  fillAdTarget();
+  renderChatList();
 }
 
 const ROLE_LABEL = { prompt: 'PROMPT ENGINEER', senior: 'SENIOR ENGINEER', uiux: 'UI/UX ENGINEER', reviewer: 'REVIEWER', custom: 'OPERATIVE', indexer: 'INDEXER' };
@@ -500,34 +514,9 @@ function renderRoster() {
       if (feedFilter === a.id) feedFilter = null;
       save(); render(); applyFilter();
     };
-    el.onclick = () => openChat(a.id);
+    el.onclick = () => openModal(a.id);   // in Settings the card configures, not chats
     roster.appendChild(el);
   }
-}
-
-function renderTargets() {
-  const sel = document.getElementById('chat-target');
-  const current = sel.value;
-  sel.innerHTML = '<option value="__pipeline__">⟢ AUTO PIPELINE</option>';
-  for (const a of agents) {
-    if (a.ephemeral) continue;
-    const opt = document.createElement('option');
-    opt.value = a.id;
-    opt.textContent = `${ROLE_ICON[a.role] || ROLE_ICON.custom} ${a.name}`;
-    sel.appendChild(opt);
-  }
-  // bare Claude models — run against a model directly, no agent persona
-  const grp = document.createElement('optgroup');
-  grp.label = 'MODELS';
-  for (const [id, label] of Object.entries(MODEL_LABELS)) {
-    const opt = document.createElement('option');
-    opt.value = 'model:' + id;
-    opt.textContent = `✦ ${label}`;
-    grp.appendChild(opt);
-  }
-  sel.appendChild(grp);
-  if ([...sel.options].some(o => o.value === current)) sel.value = current;
-  if (window.refreshTargetMenu) window.refreshTargetMenu();
 }
 
 // an on-demand, hidden agent that just runs a chosen model (no persona/roster
@@ -552,69 +541,196 @@ function ensureModelAgent(model) {
 }
 
 // ============================================================
-// Themed target dropdown — overlays the native <select> (kept as the
-// value source) so the popup follows the app theme, and groups agents
-// vs. bare models. Native OS dropdowns can't be styled; this can.
+// Chat sessions — ChatGPT-style, per-workspace, fully isolated.
+// Each chat owns a UNIQUE hidden agent id ('chat-<id>'), so its feed rows,
+// run state and SDK session never merge with another chat's. The chat's own
+// sdkSessionId lives on the chat object (persisted), NOT in the shared store.
 // ============================================================
-(function buildTargetDropdown() {
-  const sel = document.getElementById('chat-target');
-  if (!sel) return;
-  sel.classList.add('ctgt-native');   // visually hidden, still the source of truth
+let activeChatId = null;
+// chat agent ids whose stored transcript is being replayed right now — the
+// chat row shows its spinner while this is in flight (see openChatSession)
+const hydratingChats = new Set();
 
-  const wrap = document.createElement('div');
-  wrap.className = 'ctgt';
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'ctgt-btn composer-target';
-  btn.innerHTML = '<span class="ctgt-label"></span><span class="ctgt-caret">⌄</span>';
-  const menu = document.createElement('div');
-  menu.className = 'ctgt-menu hidden';
-  sel.after(wrap);
-  wrap.appendChild(btn);
-  wrap.appendChild(menu);
+function chatList() { return ws().chats || (ws().chats = []); }
+function saveChats() { saveWorkspaces(); }
+function findChat(id) { return chatList().find(c => c.id === id) || null; }
 
-  function labelFor(value) {
-    const o = [...sel.options].find(o => o.value === value);
-    return o ? o.textContent : '';
+// the roster agent a chat clones its persona from (null for a bare-model chat)
+function chatSourceAgent(chat) {
+  if (!chat.target || chat.target.startsWith('model:') || chat.target === '__pipeline__') {
+    return null;
   }
-  function syncLabel() { btn.querySelector('.ctgt-label').textContent = labelFor(sel.value); }
+  return agents.find(x => x.id === chat.target && !x.ephemeral) || null;
+}
 
-  function buildMenu() {
-    menu.innerHTML = '';
-    for (const node of sel.children) {
-      if (node.tagName === 'OPTGROUP') {
-        const head = document.createElement('div');
-        head.className = 'ctgt-group';
-        head.textContent = node.label;
-        menu.appendChild(head);
-        for (const opt of node.children) addItem(opt);
-      } else {
-        addItem(node);
-      }
-    }
-  }
-  function addItem(opt) {
-    const it = document.createElement('div');
-    it.className = 'ctgt-item' + (opt.value === sel.value ? ' active' : '');
-    it.textContent = opt.textContent;
-    it.onclick = () => {
-      sel.value = opt.value;
-      sel.dispatchEvent(new Event('change', { bubbles: true }));
-      syncLabel();
-      close();
+// materialize (or refresh) a chat's hidden agent. Ephemeral agents are stripped
+// on save, so this must run again on every load/switch to restore isolation.
+function ensureChatAgent(chat) {
+  const id = 'chat-' + chat.id;
+  const src = chatSourceAgent(chat);
+  const model = chat.model || (src && src.model) || 'claude-sonnet-5';
+  let a = agents.find(x => x.id === id);
+  if (!a) {
+    a = {
+      id, name: chat.title || 'Chat', model,
+      role: src ? src.role : 'custom',
+      cwd: projectDir || '', perm: 'bypassPermissions', lean: true,
+      rules: src ? (src.rules || '') : '', ephemeral: true
     };
-    menu.appendChild(it);
+    if (src && src.extraRules) a.extraRules = src.extraRules;
+    agents.push(a);
+  } else {
+    a.cwd = projectDir || a.cwd;
+    a.model = model;
+    a.name = chat.title || a.name;
   }
-  function open() { buildMenu(); menu.classList.remove('hidden'); btn.classList.add('open'); }
-  function close() { menu.classList.add('hidden'); btn.classList.remove('open'); }
+  return id;
+}
 
-  btn.onclick = () => { menu.classList.contains('hidden') ? open() : close(); };
-  document.addEventListener('mousedown', e => { if (!wrap.contains(e.target)) close(); });
+function chatTargetLabel(chat) {
+  if (chat.target && chat.target.startsWith('model:')) {
+    const m = chat.target.slice('model:'.length);
+    return MODEL_LABELS[m] || m;
+  }
+  const src = chatSourceAgent(chat);
+  return src ? src.name : (MODEL_LABELS[chat.model] || chat.model || 'chat');
+}
 
-  // expose so renderTargets() can refresh label/menu after repopulating options
-  window.refreshTargetMenu = () => { syncLabel(); if (!menu.classList.contains('hidden')) buildMenu(); };
-  syncLabel();
-})();
+function renderChatList() {
+  const box = document.getElementById('chat-list');
+  if (!box) return;
+  const chats = chatList();
+  chats.forEach(ensureChatAgent);   // restore hidden agents after a reload
+  box.innerHTML = '';
+  for (const chat of chats) {
+    const running = R('chat-' + chat.id).running;
+    const loading = hydratingChats.has('chat-' + chat.id);
+    const el = document.createElement('div');
+    el.className = 'chat-row'
+      + (running ? ' running' : '')
+      + (loading ? ' loading' : '')
+      + (chat.id === activeChatId ? ' active' : '');
+    el.innerHTML = `
+      <span class="cr-spin"></span>
+      <span class="cr-body">
+        <span class="cr-title"></span>
+        <span class="cr-sub"></span>
+      </span>
+      <button class="cr-del icon-btn" title="Delete chat">✕</button>`;
+    el.querySelector('.cr-title').textContent = chat.title || 'Chat';
+    el.querySelector('.cr-sub').textContent = chatTargetLabel(chat);
+    el.querySelector('.cr-del').onclick = (e) => { e.stopPropagation(); deleteChat(chat.id); };
+    el.onclick = () => openChatUI(chat);
+    box.appendChild(el);
+  }
+}
+
+function deleteChat(id) {
+  const aid = 'chat-' + id;
+  if (R(aid).running) stopAgent(aid);
+  ws().chats = chatList().filter(c => c.id !== id);
+  setAgents(agents.filter(a => a.id !== aid));   // drop the hidden agent
+  saveChats();
+  if (activeChatId === id) { activeChatId = null; closeAgentView(); }
+  renderChatList();
+}
+
+// one-shot done handler: capture the SDK session id the run just created/continued
+function chatOnDone(chat) {
+  return () => {
+    const sid = R('chat-' + chat.id).sessionId;
+    if (sid && sid !== chat.sdkSessionId) { chat.sdkSessionId = sid; saveChats(); }
+    renderChatList();
+  };
+}
+
+// open a chat in the center dock (reuses the roster dock, minus the close btn)
+function openChatUI(chat) {
+  activeChatId = chat.id;
+  ensureChatAgent(chat);
+  // replay the chat's stored transcript when its live feed is empty (post
+  // app-restart) — openChatSession opens the dock view itself, async replay.
+  // Fall back to the project's shared deck session: sdkSessionId is only
+  // captured when a run completes (chatOnDone), so older/interrupted chats
+  // have null and would land on a blank console.
+  openChatSession('chat-' + chat.id, chat.sdkSessionId || getSession());
+  // AUTO PIPELINE fans a chat out across many real agent ids (indexer, PE,
+  // senior, reviewer...), never the chat's own hidden 'chat-<id>' agent —
+  // openChatSession just filtered the console down to that lone id, which
+  // hides every stage's real output (plog's PIPELINE tag is silenced by
+  // design, so filtered + silenced left NOTHING visible at all). Show the
+  // unfiltered console instead so the operator watches the run happen.
+  if (chat.target === '__pipeline__') { feedFilter = null; applyFilter(); }
+  document.getElementById('ad-name').textContent = chat.title || 'Chat';
+  document.getElementById('ad-all').classList.add('hidden');   // a chat is persistent
+  adInput.placeholder = 'Message…   @ files · / skills · ! shell · ⌃⏎ send';
+  syncDockControls();
+  renderChatList();
+}
+
+// send a message on the active chat, resuming ONLY that chat's own session
+function sendChatMessage(text) {
+  const chat = findChat(activeChatId);
+  if (!chat) return;
+  sendChatDispatch(chat, text);
+}
+
+// route a chat's message: AUTO PIPELINE → launchPipeline, else the chat's own
+// isolated agent (resuming only that chat's session). PLAN comes from the chat.
+function sendChatDispatch(chat, text) {
+  if (chat.target === '__pipeline__') {
+    if (pipeFor(activeWorkspaceId).active) {
+      plog('err', 'pipeline already running for this project — abort it first.');
+      return;
+    }
+    launchPipeline(text, null, activeWorkspaceId);
+    return;
+  }
+  const id = 'chat-' + chat.id;
+  const opts = {
+    fresh: true, effort: chat.effort,
+    // capture the session id the moment it exists, so an interrupted run still
+    // leaves the chat resumable (onDone alone loses it on app restart / crash)
+    onSession: sid => {
+      if (sid && sid !== chat.sdkSessionId) { chat.sdkSessionId = sid; saveChats(); }
+    },
+    onDone: chatOnDone(chat)
+  };
+  if (chat.sdkSessionId) { opts.resume = chat.sdkSessionId; opts.fork = false; }
+  runAgent(id, text, false, !!chat.plan, opts);
+}
+
+// DRAFT → real chat: auto-create a sidebar chat from the first message typed
+// into the empty-state dock, using the dock controls for target/effort/plan.
+function createChatFromText(titleText, message) {
+  const t = document.getElementById('ad-target');
+  const e = document.getElementById('ad-effort');
+  const p = document.getElementById('ad-plan');
+  const target = (t && t.value) || 'model:claude-sonnet-5';
+  const effort = (e && e.value) || getEffort();
+  const plan = !!(p && p.checked);
+  const model = target.startsWith('model:')
+    ? target.slice('model:'.length)
+    : ((agents.find(a => a.id === target) || {}).model || 'claude-sonnet-5');
+  const title = (titleText.split('\n')[0].trim().slice(0, 40)) || 'New chat';
+  const chat = {
+    id: uid(), title, target, model, effort, plan,
+    origin: 'empty', ticketId: null, seedPrompt: '',
+    sdkSessionId: null, createdAt: Date.now()
+  };
+  chatList().push(chat);
+  saveChats();
+  ensureChatAgent(chat);
+  renderChatList();
+  openChatUI(chat);
+  activeChatId = chat.id;
+  sendChatDispatch(chat, message || titleText);
+}
+
+// ---- New Chat: ChatGPT-style — no modal, just open an empty draft. The
+// first message auto-creates the chat (createChatFromText) and titles it
+// from that message.
+document.getElementById('btn-new-chat').onclick = () => openDraftChat();
 
 // effort select — persisted globally, mirrored into the wide composer. The
 // native <select> is the data source but hidden; a themed custom dropdown
@@ -706,7 +822,7 @@ function enhanceThinkSelect(sel) {
 }
 
 (async function initEffortSelect() {
-  const sel = document.getElementById('chat-think');
+  const sel = document.getElementById('ad-effort');
   if (!sel) return;
   await loadEffortLevels();   // pull Claude's supported levels before building
   // restore the saved choice; if it's no longer a valid level, fall back to auto
@@ -799,19 +915,21 @@ function feed(agentId, cls, text, ico, sameLine = false) {
   // off-screen in a detached buffer, so background streams keep the same card
   if (sameLine && s && s.parentNode) {
     s.querySelector('.body').textContent += text;
-  } else {
-    const a = findAgent(agentId);
-    const el = document.createElement('div');
-    el.className = 'ev';
-    el.dataset.agent = agentId;
-    el.innerHTML = `<span class="tag">${esc(a ? a.name : '?')}</span><span class="ico">${ico || ''}</span><span class="body ${cls}"></span>`;
-    el.querySelector('.body').textContent = text;
-    if (feedFilter && feedFilter !== agentId) el.style.display = 'none';
-    cont.appendChild(el);
-    if (sameLine) { streamEls[agentId] = el; el.classList.add('streaming'); }
-    else delete streamEls[agentId];
+    if (cont === consoleFeed) pinFeedToBottom();
+    return s;
   }
+  const a = findAgent(agentId);
+  const el = document.createElement('div');
+  el.className = 'ev';
+  el.dataset.agent = agentId;
+  el.innerHTML = `<span class="tag">${esc(a ? a.name : '?')}</span><span class="ico">${ico || ''}</span><span class="body ${cls}"></span>`;
+  el.querySelector('.body').textContent = text;
+  if (feedFilter && feedFilter !== agentId) el.style.display = 'none';
+  cont.appendChild(el);
+  if (sameLine) { streamEls[agentId] = el; el.classList.add('streaming'); }
+  else delete streamEls[agentId];
   if (cont === consoleFeed) pinFeedToBottom();
+  return el;
 }
 
 function endStream(agentId) {
@@ -840,7 +958,10 @@ function showThinking(agentId, label) {
     if (feedFilter && feedFilter !== agentId) el.style.display = 'none';
     thinkEls[agentId] = el;
   }
-  el.querySelector('.think-label').textContent = label || 'thinking…';
+  // once Stop is clicked, pin this to "aborting…" — later tool/thinking
+  // events would otherwise flip it back and make Stop look like it failed
+  const aborting = R(agentId).aborting;
+  el.querySelector('.think-label').textContent = aborting ? 'aborting…' : (label || 'thinking…');
   cont.appendChild(el);                        // keep it as the last (current) line
   if (cont === consoleFeed) pinFeedToBottom();
 }
@@ -885,44 +1006,135 @@ function diffLines(oldStr, newStr) {
   return rows;
 }
 
-// collapsible diff card in the console feed for an edit tool call
-function feedDiff(agentId, tool, inp) {
+// a file path shown relative to the agent's project (backslashes normalised)
+function relToCwd(agentId, p) {
+  if (!p) return '';
+  const a = findAgent(agentId);
+  const base = (a && a.cwd) || projectDir || '';
+  let s = String(p);
+  if (base && s.toLowerCase().startsWith(base.toLowerCase())) {
+    s = s.slice(base.length).replace(/^[\\/]/, '');
+  }
+  return s.replace(/\\/g, '/');
+}
+// the legible target of a non-edit tool call — WHAT it acts on and, for a
+// search, the pattern it's looking for (that pattern IS the "why")
+function toolTarget(agentId, tool, inp, raw) {
+  if (!inp) return String(raw || '');
+  if (tool === 'Grep') {
+    const where = inp.path ? ` in ${relToCwd(agentId, inp.path)}`
+      : inp.glob ? ` in ${inp.glob}` : '';
+    return `"${inp.pattern || ''}"${where}`;
+  }
+  if (tool === 'Glob') return inp.pattern || '';
+  if (tool === 'Read') return relToCwd(agentId, inp.file_path || inp.path || '');
+  if (tool === 'Bash' || tool === 'PowerShell') return inp.command || '';
+  if (tool === 'WebFetch') return inp.url || '';
+  if (tool === 'WebSearch') return inp.query || '';
+  return inp.file_path || inp.path || inp.command || inp.pattern || inp.query || inp.prompt || '';
+}
+// a present-tense sentence for a tool call so the feed reads like someone
+// narrating ("Let me check X", "Searching for Y") — the result chip added on
+// 'tool-result' completes it ("… → 142 lines")
+function toolNarration(agentId, tool, inp, raw) {
+  const pick = arr => arr[(narrTick++) % arr.length];
+  const t = toolTarget(agentId, tool, inp, raw);
+  switch (tool) {
+    case 'Read': return t ? `${pick(READ_LEADS)} ${t}` : 'Reading a file';
+    case 'Grep': return `${pick(FIND_LEADS)} ${t}`;   // t = "pattern" in file
+    case 'Glob': return t ? `Looking for ${t}` : 'Listing files';
+    case 'Bash': case 'PowerShell': return t ? `Running ${t}` : 'Running a command';
+    case 'WebFetch': return t ? `Fetching ${t}` : 'Fetching a page';
+    case 'WebSearch': return `Searching the web for "${(inp && inp.query) || ''}"`;
+    case 'Task': case 'Agent': return t ? `Handing off: ${t}` : 'Delegating a subtask';
+    case 'TodoWrite': return 'Updating the plan';
+    default: return t ? `${tool} ${t}` : tool;
+  }
+}
+
+// diff card in the console feed for an edit tool call — Claude-Code style:
+// "Update(path)" header, "└ Added N lines" summary, line-numbered gutter,
+// OPEN by default so every change is visible without a click (the header
+// still toggles it closed). startLines = per-hunk real file line numbers
+// computed in the main process (null when the file couldn't be probed).
+const MAX_DIFF_ROWS = 400;   // cap huge Writes; the tail is elided
+
+function feedDiff(agentId, tool, inp, startLines) {
   const cont = feedElFor(agentId);
   if (cont === consoleFeed) hideFeedEmpty();
   const a = findAgent(agentId);
   const file = inp.file_path || inp.path || '';
-  const name = file ? file.split(/[\\/]/).pop() : tool;
-  let rows = [];
-  if (tool === 'Write') rows = diffLines('', inp.content || '');
-  else if (tool === 'MultiEdit' && Array.isArray(inp.edits)) {
-    inp.edits.forEach((e, i) => {
-      if (i) rows.push(['sep', '']);
-      rows.push(...diffLines(e.old_string, e.new_string));
-    });
-  } else rows = diffLines(inp.old_string, inp.new_string);
+  // show the path relative to the agent's project when possible
+  const base = (a && a.cwd) || projectDir || '';
+  let shown = file || tool;
+  if (base && file.toLowerCase().startsWith(base.toLowerCase())) {
+    shown = file.slice(base.length).replace(/^[\\/]/, '');
+  }
+
+  // hunks = [old, new] pairs; rows = [kind, text, lineNo] with real numbers
+  const hunks = (tool === 'MultiEdit' && Array.isArray(inp.edits))
+    ? inp.edits.map(e => [e.old_string, e.new_string])
+    : (tool === 'Write')
+      ? [['', inp.content || '']]
+      : [[inp.old_string, inp.new_string]];
+  const rows = [];
+  hunks.forEach(([o, n], hi) => {
+    if (hi) rows.push(['sep', '', '']);
+    const start = (startLines && startLines[hi]) || null;
+    let oldLn = start, newLn = start;
+    for (const [k, text] of diffLines(o, n)) {
+      let ln = '';
+      if (start !== null) {
+        if (k === 'del') ln = oldLn++;
+        else if (k === 'add') ln = newLn++;
+        else { ln = newLn++; oldLn++; }   // ctx advances both counters
+      }
+      rows.push([k, text, ln]);
+    }
+  });
+  if (rows.length > MAX_DIFF_ROWS) {
+    const extra = rows.length - MAX_DIFF_ROWS;
+    rows.length = MAX_DIFF_ROWS;
+    rows.push(['cut', `… ${extra} more lines`, '']);
+  }
 
   const adds = rows.filter(r => r[0] === 'add').length;
   const dels = rows.filter(r => r[0] === 'del').length;
-  const prefix = k => (k === 'add' ? '+' : k === 'del' ? '-' : k === 'sep' ? '' : ' ');
+  const prefix = k => (k === 'add' ? '+' : k === 'del' ? '-' : ' ');
+
+  // "└ Added 4 lines" / "└ Removed 2 lines" / "└ Added 4, removed 2 lines"
+  const sum = adds && dels ? `Added ${adds}, removed ${dels} lines`
+    : adds ? `Added ${adds} line${adds === 1 ? '' : 's'}`
+    : dels ? `Removed ${dels} line${dels === 1 ? '' : 's'}`
+    : 'No line changes';
+  const verb = tool === 'Write' ? 'Write' : 'Update';
 
   const card = document.createElement('div');
   card.className = 'ev ev-diff';
   card.dataset.agent = agentId;
   card.innerHTML =
     `<span class="tag">${esc(a ? a.name : '?')}</span>` +
-    `<div class="diff-card">` +
+    `<div class="diff-card open">` +
       `<button class="diff-head">` +
-        `<span class="diff-caret">▸</span><span class="diff-ico">✏</span>` +
+        `<span class="diff-caret">▸</span>` +
         `<span class="diff-file"></span>` +
         `<span class="diff-stat"><b class="add">+${adds}</b> <b class="del">-${dels}</b></span>` +
       `</button>` +
+      `<div class="diff-sum">└ ${esc(sum)}</div>` +
       `<div class="diff-body">` +
-        rows.map(([k]) => `<div class="dl dl-${k}"><i>${prefix(k)}</i><span></span></div>`).join('') +
+        rows.map(([k]) => (k === 'sep'
+          ? `<div class="dl dl-sep"></div>`
+          : `<div class="dl dl-${k}"><em></em><i>${prefix(k)}</i><span></span></div>`
+        )).join('') +
       `</div>` +
     `</div>`;
-  card.querySelector('.diff-file').textContent = name + (tool === 'Write' ? '  (new file)' : '');
-  const spans = card.querySelectorAll('.dl > span');
-  rows.forEach((r, i) => { spans[i].textContent = r[1]; });
+  card.querySelector('.diff-file').textContent =
+    `${verb}(${shown})` + (tool === 'Write' ? '  (new file)' : '');
+  const lines = card.querySelectorAll('.diff-body .dl:not(.dl-sep)');
+  rows.filter(r => r[0] !== 'sep').forEach((r, i) => {
+    lines[i].querySelector('em').textContent = r[2];
+    lines[i].querySelector('span').textContent = r[1];
+  });
   const inner = card.querySelector('.diff-card');
   card.querySelector('.diff-head').onclick = () => inner.classList.toggle('open');
   if (feedFilter && feedFilter !== agentId) card.style.display = 'none';
@@ -991,8 +1203,10 @@ function lockImplCard(btn, hint, label) {
 // drained the plan limit). Instead we carry ONLY the plan text forward, inline,
 // and start the builder on a FRESH context. One compact plan in, no history.
 function implementPlan(runnerId, plannerId, planSessionId, routeModel) {
-  const planBox = document.getElementById('chat-plan');
+  const planBox = document.getElementById('ad-plan');
   if (planBox) planBox.checked = false;   // exit plan mode for future sends too
+  const planChat = findChat(activeChatId);
+  if (planChat) { planChat.plan = false; saveChats(); }
   const delegated = runnerId !== plannerId;
   const planText = (R(plannerId).lastText || '').trim();
 
@@ -1033,6 +1247,9 @@ function applyFilter() {
   consoleFeed.querySelectorAll('.ev').forEach(el => {
     el.style.display = (!feedFilter || el.dataset.agent === feedFilter) ? '' : 'none';
   });
+  // single-chat view: every row is the same agent — the repeated name column
+  // is noise, so hide it (the ALL view keeps it to tell agents apart)
+  consoleFeed.classList.toggle('one-agent', !!feedFilter);
   feedStuck = true;
   consoleFeed.scrollTop = consoleFeed.scrollHeight;
 }
@@ -1057,9 +1274,6 @@ function renderActivity() {
   // "what's happening" is now the status bar (see statusbar.js renderWork()).
   activityEl.classList.add('hidden');
   activityEl.innerHTML = '';
-  // composer stop button: visible whenever anything is actually running
-  const stopBtn = document.getElementById('btn-pipeline-stop');
-  if (stopBtn) stopBtn.classList.toggle('hidden', !anyBusy());
   if (window.renderStatusBar) window.renderStatusBar();
   syncPane();
 }
@@ -1127,7 +1341,10 @@ function syncPane() {
 }
 
 function ticker(agentId, text, idle = false) {
-  R(agentId).status = text;
+  const r = R(agentId);
+  // once Stop is clicked, trailing tool/stream events must not overwrite the
+  // status back to "thinking…"/tool narration — that reads as Stop doing nothing
+  r.status = r.aborting ? 'aborting…' : text;
   renderActivity();
   updateChatModal();
 }
@@ -1141,6 +1358,10 @@ function ticker(agentId, text, idle = false) {
 // project-map hint cache: one indexStatus IPC per cwd per app session (the
 // status call walks the tree to fingerprint it — too heavy to repeat every run)
 const mapHintSeen = new Map();   // cwd -> boolean (PROJECT-MAP.md exists)
+// warm-run target dedupe: agentId -> sorted rel-list key of the last TARGET
+// FILES block injected. A follow-up about the same area used to re-append a
+// near-identical ~0.5k block every message — cached-input cost every turn.
+const lastTargets = new Map();
 async function hasProjectMap(cwd) {
   if (!cwd) return false;
   if (!mapHintSeen.has(cwd)) {
@@ -1203,6 +1424,40 @@ function withTimeout(promise, ms, fallback) {
   ]).finally(() => clearTimeout(t));
 }
 
+// ===== Retrieval eval (hit@k) — closes the measurement loop =====
+// At launch we record what retrieval PREDICTED (the pre-ranked file list);
+// during the run we record what the agent actually EDITED; on done this logs
+// hit@5 / hit@10 to .loveai/index/retrieval-eval.jsonl via main. That file is
+// the ground truth for whether a ranking change helped — check it (or
+// window.deck.evalStats(cwd)) before and after tuning retrieval.
+function logRetrievalEval(r, cwd) {
+  try {
+    if (!cwd || !r.evalPredicted || !r.evalPredicted.length) return;
+    if (!r.evalEdited || !r.evalEdited.size) return;
+    const rootFwd = String(cwd).replace(/\\/g, '/').replace(/\/+$/, '') + '/';
+    const norm = (p) => {
+      let s = String(p).replace(/\\/g, '/');
+      if (s.toLowerCase().startsWith(rootFwd.toLowerCase())) s = s.slice(rootFwd.length);
+      return s;
+    };
+    const edited = [...new Set([...r.evalEdited].map(norm))];
+    const top5 = new Set(r.evalPredicted.slice(0, 5));
+    const top10 = new Set(r.evalPredicted.slice(0, 10));
+    const frac = (set) => edited.filter(e => set.has(e)).length / edited.length;
+    window.deck.evalLog(cwd, {
+      at: Date.now(),
+      warm: !!r.evalWarm,
+      query: String(r.evalQuery || '').replace(/\s+/g, ' ').slice(0, 120),
+      predicted: r.evalPredicted,
+      edited,
+      hit5: +frac(top5).toFixed(3),
+      hit10: +frac(top10).toFixed(3),
+    }).catch(() => {});
+  } catch {}
+  r.evalPredicted = null;
+  r.evalEdited = null;
+}
+
 async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) {
   const a = findAgent(agentId);
   const r = R(agentId);
@@ -1221,8 +1476,10 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   // optional one-shot completion callback, fired with (result, finalText) on done
   if (opts.onDone) runDoneCallbacks[r.runId] = opts.onDone;
   if (opts.onEvent) runEventSinks[r.runId] = opts.onEvent;
+  if (opts.onSession) runSessionCallbacks[r.runId] = opts.onSession;
   r.startedAt = Date.now();
   r.lastText = '';
+  r.aborting = false;   // clear any stale flag from a prior stopped run
   r.sessionId = null;   // per-run: set on the 'init' event; used by the watchdog
   r.curModel = model;   // for the background learner
   setRunningUI(agentId, true);
@@ -1271,24 +1528,58 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   // its first run — re-attaching them would replay thousands of duplicate
   // tokens into an already-loaded context, so all injects are skipped.
   const warm = !!(opts.resume || (opts.cont && getSession()));
+  // retrieval key — what the index/RAG is queried with. Defaults to the prompt,
+  // but pipeline dispatches pass the TASK CONTENT here: their prompt is just
+  // "Execute task-NN.md: read … per your rules", which ranked files against
+  // "execute/read/pipeline" noise and made engineers re-research by hand.
+  const rq = String(opts.retrievalQuery || prompt);
+  // retrieval eval state — what we predicted at launch vs what gets edited
+  r.evalEdited = new Set();
+  r.evalPredicted = null;
+  r.evalQuery = rq;
   let fullPrompt = prompt;
-  if (!warm && a.role !== 'indexer' && await withTimeout(hasProjectMap(cwd), 4000, false)) {
+  const prepT0 = performance.now();   // how long context assembly holds the spawn
+  // ---- COLD-RUN ENRICHMENT, kicked off in PARALLEL ----
+  // These lookups (map check, topic memory, regression impact, lexical
+  // retrieval, vector RAG, symbol pack) are independent of each other. They
+  // used to be awaited one after another, so their timeouts could STACK to
+  // ~38s of dead time before the agent spawned. Start them all at once here;
+  // the awaits below then cost max(slowest), not the sum. Append order into
+  // fullPrompt is unchanged (awaits happen in the original order).
+  const isIdx = a.role === 'indexer';
+  const heavyRole = a.role === 'prompt' || a.role === 'custom'
+    || a.role === 'senior' || a.role === 'uiux';
+  const frontLoad = !warm && heavyRole && cwd;
+  // tight ceilings: a warm index answers in ms — only a busy/cold worker hits
+  // these, and then the launch proceeds without that enrichment rather than wait
+  const pMap = (!warm && !isIdx)
+    ? withTimeout(hasProjectMap(cwd), 2000, false) : null;
+  const pMem = (!warm && !isIdx && cwd)
+    ? withTimeout(memoryInject(cwd, rq), 2000, '') : null;
+  const pImp = (!warm && !isIdx && !heavyRole && cwd)
+    ? withTimeout(window.deck.regressionImpact(cwd, rq), 3000, null) : null;
+  // withContent=0: the push is a MAP now (file names + symbols), never code —
+  // the agent PULLS code mid-task via the mcp__deck__* retrieval tools
+  const pCtx = frontLoad
+    ? withTimeout(window.deck.retrieveContext(cwd, rq, 12), 3500, null) : null;
+  const pVec = frontLoad
+    ? withTimeout(window.deck.vectorQuery(cwd, rq, 20), 3500, null) : null;
+
+  if (pMap && await pMap) {
     fullPrompt += '\n\nOrientation: read .loveai/index/PROJECT-MAP.md first and open only the files relevant to this task — do not survey the repo.';
   }
   // TOPIC MEMORY — front-load only the feature memory relevant to this run so
   // the agent already knows the flow (paths, functions, step-by-step) without
   // re-exploring. Light by design: at most 1-2 topics, not the whole codebase.
   // Every role reads it and (per DISCIPLINE) every role maintains it.
-  if (!warm && a.role !== 'indexer' && cwd) {
-    fullPrompt += await withTimeout(memoryInject(cwd, prompt), 4000, '');
-  }
+  if (pMem) fullPrompt += await pMem;
   // REGRESSION IMPACT (global) — the native code graph's blast-radius, injected
   // for EVERY non-indexer run so any agent/model sees what a change touches. The
   // Prompt Engineer / custom already get a richer version inside the retrieval
   // front-load below, so they're excluded here to avoid a duplicate block.
-  if (!warm && a.role !== 'indexer' && a.role !== 'prompt' && a.role !== 'custom' && a.role !== 'senior' && a.role !== 'uiux' && cwd) {
+  if (pImp) {
     try {
-      const im = await withTimeout(window.deck.regressionImpact(cwd, prompt), 6000, null);
+      const im = await pImp;
       if (im && im.ok && im.impact && im.impact.trim()) {
         fullPrompt += `\n\nREGRESSION IMPACT (auto, from the code graph — NOT ` +
           `exhaustive, verify): the symbols you may change and what calls/imports ` +
@@ -1297,17 +1588,16 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
       }
     } catch {}
   }
-  // LEXICAL + GRAPH FRONT-LOAD: pre-rank the files most likely involved (symbol +
-  // BM25) and inline their source, so the agent reads its context HERE instead of
-  // re-grepping/re-reading the repo. Given to the planner (PE/custom) AND the build
-  // agents (seniors + UI/UX engineers) — the latter previously re-opened every file
-  // over many turns, which is what actually burned the token budget. Cheap local
-  // call, no LLM.
-  if (!warm && (a.role === 'prompt' || a.role === 'custom' || a.role === 'senior' || a.role === 'uiux') && cwd) {
+  // SLIM FRONT-LOAD (map, not code): pre-rank the files most likely involved
+  // (BM25 + vector) and hand over NAMES + SYMBOLS only. The agent pulls actual
+  // code mid-task through the in-process mcp__deck__* retrieval tools (see
+  // main.js buildDeckServer) — mid-task queries beat t=0 prompt-keyed guesses.
+  // Given to the planner (PE/custom) AND build agents (seniors + UI/UX).
+  if (frontLoad) {
     try {
-      // top 12 ranked; full CONTENT for the top 5 so the agent barely needs to Read
-      const r = await withTimeout(window.deck.retrieveContext(cwd, prompt, 12, 5), 8000, null);
-      if (!r) throw new Error('retrieve-context timed out');
+      // top 12 ranked file names + symbols — the MAP the slim push is built from
+      const rc = await pCtx;
+      if (!rc) throw new Error('retrieve-context timed out');
       // SEMANTIC (RAG) retrieval — vector search over the tree-sitter symbols, so
       // the agent sees files whose MEANING matches even when no identifier does.
       // LOGGED so the operator can confirm the vector index is actually being used
@@ -1315,18 +1605,22 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
       let vhits = [];
       let vq = null;
       try {
-        vq = await withTimeout(window.deck.vectorQuery(cwd, prompt, 20), 8000, null);
+        vq = await pVec;
         if (vq && vq.ready && Array.isArray(vq.hits)) vhits = vq.hits;
       } catch {}
-      const vTopFiles = [...new Set(
-        vhits.map(h => h.id.slice(0, h.id.lastIndexOf('#')))
-      )].slice(0, 6);
+      // id format is rel#symbol — guard the cut so an id without '#' (legacy
+      // index rows) yields the raw id instead of a chopped/garbled path
+      const relOfHit = (id) => {
+        const cut = id.lastIndexOf('#');
+        return cut > 0 ? id.slice(0, cut) : id;
+      };
+      const vTopFiles = [...new Set(vhits.map(h => relOfHit(h.id)))].slice(0, 6);
       // Say WHICH failure it is — a built index with a dead embedder is NOT the
       // same as no index, and telling the user to "build the graph" when the
       // vectors already exist just loops them (build succeeds, query still empty).
       let ragMsg;
       if (vhits.length) {
-        ragMsg = `RAG query → "${String(prompt).replace(/\s+/g, ' ').slice(0, 70)}" · ` +
+        ragMsg = `RAG query → "${rq.replace(/\s+/g, ' ').slice(0, 70)}" · ` +
           `${vhits.length} semantic hits · top: ${vTopFiles.join(', ')}`;
       } else if (vq && vq.indexed && vq.embedErr) {
         ragMsg = `RAG: vector index exists but the embedder won't load ` +
@@ -1349,28 +1643,25 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
         }
       }
       feed(agentId, 'sys', ragMsg, '🧬');
-      if (r.ok && r.files && r.files.length) {
+      if (rc.ok && rc.files && rc.files.length) {
         // fold semantic-only files into the ranked list so they're surfaced too
-        const haveRel = new Set(r.files.map(f => f.rel));
+        const haveRel = new Set(rc.files.map(f => f.rel));
         for (const rel of vTopFiles) {
-          if (!haveRel.has(rel)) { haveRel.add(rel); r.files.push({ rel }); }
+          if (!haveRel.has(rel)) { haveRel.add(rel); rc.files.push({ rel }); }
         }
-        // SYMBOL-LEVEL PACK (tree-sitter) — the primary context path. Loads only the
-        // symbols the request needs + their dependencies instead of whole files.
-        // Graph-gated: `ready` is false when the code graph is cold or nothing
-        // relevant was found, and we transparently fall back to the whole-file
-        // front-load below (hybrid). Cheap local call, no LLM.
-        let sym = null;
-        try { sym = await withTimeout(window.deck.retrieveSymbols(cwd, prompt, 12000, false), 8000, null); } catch {}
-        const symReady = !!(sym && sym.ok && sym.ready && sym.context);
-
-        // 1) repo map — the symbol pack carries its own (symbol-level) map, so only
-        // add the lexical dir-map when we're on the whole-file fallback path.
-        if (!symReady && r.repoMap) {
-          fullPrompt += `\n\nREPO MAP (directories by file count + notable files — use this for orientation instead of exploring):\n${r.repoMap}`;
+        // record the prediction for the retrieval eval (logged on done)
+        r.evalPredicted = rc.files.slice(0, 10).map(f => f.rel);
+        r.evalWarm = false;
+        // SLIM PUSH (Aider-style): a small MAP of where the task lives — file
+        // names + symbols, never code. The heavy context (symbol packs, file
+        // contents, blast radius) is PULLED by the agent mid-task via the
+        // in-process mcp__deck__* tools, when it knows what it actually needs.
+        // 1) repo map for orientation
+        if (rc.repoMap) {
+          fullPrompt += `\n\nREPO MAP (directories by file count + notable files — use this for orientation instead of exploring):\n${rc.repoMap}`;
         }
         // 2) ranked candidate files for this specific issue
-        const lines = r.files
+        const lines = rc.files
           .map(f => `- ${f.rel}${f.symbols && f.symbols.length ? ' — ' + f.symbols.slice(0, 8).join(', ') : ''}`)
           .join('\n');
         fullPrompt += `\n\nPRE-RANKED RELEVANT FILES (lexical match on the issue):\n${lines}`;
@@ -1381,62 +1672,102 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
           fullPrompt += `\n\nSEMANTIC MATCHES (vector/RAG search — meaning-based, ` +
             `use alongside the lexical list):\n${symLines}`;
         }
-        // 3) CONTEXT — symbol pack if ready; ALSO inline whole files when the pack
-        // is absent OR thin. A thin pack (few files / few chars) starves the agent
-        // and forces manual grep/read loops — every extra turn re-reads the whole
-        // transcript, which is what balloons cache-read (and the plan quota). Lexical
-        // retrieval whiffs when the issue's words don't match code identifiers, so a
-        // thin pack is common for cross-cutting bugs — hand over the code up front.
-        const s = (symReady && sym.stats) ? sym.stats : {};
-        // Only augment a genuinely starved pack. A working symbol pack already IS
-        // the context — adding a 6k whole-file dump on top just re-sends code the
-        // agent has, and every later turn replays it (pure waste on Opus).
-        const thinPack = symReady
-          && ((s.files || 0) <= 1 || (s.chars || 0) < 2500);
-        if (symReady) {
-          fullPrompt += `\n\n${sym.context}`;
-          feed(agentId, 'sys',
-            `symbol context: ${s.seeds || 0} symbols + ${s.deps || 0} deps from ` +
-            `${s.files || 0} files (~${s.chars || 0} chars)` +
-            (thinPack ? ' — thin, adding whole-file front-load'
-                      : ' — whole-file load skipped'), '🌳');
-        }
-        if (!symReady || thinPack) {
-          // whole-file front-load — inline the actual code of the top files
-          let budget = 6000;          // total inline char budget — fallback only; the symbol pack is primary
-          const PER_FILE = 3000;      // cap any single file so one big file can't eat it all
-          const blocks = [];
-          for (const f of r.files) {
-            if (budget <= 0 || !f.content) continue;
-            const chunk = f.content.slice(0, Math.min(budget, PER_FILE));
-            budget -= chunk.length;
-            blocks.push(`\n===== ${f.rel} =====\n${chunk}`);
-          }
-          if (blocks.length) {
-            fullPrompt += `\n\nTOP FILE CONTENTS (already loaded — read here, do NOT re-open with Read):\n${blocks.join('\n')}`;
-          }
-        }
-        // 3b) regression blast-radius — who references the symbols you may touch. The
-        // planner bakes it into the task CONTEXT so seniors inherit it; seniors/UI
-        // engineers also see it directly here (they no longer get the lighter block above).
-        if (r.impact) {
+        // 3) regression blast-radius — who references the symbols you may touch.
+        // The planner bakes it into the task CONTEXT so seniors inherit it.
+        if (rc.impact) {
           fullPrompt += `\n\nREGRESSION IMPACT (auto, computed from the index — NOT ` +
             `exhaustive, verify): symbols you may change and the files that reference ` +
             `them. Before altering any symbol below, check EACH listed reference for ` +
             `breakage, prefer a minimal backward-compatible change, and RECORD the ` +
-            `affected files in your task's CONTEXT so the engineers inherit this.\n${r.impact}`;
+            `affected files in your task's CONTEXT so the engineers inherit this.\n${rc.impact}`;
         }
-        // 4) firm directive so it trusts the above and stops exploring
-        const ctxDesc = symReady
-          ? (thinPack
-              ? 'symbol context + inlined file contents'
-              : 'symbol context (implementations + dependencies)')
-          : 'inlined file contents';
-        fullPrompt += `\n\nEFFICIENCY: The ranked files + ${ctxDesc} above ARE your context. Do AT MOST 2-3 extra targeted reads/greps only if a specific symbol you need is missing. Do not survey the tree, do not re-read what is already loaded, and go straight to producing the output.`;
+        // 4) firm directive: pull code through the indexed tools, not tree surveys
+        fullPrompt += `\n\nRETRIEVAL TOOLS (indexed, answer in milliseconds — ` +
+          `PREFER these over Glob/Grep surveys):\n` +
+          `- mcp__deck__search_code — hybrid ranked file/symbol search (lexical+semantic)\n` +
+          `- mcp__deck__get_symbols — implementations + dependencies for a topic (actual code)\n` +
+          `- mcp__deck__who_references — blast radius of a symbol/file before you change it\n` +
+          `- mcp__deck__topic_memory — feature notes recorded by previous runs\n` +
+          `Workflow: the lists above say WHERE the task lives → pull code with ` +
+          `get_symbols/search_code → Read only the exact spans you will edit. ` +
+          `Do not survey the tree.`;
+      }
+    } catch {}
+  }
+  // PER-MESSAGE RETRIEVAL (warm runs) — a resumed/continued session already
+  // carries the FIRST message's front-load, but a follow-up about something
+  // NEW used to arrive with zero targeting: the model then re-located the
+  // code by hand (Glob/Grep loops over many turns), which is what actually
+  // burned the turn ceiling. Every message now queries the index (vector RAG
+  // + BM25 + tree-sitter symbol graph) and hands the model the exact files
+  // to open — the search happens HERE, in one cheap local call, not in agent
+  // turns. Kept lean on purpose: file list + symbol pack only, no repo map,
+  // no whole-file dump (the transcript already holds the session's context).
+  if (warm && cwd && a.role !== 'indexer') {
+    try {
+      // tight ceiling (was 6s): a follow-up should FEEL instant — if the index
+      // worker is busy the message just goes out without per-message targeting.
+      // No symbol-pack push here anymore: the agent pulls code via mcp__deck__*.
+      const [rc, vq] = await Promise.all([
+        withTimeout(window.deck.retrieveContext(cwd, rq, 10), 2500, null)
+          .catch(() => null),
+        withTimeout(window.deck.vectorQuery(cwd, rq, 12), 2500, null)
+          .catch(() => null),
+      ]);
+      // ranked lexical files + semantic-only files folded in, name + symbols
+      const files = [];
+      if (rc && rc.ok && Array.isArray(rc.files)) {
+        for (const f of rc.files) files.push({ rel: f.rel, symbols: f.symbols });
+      }
+      const vhits = (vq && vq.ready && Array.isArray(vq.hits)) ? vq.hits : [];
+      for (const h of vhits) {
+        const cut = h.id.lastIndexOf('#');
+        const rel = cut > 0 ? h.id.slice(0, cut) : h.id;
+        if (rel && !files.some(f => f.rel === rel)) files.push({ rel });
+      }
+      const shown = files.slice(0, 10);
+      // eval prediction recorded even when the inject below gets deduped —
+      // retrieval still ranked these files for this message
+      if (files.length) {
+        r.evalPredicted = shown.map(f => f.rel);
+        r.evalWarm = true;
+      }
+      // keyed by the session being resumed — a different session's transcript
+      // does NOT carry the previous block, so its dedupe must not apply
+      const sess = opts.resume || getSession() || '';
+      const targetKey = sess + '::' + shown.map(f => f.rel).sort().join('|');
+      if (files.length && lastTargets.get(agentId) === targetKey) {
+        // same target set as the previous message — the transcript already
+        // carries the block; re-injecting it would just duplicate tokens
+        feed(agentId, 'sys',
+          `per-message retrieval: targets unchanged — inject skipped`, '🧬');
+      } else if (files.length) {
+        lastTargets.set(agentId, targetKey);
+        const lines = shown.map(f =>
+          `- ${f.rel}${f.symbols && f.symbols.length
+            ? ' — ' + f.symbols.slice(0, 6).join(', ') : ''}`).join('\n');
+        fullPrompt += `\n\nTARGET FILES for THIS message (auto-retrieved from ` +
+          `the project index — this is where the request lives):\n${lines}`;
+        fullPrompt += `\n\nEFFICIENCY: retrieval already located this ` +
+          `message's code (list above). Pull implementations via ` +
+          `mcp__deck__search_code / mcp__deck__get_symbols (indexed, instant) ` +
+          `instead of Glob/Grep surveys; Read only the exact spans you will edit.`;
+        feed(agentId, 'sys',
+          `per-message retrieval: ${files.length} target files`, '🧬');
       }
     } catch {}
   }
 
+  // launch transparency — attribute slow starts at a glance: this line is the
+  // renderer-side prep cost; the Δ shown on the ⚡session line is the SDK
+  // subprocess spawn + session-resume cost. Model latency is everything after.
+  const prepMs = Math.round(performance.now() - prepT0);
+  const injectedK = (fullPrompt.length - prompt.length) / 1000;
+  if (prepMs > 300 || injectedK > 0.5) {
+    feed(agentId, 'sys',
+      `context assembled in ${prepMs}ms · +${injectedK.toFixed(1)}k chars injected · spawning…`, '⏱');
+  }
+  r.spawnT0 = Date.now();
   await window.deck.runAgent({
     runId: r.runId, agentId, prompt: fullPrompt,
     model, cwd, rules: effectiveRules(a),
@@ -1479,12 +1810,22 @@ function stopAgent(agentId) {
     if (r.initWatch) { clearTimeout(r.initWatch); r.initWatch = null; }
     r.running = false;
     setRunningUI(agentId, false);
+    return;
   }
+  // The subprocess can take a moment to actually die, and trailing stream/tool
+  // events keep landing in the meantime — without this they'd keep overwriting
+  // the status/thinking row back to "thinking…"/tool narration, making Stop
+  // look like it silently did nothing. Pin the UI to "aborting…" right away;
+  // cleared when 'done' finally lands (see case 'done').
+  r.aborting = true;
+  ticker(agentId, 'aborting…');
+  showThinking(agentId, 'aborting…');
 }
 
 function setRunningUI(agentId, running) {
   if (!running) ticker(agentId, 'standing by', true);
   renderRoster();
+  renderChatList();      // per-chat row spinners follow run state
   renderActivity();
   renderRail();          // keep the rail's per-project running badges live
   updateChatModal();
@@ -1506,12 +1847,26 @@ window.deck.onAgentEvent(ev => {
   if (runEventSinks[ev.runId]) { try { runEventSinks[ev.runId](ev); } catch {} }
 
   switch (ev.kind) {
-    case 'init':
+    case 'init': {
       r.sessionId = ev.sessionId;
-      feed(ev.agentId, 'sys', `session ${ev.sessionId.slice(0, 8)} · ${ev.model}`, '⚡');
+      // persist the session linkage NOW, before any work runs — a run the
+      // operator interrupts (app restart, crash) never reaches 'done', so the
+      // owning chat/ticket would otherwise forget which session to resume and
+      // start the next message cold. Fires on every init (a missing-session
+      // fresh-retry emits a new one) so the LATEST id always wins.
+      if (runSessionCallbacks[ev.runId]) {
+        try { runSessionCallbacks[ev.runId](ev.sessionId); } catch {}
+      }
+      // Δ = SDK subprocess spawn + transcript resume, the cost a persistent
+      // CLI session doesn't pay — watch this to see where slow starts live
+      const spawnS = r.spawnT0 ? ((Date.now() - r.spawnT0) / 1000).toFixed(1) : null;
+      feed(ev.agentId, 'sys',
+        `session ${ev.sessionId.slice(0, 8)} · ${ev.model}` +
+        (spawnS ? ` · spawned in ${spawnS}s` : ''), '⚡');
       ticker(ev.agentId, 'thinking...');
       showThinking(ev.agentId, 'thinking…');
       break;
+    }
     case 'session-invalid':
       // the resumed session no longer exists on disk — forget it so it isn't
       // reused; the run auto-retries with a fresh context in the main process
@@ -1548,22 +1903,41 @@ window.deck.onAgentEvent(ev => {
       hideThinking(ev.agentId);
       const ico = TOOL_ICON[ev.tool] || '⚙';
       let inp = null;
-      try { inp = JSON.parse(ev.input); } catch {}
-      // edits get a collapsible diff card instead of a bare log line
+      // editInput is the UNtruncated payload for edit tools (ev.input is
+      // capped at 400 chars in main.js and won't parse for real edits)
+      try { inp = JSON.parse(ev.editInput || ev.input); } catch {}
+      // edits get a diff card instead of a bare log line
       if (inp && /^(Edit|MultiEdit|Write)$/.test(ev.tool)) {
-        feedDiff(ev.agentId, ev.tool, inp);
+        // retrieval eval: remember which files actually got edited this run
+        const editedPath = inp.file_path || inp.path || '';
+        if (editedPath && r.evalEdited) r.evalEdited.add(editedPath);
+        feedDiff(ev.agentId, ev.tool, inp, ev.editLines);
         const fn = (inp.file_path || inp.path || '').split(/[\\/]/).pop();
         ticker(ev.agentId, `${ev.tool} ▸ ${fn}`);
         showThinking(ev.agentId, `${ev.tool} ▸ ${fn}`);
         break;
       }
-      let detail = '';
-      if (inp) detail = inp.file_path || inp.path || inp.command || inp.pattern || inp.query || inp.prompt || '';
-      else detail = ev.input;
-      detail = String(detail).slice(0, 120);
-      feed(ev.agentId, 'tool', `${ev.tool} ${detail}`, ico);
-      ticker(ev.agentId, `${ev.tool} ▸ ${detail}`);
-      showThinking(ev.agentId, `${ev.tool} ▸ ${detail}`);
+      // a human sentence ("Let me check X", "Searching for Y…"); the result
+      // chip is appended on 'tool-result' to complete it ("… 142 lines")
+      const narr = String(toolNarration(ev.agentId, ev.tool, inp, ev.input)).slice(0, 160);
+      const row = feed(ev.agentId, 'tool', narr, ico);
+      if (row && ev.id) { row.dataset.toolId = ev.id; toolRowEls[ev.id] = row; }
+      ticker(ev.agentId, narr);
+      showThinking(ev.agentId, narr);
+      break;
+    }
+    case 'tool-result': {
+      // land the outcome (142 lines / 8 matches / ok / failed) on its tool row so
+      // the operator sees WHAT the read/search/command returned, not just that it ran
+      const row = toolRowEls[ev.id];
+      if (row) {
+        const chip = document.createElement('span');
+        chip.className = 'tres' + (ev.ok ? '' : ' err');
+        chip.textContent = ev.summary || (ev.ok ? 'done' : 'failed');
+        row.appendChild(chip);
+        delete toolRowEls[ev.id];
+        if (feedElFor(ev.agentId) === consoleFeed) pinFeedToBottom();
+      }
       break;
     }
     case 'result': {
@@ -1618,6 +1992,7 @@ window.deck.onAgentEvent(ev => {
       break;
     case 'done': {
       r.running = false;
+      r.aborting = false;
       endStream(ev.agentId);
       hideThinking(ev.agentId);
       // any agent may have written/updated topic memories — capture fingerprints
@@ -1627,6 +2002,8 @@ window.deck.onAgentEvent(ev => {
       if (finishedAgent && finishedAgent.role !== 'indexer' && memCwd) {
         window.deck.memoryReindex(memCwd).catch(() => {});
       }
+      // retrieval eval: did the pre-ranked list contain the edited files?
+      logRetrievalEval(r, r.cpCwd || memCwd);
       if (r.planMode && r.lastResult === 'success') {
         feed(ev.agentId, 'sys', 'plan complete — nothing was written yet.', '🗺');
         feedImplementCard(ev.agentId, r.sessionId);
@@ -1640,6 +2017,7 @@ window.deck.onAgentEvent(ev => {
         try { cb(r.lastResult, r.lastText || ''); } catch {}
       }
       delete runEventSinks[ev.runId];
+      delete runSessionCallbacks[ev.runId];
       if (r.cpStandalone && r.cpCwd) { cpEndTask(r.cpCwd); r.cpStandalone = false; }
       if (typeof gitRefresh === 'function' && gitRepo) gitRefresh();
       // a MANUAL Prompt Engineer run (outside the pipeline) that produced task
@@ -1679,6 +2057,7 @@ function freshPipe() {
   return {
     active: false, stage: null, cwd: '', iteration: 0, maxIter: 5,
     pending: new Set(), taskAssign: new Map(), planTasks: [], taskModels: new Map(),
+    taskContent: new Map(),
     reviewModel: null,
     // per-run reasoning-effort override (e.g. a workspace ticket's REASONING
     // choice) — null means "use the global session setting" as before
@@ -1771,7 +2150,6 @@ async function launchPipeline(issue, effort, wsId) {
   p.pending.clear();
   p.taskAssign.clear();
   p.engineersAssigned = false;
-  if (wsId === activeWorkspaceId) document.getElementById('btn-pipeline-stop').classList.remove('hidden');
   if (planReviewWsId === wsId) hidePlanReview();
 
   await window.deck.pipelineReset(p.cwd);
@@ -1853,10 +2231,7 @@ function abortPipeline(msg, wsId) {
   p.active = false;
   setStage(wsId, null);
   cpEndTask(p.cwd);
-  if (wsId === activeWorkspaceId) {
-    document.getElementById('btn-pipeline-stop').classList.add('hidden');
-    hideReassigning();
-  }
+  if (wsId === activeWorkspaceId) hideReassigning();
   if (planReviewWsId === wsId) hidePlanReview();
   for (const id of p.pending) stopAgent(id);
   const pr = byRoleIn(wsId, 'prompt')[0]; if (pr && R(pr.id).running) stopAgent(pr.id);
@@ -1872,7 +2247,6 @@ function finishPipeline(msg, wsId) {
   p.active = false;
   setStage(wsId, null);
   cpEndTask(p.cwd);
-  if (wsId === activeWorkspaceId) document.getElementById('btn-pipeline-stop').classList.add('hidden');
   plog('ok', msg, wsId);
   cleanupSeniors(wsId);
   bridgePipelineSession(wsId);
@@ -2000,10 +2374,12 @@ async function deployEngineersFromDir(wsId) {
   p.reviewModel = null;
   const uiTasks = new Set();
   const files = await window.deck.pipelineRead(p.cwd);
+  p.taskContent = new Map();   // name → body, feeds each engineer's retrieval
   for (const f of files) {
     if (/^task-\d+.*\.md$/i.test(f.name)) {
       const m = parseModelLine(f.content);
       if (m) p.taskModels.set(f.name, m);
+      p.taskContent.set(f.name, f.content);
       if (isUiTask(f.name + ' ' + f.content.slice(0, 2000))) uiTasks.add(f.name);
     } else if (f.name === 'review-brief.md') {
       p.reviewModel = parseModelLine(f.content, 'REVIEW-MODEL');
@@ -2076,7 +2452,6 @@ function feedDeployCard(cwd, taskNames, wsId) {
     el.classList.add('done');
     el.querySelector('.pl-meta').textContent = 'deploying…';
     p.active = true; p.cwd = cwd; p.iteration = 0;
-    if (wsId === activeWorkspaceId) document.getElementById('btn-pipeline-stop').classList.remove('hidden');
     p.planTasks = taskNames;
     await deployEngineersFromDir(wsId);
   };
@@ -2166,7 +2541,16 @@ function startBuild(taskCmd, wsId) {
         `${a ? a.name : agentId} ▸ ${taskFile} on ${MODEL_LABELS[model]} (complexity-routed)`,
         wsId);
     }
-    runAgent(agentId, prompt, false, false, { model, fresh: true, effort: p.effort });
+    // key retrieval on the TASK BODY (minus the routing header), not the
+    // "Execute task-NN…" wrapper — so the engineer's front-load ranks the
+    // files the task is actually about and it never re-researches the plan
+    const body = (p.taskContent && p.taskContent.get(taskFile)) || '';
+    const retrievalQuery = body
+      ? body.replace(/^COMPLEXITY:.*$/m, '').replace(/^MODEL:.*$/m, '')
+          .trim().slice(0, 2500)
+      : null;
+    runAgent(agentId, prompt, false, false,
+      { model, fresh: true, effort: p.effort, retrievalQuery });
   }
 }
 
@@ -2232,7 +2616,11 @@ async function startFixRound(wsId) {
 IMPORTANT: findings that say a file is "untouched", a component/prop/filter/badge is "missing", or a criterion "doesn't exist" mean that work was NEVER DONE — you must IMPLEMENT it now (edit the real component/source files named in the findings; create code where it's missing). Do not just tweak what already changed.
 
 For each finding: implement the fix in the actual files, OR — only if you are certain it is a FALSE POSITIVE — leave it and write an evidence-backed justification in changes-log.md. Then append everything you did to .loveai/pipeline/changes-log.md. Verify against the acceptance criteria before finishing.`;
-  runAgent(fixer.id, prompt, false, false, { fresh: true, effort: p.effort });
+  // key retrieval on the findings themselves (they name the broken files/symbols)
+  runAgent(fixer.id, prompt, false, false, {
+    fresh: true, effort: p.effort,
+    retrievalQuery: findings ? findings.slice(0, 2500) : null
+  });
 }
 
 // the Prompt Engineer is supposed to write review-brief.md. If a run skipped it
@@ -2357,8 +2745,6 @@ async function onPipelineAgentDone(agentId, result) {
   }
 }
 
-document.getElementById('btn-pipeline-stop').onclick = () => stopEverything();
-
 // ============================================================
 // Chatbox — routes to pipeline or a single agent
 // ============================================================
@@ -2461,16 +2847,13 @@ function enableDrop(el) {
     if (e.dataTransfer && e.dataTransfer.files) addDroppedFiles(e.dataTransfer.files);
   });
 }
-enableDrop(document.getElementById('chat-input'));
 enableDrop(document.getElementById('cm-input'));
 
 const fileIn = document.getElementById('file-in');
-document.getElementById('btn-attach').onclick = () => fileIn.click();
 document.getElementById('cm-attach-btn').onclick = () => fileIn.click();
 fileIn.onchange = () => { addDroppedFiles(fileIn.files); fileIn.value = ''; };
 
 // ===== Slash menu — /skills and /commands, CLI style (reusable per textarea) =====
-const chatInput = document.getElementById('chat-input');
 let slashItems = [];      // { name, description, type, scope, path }
 
 async function loadSlashItems() {
@@ -2546,20 +2929,13 @@ function setupSlash(textarea, menu) {
     else if (e.key === 'Escape') { e.stopPropagation(); hide(); }
   });
 }
-setupSlash(chatInput, document.getElementById('slash-menu'));
-
-// short label for whatever the composer's target select currently points at
-// (agent + model, bare model, or the auto pipeline) — used in confirmations
-// so the operator can see what a "new session" will actually run against.
+// short label for the agent currently focused in the dock — used in the
+// "new session" confirmation so the operator sees what will run next under
+// the shared session (chat sessions are isolated and unaffected by this).
 function currentTargetLabel() {
-  const target = document.getElementById('chat-target').value;
-  if (target === '__pipeline__') return 'auto pipeline';
-  if (target.startsWith('model:')) {
-    const model = target.slice('model:'.length);
-    return MODEL_LABELS[model] || model;
-  }
-  const a = agents.find(x => x.id === target);
-  return a ? `${a.name} (${MODEL_LABELS[a.model] || a.model})` : 'no target selected';
+  if (!chatAgentId) return 'no agent focused';
+  const a = agents.find(x => x.id === chatAgentId);
+  return a ? `${a.name} (${MODEL_LABELS[a.model] || a.model})` : 'no agent focused';
 }
 
 // a leading /name becomes an explicit directive so the Prompt Engineer (or the
@@ -2572,62 +2948,17 @@ function slashDirective(text) {
   return `\n\n[OPERATOR DIRECTIVE] The request invokes "/${it.name}" — a ${it.type === 'skill' ? 'skill' : 'custom command'} defined at ${it.path}. Read that file FIRST and treat its instructions as binding for this task: follow its protocol, structure and constraints when producing your output (task prompt files included — they must tell the engineers to comply with it too).`;
 }
 
-async function sendChat() {
-  const target = document.getElementById('chat-target').value;
-  const input = document.getElementById('chat-input');
-  const text = input.value.trim();
-  if (!text) return;
-
-  // "!" prefix — quick shell command in the project dir, like the CLI
-  if (text.startsWith('!')) {
-    const cmd = text.slice(1).trim();
-    if (!cmd) return;
-    input.value = '';
-    feedRaw('OPERATOR', 'tool', '$ ' + cmd, '⌨');
-    const r = await window.deck.exec(cmd, projectDir || '');
-    feedRaw('SHELL', r.ok ? 'txt' : 'err', (r.out || '').trim() || (r.ok ? '(no output)' : '(command failed)'));
-    return;
-  }
-
-  const plan = document.getElementById('chat-plan').checked;
-  const full = text + attachBlock() + slashDirective(text);
-  if (target === '__pipeline__') {
-    if (pipeFor(activeWorkspaceId).active) { plog('err', 'pipeline already running for this project — abort it first.'); return; }
-    launchPipeline(full, null, activeWorkspaceId);
-  } else if (target.startsWith('model:')) {
-    // run a bare Claude model, no agent persona. Unlike a roster agent (which
-    // gets a real follow-up composer in the agent dock), a bare model has no
-    // such UI — repeat sends here ARE its only "keep chatting" path, so they
-    // must continue the shared session, not silently start fresh each time.
-    // If the operator switched models since the shared session was created,
-    // resuming in place is rejected by the CLI (model mismatch) and wipes the
-    // session — so FORK instead: seeds a new session id with the full prior
-    // transcript under the new model. Same model: continue in place (cheaper,
-    // hits the prompt cache).
-    const model = target.slice('model:'.length);
-    const id = ensureModelAgent(model);
-    const sess = getSession();
-    const switched = sess && getSessionModel() && getSessionModel() !== model;
-    const opts = switched ? { resume: sess, fork: true } : { cont: true };
-    runAgent(id, full, false, plan, opts);
-  } else {
-    // background learner: manual UI/UX sends grow the UI vocabulary; a quick
-    // corrective follow-up counts against the model of the previous run
-    const tAgent = agents.find(x => x.id === target);
-    if (tAgent && tAgent.role === 'uiux') learnUiWords(text);
-    learnMaybeCorrection(target, text);
-    // always a fresh, token-lean context — no transcript replay, no fork.
-    // continuity comes from carried-forward summaries (plan text, follow-up chat),
-    // never from re-sending the whole conversation.
-    runAgent(target, full, false, plan);
-  }
-  input.value = '';
+// visible confirmation that a leading /name was recognized and attached — the
+// directive itself is invisible (injected text), so without this a skill send
+// looks identical to a plain message ("no warning that skill is loaded").
+function noteSlashAttached(text) {
+  const m = /^\/([\w-]+)/.exec(text);
+  if (!m) return;
+  const it = slashItems.find(i => i.name === m[1]);
+  if (!it) return;
+  const kind = it.type === 'skill' ? 'skill' : 'command';
+  feedRaw('OPERATOR', 'sys', `${kind} "/${it.name}" attached — instructions from ${it.path}`, '🧩');
 }
-
-document.getElementById('btn-send').onclick = sendChat;
-document.getElementById('chat-input').addEventListener('keydown', e => {
-  if (e.ctrlKey && e.key === 'Enter') sendChat();
-});
 
 // ===== @ file navigator — browse folders → files, arrow keys + Enter =====
 // Attaches to a textarea + a menu element. The path lives in the "@token" text,
@@ -2741,8 +3072,6 @@ function setupMention(textarea, menu) {
     const slash = tok.rel.lastIndexOf('/'); return slash >= 0 ? tok.rel.slice(0, slash) : '';
   }
 }
-setupMention(document.getElementById('chat-input'), document.getElementById('chat-mention'));
-
 // ===== Themed tooltips — hijack native `title` so hints match the theme =====
 const ttip = document.createElement('div');
 ttip.id = 'ttip'; ttip.className = 'hidden';
@@ -2777,47 +3106,61 @@ document.addEventListener('mouseover', (e) => {
 document.addEventListener('mouseout', () => { clearTimeout(ttipTimer); hideTtip(); });
 document.addEventListener('mousedown', hideTtip);
 
-// ===== Wide chat composer: same input, roomier view =====
+// ===== Wide chat composer: the dock's input in a roomier view =====
 const chatExpandModal = document.getElementById('chat-expand-modal');
 const cxInput = document.getElementById('cx-input');
 setupMention(cxInput, document.getElementById('cx-mention'));
 setupSlash(cxInput, document.getElementById('cx-slash'));
 enableDrop(cxInput);
 document.getElementById('cx-attach-btn').onclick = () => fileIn.click();
-function openChatExpand() {
-  // mirror target options + current values into the modal
-  const tgt = document.getElementById('chat-target');
+
+// full-screen for the DOCK: mirror the dock input + controls into the wide modal
+function openDockExpand() {
+  const adt = document.getElementById('ad-target');
   const cxt = document.getElementById('cx-target');
-  cxt.innerHTML = tgt.innerHTML;
-  cxt.value = tgt.value;
-  document.getElementById('cx-plan').checked = document.getElementById('chat-plan').checked;
-  const cxt2 = document.getElementById('cx-think');
-  cxt2.value = document.getElementById('chat-think').value;
-  cxt2._tselSync && cxt2._tselSync();
-  cxInput.value = chatInput.value;
+  cxt.innerHTML = adt.innerHTML;
+  cxt.value = adt.value;
+  document.getElementById('cx-plan').checked = document.getElementById('ad-plan').checked;
+  const cx2 = document.getElementById('cx-think');
+  populateEffortSelect(cx2);
+  cx2.value = document.getElementById('ad-effort').value;
+  cx2._tselSync && cx2._tselSync();
+  cxInput.value = adInput.value;
   chatExpandModal.classList.remove('hidden');
-  renderAttach();   // show any pending attachments in the modal too
+  renderAttach();
   cxInput.focus();
   cxInput.setSelectionRange(cxInput.value.length, cxInput.value.length);
 }
+
 function closeChatExpand() {
-  chatInput.value = cxInput.value;   // keep the small box in sync on close
+  adInput.value = cxInput.value;   // keep the dock box in sync on close
   chatExpandModal.classList.add('hidden');
 }
-document.getElementById('btn-chat-expand').onclick = openChatExpand;
 document.getElementById('cx-close').onclick = closeChatExpand;
 document.getElementById('cx-send').onclick = () => {
-  // push the modal's values into the real controls, then reuse sendChat()
-  document.getElementById('chat-target').value = document.getElementById('cx-target').value;
-  document.getElementById('chat-plan').checked = document.getElementById('cx-plan').checked;
-  const ct2 = document.getElementById('chat-think');
-  ct2.value = document.getElementById('cx-think').value;
-  ct2._tselSync && ct2._tselSync();
-  setEffort(document.getElementById('cx-think').value);
-  chatInput.value = cxInput.value;
+  // push the modal's values back into the dock controls, then send via the dock
+  const adt = document.getElementById('ad-target');
+  const ade = document.getElementById('ad-effort');
+  const adp = document.getElementById('ad-plan');
+  adt.value = document.getElementById('cx-target').value;
+  adp.checked = document.getElementById('cx-plan').checked;
+  ade.value = document.getElementById('cx-think').value;
+  const chat = findChat(activeChatId);
+  if (chat) {
+    chat.target = adt.value;
+    chat.model = adt.value.startsWith('model:')
+      ? adt.value.slice('model:'.length)
+      : ((agents.find(a => a.id === adt.value) || {}).model || chat.model);
+    chat.effort = ade.value;
+    chat.plan = adp.checked;
+    const ag = agents.find(a => a.id === 'chat-' + chat.id);
+    if (ag) ag.model = chat.model;
+    saveChats();
+  }
+  adInput.value = cxInput.value;
   chatExpandModal.classList.add('hidden');
-  sendChat();
   cxInput.value = '';
+  sendAgentFollowup();
 };
 cxInput.addEventListener('keydown', e => {
   if (e.ctrlKey && e.key === 'Enter') document.getElementById('cx-send').click();
@@ -2867,8 +3210,11 @@ function openChat(agentId) {   // called by the roster card click
   applyFilter();
   document.getElementById('ad-avatar').textContent = ROLE_ICON[a.role] || ROLE_ICON.custom;
   document.getElementById('ad-name').textContent = a.name;
+  // roster/ticket callers get the ✕ ALL close button; openChatUI re-hides it
+  document.getElementById('ad-all').classList.remove('hidden');
   agentDock.classList.remove('hidden');
   document.getElementById('console-feed').classList.add('has-dock');
+  syncConsoleChat();       // a per-chat dock replaces the default console chatbox
   updateChatModal();
   renderAttach();
   adInput.focus();
@@ -2879,10 +3225,30 @@ function openChat(agentId) {   // called by the roster card click
 }
 function closeAgentView() {
   chatAgentId = null;
+  activeChatId = null;
   feedFilter = null;
   applyFilter();
   agentDock.classList.add('hidden');
   document.getElementById('console-feed').classList.remove('has-dock');
+  renderChatList();        // drop the active-row highlight
+  syncConsoleChat();       // restore the default console chatbox
+}
+
+// The default console chatbox is visible whenever a project is open and no
+// per-chat dock has taken over the console. It is the primary send surface now
+// that the sidebar chatbox is gone.
+function syncConsoleChat() {
+  // the global "square" composer is retired — the per-chat dock is the ONLY
+  // chatbox. Keep it permanently hidden (its shared wiring still lives in DOM).
+  const cc = document.getElementById('console-chat');
+  if (cc) cc.classList.add('hidden');
+  // default composer = the DRAFT dock, shown when a project is open, the
+  // console feed is the visible surface, and no chat/agent dock is focused.
+  const feed = document.getElementById('console-feed');
+  const feedVisible = feed && !feed.classList.contains('hidden');
+  if (projectDir && feedVisible && agentDock.classList.contains('hidden')) {
+    openDraftChat();
+  }
 }
 
 // sessions whose stored transcript we've already replayed into the feed, so
@@ -2900,10 +3266,24 @@ async function openChatSession(agentId, sessionId) {
   const hasLive = [...consoleFeed.querySelectorAll('.ev')]
     .some(el => el.dataset.agent === agentId);
   if (hasLive) return;
-  hydratedSessions.add(sessionId);
+  if (hydratingChats.has(agentId)) return;   // double-click while loading
+  // loading state: spinner on the chat row + a placeholder line in the feed
+  hydratingChats.add(agentId);
+  renderChatList();
+  const ph = feed(agentId, 'sys', 'loading previous conversation…', '🕘');
   let msgs = [];
   try { msgs = await window.deck.sessionLoad(sessionId); } catch {}
-  if (!msgs || !msgs.length) return;
+  hydratingChats.delete(agentId);
+  renderChatList();
+  if (ph && ph.parentNode) ph.remove();
+  if (!msgs || !msgs.length) {
+    // say so instead of a silent blank console; NOT marked hydrated, so a
+    // later click retries (the transcript may still be being written)
+    feed(agentId, 'sys',
+      `no saved transcript found for session ${String(sessionId).slice(0, 8)}`, '🕘');
+    return;
+  }
+  hydratedSessions.add(sessionId);
   // still the same agent's view? (operator may have clicked away while loading)
   if (feedFilter && feedFilter !== agentId) return;
   feed(agentId, 'sys', `— previous conversation (${msgs.length} entries) —`, '🕘');
@@ -2922,17 +3302,36 @@ function updateChatModal() {
   if (!a) return;
   const r = R(chatAgentId);
   const sess = getSession();
+  // AUTO PIPELINE chats never run on their own hidden agent (chat.target ===
+  // '__pipeline__' fans out to the real roster agents instead), so R(chatAgentId)
+  // stays idle for the whole run. Fold in the pipeline's own busy state so the
+  // dock (status text + stop control) reflects reality for those chats too.
+  const chat = findChat(activeChatId);
+  const pipeSt = (chat && chat.target === '__pipeline__' && window.pipeState)
+    ? window.pipeState() : { active: false };
+  const pipeBusy = !!pipeSt.active;
+  const busy = pipeBusy || r.running;
+  const busyLabel = pipeBusy ? (pipeSt.label || 'pipeline running') : (r.status || 'running');
   document.getElementById('ad-status').innerHTML =
-    `<span class="${r.running ? 'run' : ''}">${r.running ? '● ' + esc(r.status || 'running') : '○ idle'}</span>` +
+    `<span class="${busy ? 'run' : ''}">${busy ? '● ' + esc(busyLabel) : '○ idle'}</span>` +
     ` · ${MODEL_LABELS[a.model] || a.model} · ${sess ? 'session ' + esc(sess.slice(0, 8)) : 'new session'}`;
-  document.getElementById('ad-send').disabled = r.running;
-  document.getElementById('ad-stop').classList.toggle('hidden', !r.running);
+  // ChatGPT-style: the send arrow morphs into a red STOP square while the
+  // agent (or, for AUTO PIPELINE, the pipeline itself) runs — click aborts.
+  // During plan-review the pipeline is paused awaiting the plan card, not
+  // abortable from here, so the control just shows busy without turning stop.
+  const stoppable = pipeBusy ? pipeSt.stage !== 'plan' : r.running;
+  const sendBtn = document.getElementById('ad-send');
+  sendBtn.disabled = pipeBusy && !stoppable;
+  sendBtn.classList.toggle('stop', !!stoppable);
+  sendBtn.title = stoppable ? 'Stop this run'
+    : (sendBtn.disabled ? 'Awaiting plan review — use the review card' : 'Send  (Ctrl+Enter)');
+  document.getElementById('ad-stop').classList.add('hidden');
 }
 
 function sendAgentFollowup() {
   const text = adInput.value.trim();
-  if (!text || !chatAgentId || R(chatAgentId).running) return;
-  // "!" shell like the main box
+  if (!text) return;
+  // "!" shell like the main box (works in draft too)
   if (text.startsWith('!')) {
     const cmd = text.slice(1).trim(); if (!cmd) return;
     adInput.value = '';
@@ -2940,17 +3339,48 @@ function sendAgentFollowup() {
     window.deck.exec(cmd, projectDir || '').then(r => feedRaw('SHELL', r.ok ? 'txt' : 'err', (r.out || '').trim() || '(no output)'));
     return;
   }
+  // DRAFT (empty-state dock, no chat/agent focused): auto-create a chat and send
+  if (!chatAgentId && !activeChatId) {
+    const draftFull = text + attachBlock() + slashDirective(text);
+    adInput.value = '';
+    adInput.style.height = 'auto';
+    noteSlashAttached(text);
+    createChatFromText(text, draftFull);
+    return;
+  }
+  if (!chatAgentId || R(chatAgentId).running) return;
   const full = text + attachBlock() + slashDirective(text);
+  noteSlashAttached(text);
   adInput.value = '';
   adInput.style.height = 'auto';
   const fa = agents.find(x => x.id === chatAgentId);
   if (fa && fa.role === 'uiux') learnUiWords(text);
   learnMaybeCorrection(chatAgentId, text);
+  // an isolated chat resumes ONLY its own sdkSessionId — never the shared store
+  if (activeChatId && chatAgentId === 'chat-' + activeChatId) {
+    sendChatMessage(full);
+    return;
+  }
   // continuity: resume the shared session in place (no fork)
   runAgent(chatAgentId, full, false, false, { cont: true });
 }
 
-document.getElementById('ad-send').onclick = sendAgentFollowup;
+document.getElementById('ad-send').onclick = () => {
+  // while running the arrow is a stop button — abort instead of sending.
+  // AUTO PIPELINE chats run on the roster agents, not chatAgentId, so route
+  // the abort through the pipeline itself (skip during plan-review — that
+  // pause is resolved via the plan card, not a hard abort).
+  const chat = findChat(activeChatId);
+  if (chat && chat.target === '__pipeline__') {
+    const p = pipeFor(activeWorkspaceId);
+    if (p.active) {
+      if (p.stage !== 'plan') abortPipeline('pipeline aborted by operator.', activeWorkspaceId);
+      return;
+    }
+  }
+  if (chatAgentId && R(chatAgentId).running) { stopAgent(chatAgentId); return; }
+  sendAgentFollowup();
+};
 document.getElementById('ad-all').onclick = closeAgentView;
 document.getElementById('ad-stop').onclick = () => { if (chatAgentId) stopAgent(chatAgentId); };
 document.getElementById('ad-attach-btn').onclick = () => fileIn.click();
@@ -2964,6 +3394,114 @@ function autoGrow(el) {
   el.style.height = Math.min(el.scrollHeight, 200) + 'px';
 }
 adInput.addEventListener('input', () => autoGrow(adInput));
+
+// ============================================================
+// Dock control row: agent/model · reasoning · PLAN · full-screen.
+// Relocated here from the retired global composer so the per-chat dock is the
+// single chatbox. In a chat these drive that chat; in DRAFT they set the
+// defaults used when the first message auto-creates a chat.
+// ============================================================
+function fillAdTarget() {
+  const sel = document.getElementById('ad-target');
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = '';
+  const pipe = document.createElement('option');
+  pipe.value = '__pipeline__';
+  pipe.textContent = '⟢ AUTO PIPELINE';
+  sel.appendChild(pipe);
+  for (const a of agents) {
+    if (a.ephemeral) continue;
+    const o = document.createElement('option');
+    o.value = a.id;
+    o.textContent = `${ROLE_ICON[a.role] || ROLE_ICON.custom} ${a.name}`;
+    sel.appendChild(o);
+  }
+  const grp = document.createElement('optgroup');
+  grp.label = 'MODELS';
+  for (const [mid, label] of Object.entries(MODEL_LABELS)) {
+    const o = document.createElement('option');
+    o.value = 'model:' + mid;
+    o.textContent = `✦ ${label}`;
+    grp.appendChild(o);
+  }
+  sel.appendChild(grp);
+  if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+}
+
+// reflect the active chat (or draft defaults) into the dock controls
+function syncDockControls() {
+  const t = document.getElementById('ad-target');
+  const e = document.getElementById('ad-effort');
+  const p = document.getElementById('ad-plan');
+  if (!t || !e || !p) return;
+  fillAdTarget();
+  populateEffortSelect(e);
+  const chat = findChat(activeChatId);
+  if (chat) {
+    if ([...t.options].some(o => o.value === chat.target)) t.value = chat.target;
+    e.value = chat.effort || getEffort();
+    p.checked = !!chat.plan;
+  } else {
+    if (!t.value) t.value = 'model:claude-sonnet-5';
+    e.value = getEffort();
+    p.checked = false;
+  }
+}
+
+// the empty-state chatbox: the dock with no chat focused. The first send here
+// auto-creates a real chat (createChatFromText via sendAgentFollowup).
+function openDraftChat() {
+  activeChatId = null;
+  chatAgentId = null;
+  feedFilter = '__draft__';   // matches no rows → a clean, empty feed
+  applyFilter();
+  document.getElementById('ad-avatar').textContent = '✦';
+  document.getElementById('ad-name').textContent = 'New chat';
+  document.getElementById('ad-status').textContent = '';
+  document.getElementById('ad-all').classList.add('hidden');
+  document.getElementById('ad-stop').classList.add('hidden');
+  agentDock.classList.remove('hidden');
+  document.getElementById('console-feed').classList.add('has-dock');
+  syncDockControls();
+  renderChatList();
+  adInput.placeholder = 'Start a new chat…   @ files · / skills · ! shell · ⌃⏎ send';
+  // make sure the console surface is visible even when + NEW is clicked
+  // from another screen (editor, board, …)
+  if (typeof focusConsoleForTask === 'function') focusConsoleForTask();
+  else if (typeof showSurface === 'function') showSurface('console');
+  adInput.focus();
+}
+
+(function wireDockControls() {
+  const t = document.getElementById('ad-target');
+  const e = document.getElementById('ad-effort');
+  const p = document.getElementById('ad-plan');
+  const x = document.getElementById('ad-expand');
+  if (!t || !e || !p) return;
+  populateEffortSelect(e);
+  t.onchange = () => {
+    const chat = findChat(activeChatId);
+    if (!chat) return;   // draft: the value is read at create time
+    chat.target = t.value;
+    chat.model = t.value.startsWith('model:')
+      ? t.value.slice('model:'.length)
+      : ((agents.find(a => a.id === t.value) || {}).model || chat.model);
+    const ag = agents.find(a => a.id === 'chat-' + chat.id);
+    if (ag) ag.model = chat.model;
+    saveChats();
+    renderChatList();
+  };
+  e.onchange = () => {
+    const chat = findChat(activeChatId);
+    if (chat) { chat.effort = e.value; saveChats(); }
+  };
+  p.onchange = () => {
+    const chat = findChat(activeChatId);
+    if (chat) { chat.plan = p.checked; saveChats(); }
+  };
+  if (x) x.onclick = openDockExpand;
+})();
 
 // ============================================================
 // Modal
@@ -3287,6 +3825,8 @@ function switchWorkspace(id) {
   agents = ws().agents;                    // re-point the live references
   projectDir = ws().path || '';
   feedFilter = null;
+  chatAgentId = null;
+  activeChatId = null;
   document.getElementById('agent-dock').classList.add('hidden');
   saveWorkspaces();
   restoreFeed(id);                         // show the new project's console
@@ -3359,6 +3899,7 @@ function renderWelcome() {
   const wel = document.getElementById('welcome');
   if (!wel) return;
   wel.classList.toggle('hidden', !!projectDir);
+  syncConsoleChat();       // hide the console chatbox on the Welcome screen
   if (projectDir) return;
   const recents = getRecentFolders().filter(Boolean);
   const wrap = document.getElementById('wel-recent-wrap');

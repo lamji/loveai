@@ -1,5 +1,592 @@
 # Changes Log
 
+## 2026-07-23
+
+### fix: Stop button looked like it wasn't working
+- **File**: renderer/app.js — `stopAgent()`, `ticker()`, `showThinking()`, `runAgent()`, `case 'done'`
+- **Symptom (operator)**: clicking Stop on a running agent didn't visibly do
+  anything — the thinking row / status pill kept reading "thinking…" or the
+  latest tool narration for a while, as if the click had no effect.
+- **Root cause**: `stopAgent()` sends the abort IPC and returns; it never
+  touched the UI itself. Meanwhile the SDK subprocess can take a moment to
+  actually die, so trailing `thinking`/`tool`/`text-delta` events kept
+  arriving and calling `ticker()`/`showThinking()`, which overwrote the
+  status straight back to "thinking…"/narration until the real `done` event
+  finally landed.
+- **Fix**: new `r.aborting` flag on the agent's runtime state (`R(agentId)`).
+  `stopAgent()` now sets it immediately after requesting the abort and force-
+  updates both the status pill (`ticker`) and the feed's thinking row
+  (`showThinking`) to "aborting…". `ticker()`/`showThinking()` now pin their
+  label to "aborting…" whenever `r.aborting` is set, ignoring whatever text
+  a trailing event tries to set — so the UI can't flip back to "thinking…"
+  mid-abort. The flag is cleared on `case 'done'` (the real end of the run)
+  and reset to `false` at the top of `runAgent()` so a fresh run never
+  inherits a stale flag. The existing "wedged, no session yet" recovery path
+  in `stopAgent()` (pre-`init` abort) is unchanged — it already resets
+  `running` synchronously and has no thinking row to fix.
+- **Untouched**: `window.deck.stopAgent()` IPC / main-process abort logic,
+  `setRunningUI()`, the init watchdog.
+- **Status**: `node --check renderer/app.js` passes. Renderer-only → hot-
+  reloads via Ctrl+R; operator asked NOT to restart the app.
+
+### feat: console tool rows now read as steps + show their result
+- **Files**: main.js, renderer/app.js, renderer/style.css
+- **Why (operator)**: the central console listed bare tool calls
+  (`Read <abs path>`, `Grep <abs path>`, `Bash git diff …`) with no outcome
+  and no legible intent — you couldn't tell what a Read returned or why the
+  agent kept reading/grepping.
+- **Result of each call is now shown**: main.js was dropping tool_result
+  entirely (only tool_use + result were forwarded). It now tracks each
+  tool_use id→{name,input}, and on the following `user` message summarizes
+  every tool_result and forwards a new `tool-result` event
+  (`{id, tool, ok, summary}`). Summaries: Read → "N lines", Grep → "N
+  matches"/"N files" (by output_mode), Glob → "N files", Bash/PowerShell →
+  "N lines out"/"no output", errors → the first error line. The renderer
+  lands that as a rounded chip on the exact tool row (matched by tool_use
+  id via a `toolRowEls` map — buffer-safe), red on failure.
+- **Intent now reads like commentary**: each row is a present-tense sentence
+  instead of a raw tool name + absolute path — `Let me check renderer/app.js`,
+  `Searching for "feedFilter" in renderer/app.js`, `Running git diff --stat
+  HEAD`, `Looking for **/*.js`. Lead-ins rotate (READ_LEADS / FIND_LEADS via
+  a `narrTick` counter) so a run of calls reads like a person working, not a
+  list. Paths are relative to the agent's cwd; for Grep the pattern is
+  surfaced (that pattern IS the "why it's searching"). New `toolNarration()`
+  + `relToCwd()` + `toolTarget()` helpers. The agent's own streamed narration
+  still renders above these rows unchanged.
+- **Outcome wording softened** (main.js summarizeTool): Grep → `found 8
+  matches` / `found in 3 files` / `nothing found`; Glob → `5 files` /
+  `nothing found`; Read → `142 lines` / `empty file`; Bash → `done`;
+  errors → the first error line. So a row reads
+  `Searching for "x" in app.js   [found 8 matches]`.
+- **Untouched**: edit tools keep their diff card (added/removed lines already
+  convey the result); their tool-result is a no-op (no row stored).
+- **Status**: `node --check` passes on main.js + renderer/app.js.
+  ⚠ main.js changed → the result chips + softened wording only take effect
+  after a FULL app restart (operator asked NOT to restart — applies on next
+  launch); the renderer narration sentences hot-reload on Ctrl+R.
+
+### fix: no live logs in CENTRAL CONSOLE for a chat targeting AUTO PIPELINE
+- **File**: renderer/app.js
+- **Symptom (operator)**: start a new chat and the central console shows
+  nothing — no PIPELINE status, no agent output — even though a run is
+  actually happening.
+- **Root cause**: `openChatUI` → `openChatSession` → `openChat` filters the
+  console (`feedFilter`) down to the chat's own hidden `chat-<id>` agent.
+  A chat whose target is `__pipeline__` (AUTO PIPELINE — the first, default
+  option in the dock's target dropdown) never runs under that id; it fans
+  out to the real roster agents (indexer/PE/senior/reviewer). Their feed
+  rows all got hidden by the mismatched filter, and `plog`'s `PIPELINE` tag
+  is *also* silenced by design (`SILENT_FEED_TAGS`) — filtered + silenced
+  left the console looking completely dead.
+- **Fix**: `openChatUI` now clears `feedFilter` (shows the unfiltered
+  console) whenever the chat's target is `__pipeline__`, covering both a
+  brand-new pipeline chat and reopening one whose pipeline is still running.
+- **Status**: `node --check renderer/app.js` passes. Renderer-only; operator
+  asked NOT to restart — applies on next Ctrl+R / app launch.
+
+### fix: sidebar chat click landed on an empty console (no history, no loading)
+- **Files**: renderer/app.js, renderer/style.css
+- Clicking a chat in the CHATS list (openChatUI) never replayed the chat's
+  stored transcript — only the ticket/board flow (openChatSession) did. After
+  an app restart a chat with an existing sdkSessionId opened onto an EMPTY
+  console with no indication anything should be there.
+- openChatUI now routes through openChatSession(chat agent, sdkSessionId).
+- **Follow-up**: chat.sdkSessionId is only captured when a run COMPLETES
+  (chatOnDone) — for older/interrupted chats it is null, so the replay
+  silently bailed and the console stayed blank (the header's "session
+  xxxxxxxx" is getSession(), the shared deck session, not the chat's).
+  openChatUI now falls back to getSession(); an empty/missing transcript
+  prints "no saved transcript found…" instead of silently showing nothing,
+  and is retried on the next click instead of being marked hydrated.
+- Loading state added while the transcript loads: the chat row's spinner
+  runs (.chat-row.loading) and the feed shows a "loading previous
+  conversation…" placeholder that is replaced by the replayed history.
+- feed() now returns the created row so the placeholder can be removed.
+- **Status**: syntax-checked; app NOT restarted (operator's running instance
+  left alone — takes effect next launch/reload).
+
+### feat: Chrome-style browser tabs
+- **Files**: renderer/index.html, renderer/style.css, renderer/src/browser.js
+- Tab strip redesigned to look like Google Chrome: tabs sit on a darker
+  frame row with rounded tops; the active tab shares the toolbar background
+  and merges into it with inverted (flared) bottom corners; thin separators
+  between inactive tabs; close ✕ fades in on hover/active.
+- Favicon per tab (page-favicon-updated → stored + persisted), spinner in
+  the icon slot while loading, dim dot fallback.
+- ＋ new-tab button moved from the toolbar into the tab bar (after the last
+  tab, Chrome-style). Middle-click closes a tab.
+
+### fix: terminal ctrl+click — reuse any empty tab + url bar stays blank
+- **Files**: renderer/src/browser.js
+- **Empty "New Tab" not reused**: openUrlInBrowser only reused an empty tab
+  when it was the ACTIVE one; a non-active empty tab lingered while a fresh
+  tab opened beside it (reproduced over the bridge). Now any empty tab in
+  the active project is reused, active one first.
+- **URL bar blank until refresh**: openBrowserView always focused the url
+  bar, and syncUrlBar skips updates while the bar is focused — so after a
+  ctrl+click every did-navigate sync was silently dropped and the bar stayed
+  empty until a manual refresh. openBrowserView now focuses the bar only on
+  an empty tab; openUrlInBrowser blurs the bar and shows the target url
+  immediately; syncUrlBar falls back to the tab's stored url while the
+  webview isn't attached yet.
+- **Status**: ✅ both repro'd live over the bridge before the fix; app
+  restarted after.
+
+### feat: browser bridge — in-app Playwright (MCP + HTTP + browserctl CLI)
+- **Files**: main.js, preload.js, renderer/src/bridge.js (new),
+  renderer/src/browser.js, renderer/index.html, browserctl.js (new),
+  docs/browser-bridge.md (new)
+- **Why**: Playwright is painfully slow for debugging/e2e (browser spawn +
+  CDP handshake per run) and can't see the app's OWN sandbox browser. The
+  bridge drives the live `<webview>` guests directly — commands land in
+  milliseconds on the tabs the user is already looking at.
+- **main.js**: `bridgeDispatch()` relays ops to the renderer over
+  bridge-cmd/bridge-reply IPC (per-op timeouts); passive webRequest network
+  log for persist:sandbox (400-entry ring buffer, served without a renderer
+  trip); screenshots decoded + saved to %TEMP%\loveai-shots; token-gated
+  HTTP endpoint on 127.0.0.1 (random port, `POST /cmd`, `GET /health`) with
+  port+token written to ~/.loveai/browser-bridge.json AND injected into every
+  in-app terminal's env (LOVEAI_BRIDGE_PORT/TOKEN); `buildBrowserServer()` —
+  an in-process `browser` MCP server (12 tools: tabs/open/navigate/snapshot/
+  click/fill/press/eval/console/network/screenshot/wait_for) added to every
+  agent run beside `deck`.
+- **bridge.js**: executes each op on the right tab — injects an idempotent
+  guest helper lib (`__lv`) for ref-based snapshots (headings + interactive
+  elements as `ref=eN role "name"`), click by ref/selector/text, React-safe
+  fill (native value setter + input/change), waitFor polling; real Chromium
+  key events via sendInputEvent (Enter actually submits forms); capturePage
+  screenshots; per-tab console ring buffer read-out; fast-fails with the real
+  load error (e.g. ERR_CONNECTION_REFUSED) instead of a blind timeout.
+- **browser.js**: exposes internals as `window.__bw`; buffers guest
+  console-message (500/tab) for the bridge.
+- **Status**: ✅ full e2e self-test over the HTTP bridge against a live app:
+  open → snapshot (5 refs) → click by ref + by text → fill + select → real
+  Enter submits form → waitFor late DOM (4ms) → console shows page error →
+  network log shows 404 → screenshot verified visually → same-URL open
+  reuses the tab → popup link became an in-app tab. App restarted.
+
+### fix: sandbox browser bugs + flow gaps (terminal link → tab)
+- **Files**: main.js, renderer/src/browser.js
+- **Popups were broken (silent)**: browser.js listened for the webview
+  `new-window` DOM event — REMOVED in Electron 22 (app runs 33). Any
+  window.open/target=_blank opened a bare native window; OAuth popup routing
+  was dead code. Now main.js handles `web-contents-created` for sandbox
+  guests: `setWindowOpenHandler` denies + routes — AUTH_HOSTS → native
+  shared-session window (opener reloaded after sign-in), other http(s) →
+  `browser-popup` IPC → tab in the OPENER's project. Renderer-side auth
+  list/openAuthPopup deleted (single source of truth in main).
+- **localhost forced to https**: normalizeUrl("localhost:5173") produced
+  https:// → SSL error on every dev server. Local hosts (localhost/127.x/
+  0.0.0.0) now get http://.
+- **Terminal ctrl+click spammed tabs**: every click opened a NEW tab (plus a
+  stray empty "New Tab" when the project had none). openUrlInBrowser now
+  reuses an existing tab with the same URL, navigates an empty active tab in
+  place, else opens one tab.
+- **Hotkeys died inside the page**: Esc/Ctrl+T/W never bubble out of a
+  focused guest — you could get stuck in full view. main.js forwards them
+  via before-input-event → `browser-hotkey` (adds Ctrl+L = focus url bar).
+- **Crashes invisible**: render-process-gone now shows the error overlay
+  ("The page crashed") with working Try again.
+- **URL bar blank on first Enter**: with no active tab, the empty newTab
+  cleared the input; now the tab opens directly onto the typed URL.
+- **Status**: ✅ popup→tab and dedupe verified live over the bridge; rest
+  code-reviewed + app restarted.
+
+### feat: vector-build checkpoint/resume — close the app mid-build, lose ≤1000 symbols
+- **Files**: vectors.js, vectors-worker.js, renderer/src/statusbar.js
+- **Before**: both index builds only wrote to disk at the END. Closing the app
+  mid-embed (minutes-long on big repos) lost everything; reopen restarted the
+  vector build from 0%.
+- **vectors.js**:
+  - Every symbol doc gets a 32-bit FNV-1a `docHash`, stored alongside ids in
+    vectors.json (and checkpoints). Same doc + same model ⇒ identical
+    embedding, so a hash-validated row is losslessly reusable.
+  - Long builds checkpoint to vectors.partial.{json,bin} every ~1000 embedded
+    symbols (bin written before json; a torn pair is rejected on read).
+  - `buildVectorIndex` first loads reusable rows from BOTH the completed index
+    and any partial checkpoint, embeds only the missing/changed docs, then
+    writes the final index and deletes the checkpoint. If nothing changed it
+    finishes without even loading the model.
+  - `syncFilesVectors` carries hashes through watcher syncs (0 = unknown).
+- **statusbar.js**: a ≥5% first jump in the vectors phase is detected as a
+  resume; the alternating label says "resumed previous embedding — continuing…".
+- **Effect**: manual rebuilds on an unchanged repo are near-instant (measured
+  15ms for the test index vs a full re-embed); a kill mid-build loses at most
+  ~1000 symbols of work.
+- **Status**: ✅ end-to-end test (real embedder): full build → unchanged
+  rebuild (12/12 reused, 15ms) → one-doc-changed (11/12 reused) → simulated
+  interruption via checkpoint (12/12 resumed, checkpoint cleaned up) → query
+  returns correct top hit. App restarted.
+
+### fix: build progress stuck at 0% + human "this takes time" messaging
+- **Files**: main.js, codegraph-worker.js, codegraph-parse.js, vectors.js,
+  renderer/src/statusbar.js
+- **Root causes of the silent 0%**:
+  1. BACKGROUND graph rebuilds (schema bump / first open) emitted NO progress
+     events at all — codegraph-status said "building" so the bar appeared,
+     then sat frozen at 0% until the build silently finished. A manual click
+     during one returned "already building" and displayed nothing.
+  2. resetGraphWorker race: the old worker's async 'exit' event fired AFTER a
+     new worker spawned, clearing the fresh build's pending request — the
+     replacement build died instantly with no UI feedback.
+  3. Silent phases: file counting (seconds on big repos) and the embedding
+     model load (tens of seconds) reported nothing.
+- **main.js**: buildCodeGraph now streams `codegraph-progress` for EVERY build
+  (phases init → count → parse → done|error, with the error text). fail() in
+  cgWorker ignores superseded workers; resetGraphWorker detaches listeners
+  before terminate and fails pending requests itself.
+- **codegraph-worker/parse**: counting reports every 250 files (phase 'count');
+  parse progress tagged phase 'parse'.
+- **vectors.js**: buildVectorIndex reports 0/N BEFORE the slow model load.
+- **statusbar.js**: while building, the label ALTERNATES every ~4s between the
+  progress percentage and a plain-language note ("parsing code — large repos
+  can take minutes…", "loading embedding model — can take a minute…", "still
+  embedding — hang tight…"), stall-aware (>8s without progress switches to
+  "still …" wording), repainted every 1s tick until the build truly finishes.
+  'done'/'error' phases finalize the bar (background builds included);
+  "already building" no longer records as an error — the background build's
+  progress now streams into the same bar.
+- **Status**: ✅ node --check on all five files; app restarted.
+
+### refactor: unified walker + worker-side tree-sitter + retrieval eval loop
+- **Files**: main.js, renderer/app.js, preload.js; NEW: walker.js,
+  codegraph-parse.js, codegraph-worker.js
+- **Unified walker (walker.js)**: the four hand-rolled tree walkers
+  (projectFingerprint, buildSymbolIndex, countGraphFiles, buildCodeGraph) are
+  now ONE `walkRepo(root, {exts}, onFile)` sharing skip rules
+  (INDEX_SKIP_DIRS + .gitignore), the 5000-file cap, and event-loop yielding.
+  `projectFingerprint` was the last SYNCHRONOUS walk on the main process
+  (index-status hit it per call) — now async. Fingerprint keys switch to
+  forward-slash rels: one-time staleness vs old backslash keys, self-heals on
+  the next index-mark.
+- **Tree-sitter off the main process**: the whole parse layer (runtime,
+  grammars, queries, rich def records, extractFileGraph, importSpecs) moved
+  verbatim from main.js into codegraph-parse.js and runs inside a persistent
+  codegraph-worker.js (same protocol as vectors-worker). Main keeps assembly
+  (edge linking), caches, persistence, reachability, packer. Full builds AND
+  single-file re-parses (watcher) go through the worker; a manual rebuild
+  respawns the worker to retry a failed tree-sitter init. main.js sheds ~360
+  lines of parse code. Graph gains `truncated` flag from the build.
+- **Retrieval eval loop (hit@k)**: runAgent records the pre-ranked file list
+  (cold front-load and warm per-message); the tool-event handler collects
+  Edit/MultiEdit/Write file paths; on done, `logRetrievalEval` writes one line
+  {query, predicted, edited, hit5, hit10, warm} to
+  .loveai/index/retrieval-eval.jsonl via new `eval-log` IPC. New `eval-stats`
+  IPC returns run count + average hit@5/hit@10 + last 5 entries
+  (window.deck.evalStats(cwd)). This is the ground truth for whether ranking
+  changes help — check before/after tuning retrieval.
+- Also: importSpecs regex excludes spaces (quoted prose in comments no longer
+  produces junk spec entries); preload retrieveContext drops the dead
+  withContent param.
+- **Status**: ✅ node --check on all six files; smoke test (plain Node) ran the
+  worker end-to-end on this repo: 27 files parsed, 841 defs, import specs
+  extracted, single-file parse job OK, walker skip rules verified (0
+  violations). ⚠ NOT activated — needs a full app restart (main + workers),
+  deliberately not performed this round.
+
+### fix: retrieval-engineering review round — correctness, accuracy, perf
+- **Files**: main.js, vectors.js, vectors-worker.js, renderer/app.js
+- **Correctness**:
+  - `symbolBuilding` was one GLOBAL promise — with two projects building
+    concurrently, project B received (and cached) project A's index. Now a
+    per-cwd map like `graphBuilding`.
+  - `fuseRetrieval` called `V.queryVectors` directly, lazily loading a second
+    copy of the ONNX model ON THE MAIN THREAD (search_code hot path). Now all
+    vector queries route through the persistent worker (`workerVectorHits`).
+  - Symbol ids: same-named defs in one file were silently dropped (name-only
+    dedupe) and `id = rel#name` collided. Dedupe is now name@line; ids get an
+    `@line` suffix only on collision. GRAPH_SCHEMA 2→3 (stale graphs rebuild
+    in the background on next open).
+  - Deleted stray `undefined/vecbench/` artifact (unguarded cwd interpolation
+    from a removed bench script).
+- **Retrieval accuracy**:
+  - `get_symbols`/`retrieve-symbols` now seed `packSymbols` with vector hits
+    (`opts.vectorIds`) — meaning-only queries ("timezone bug") pack symbols
+    even when no query token matches any name. Previously BM25+name-match only.
+  - Import-scoped edge resolution: `linkEdges` resolves call/import names
+    against the referrer's actual imports first (`importSpecs` regex + 
+    `resolveSpec` path/ext/index guessing), falling back to global-by-name.
+    Kills cross-module same-name blast-radius noise (`init`, `close`, …).
+  - `defDoc` now appends up to 8 callee names — symbols without a doc comment
+    were embedded as bare names (no semantic signal beyond fuzzy name match).
+  - Indexing skips more junk: INDEX_SKIP_DIRS + out/target/vendor/venv/
+    __pycache__/local_cache, PLUS simple dir entries from the root .gitignore
+    (`ignoredDirs`/`skipDir`, applied to all 4 walkers + watcher filters).
+  - Truncation surfaced: `idx.truncated` when the 5000-file cap hits; repo map
+    and search_code output now say the index is PARTIAL instead of letting
+    agents mistake a capped index for full coverage.
+- **Performance / tokens**:
+  - vectors.json v2: raw Float32 sidecar `vectors.bin` + small metadata JSON
+    (was ~35MB base64-in-JSON stringify per watcher sync at 17k symbols).
+    v1 files remain readable; writes migrate to v2. `hasVectorIndex` now
+    validates loadability so a schema-stale index triggers a rebuild.
+  - Watcher vector-sync ships the changed files' defs to the worker — no more
+    full codegraph.json read+parse per save burst (fallback kept).
+  - `lexicalImpact` inverted map cached per index (WeakMap; invalidated on
+    file change/delete) — was rebuilt from ALL tokens on every agent launch
+    while the graph was cold.
+  - Warm-run TARGET FILES inject deduped per session (`lastTargets`) — same
+    target set no longer re-appends the ~0.5k block every follow-up.
+  - Removed the dead `withContent` file-inlining branch from retrieve-context
+    (renderer always passes 0 since the pull-model change).
+- **Status**: ✅ `node --check` passes on all four files. Graph + vector
+  indexes rebuild themselves in the background on next project open (schema
+  bumps). Needs full app restart (main.js + worker changed).
+
+### feat: pull-model retrieval — in-process mcp__deck__* tools + slim push
+- **Files**: main.js, renderer/app.js (research: docs/context-retrieval-research.md)
+- **Architecture change**: context moves from PUSH (pre-computed ~12k-char
+  blob injected into the first prompt, keyed on the raw user text) to PULL
+  (the agent queries the local index MID-TASK, when it knows what it needs).
+- **main.js**: new `buildDeckServer(cwd)` — an in-process MCP server
+  (SDK `tool()` + `createSdkMcpServer`, zod schemas) registered per run via
+  `options.mcpServers = { deck }` + `allowedTools: ['mcp__deck__*']`. Tools
+  (all readOnlyHint, handlers reuse existing index functions):
+  - `search_code(query,k)` — fuseRetrieval (BM25+vector RRF) ranked files + symbol hits
+  - `get_symbols(query,budget)` — tree-sitter symbol pack (actual code)
+  - `who_references(query)` — regression blast-radius from the code graph
+  - `topic_memory(query)` — .loveai/memory topic bodies (same scoring as memoryInject)
+  Also: SDK import now captures `tool`/`createSdkMcpServer`; zod required.
+- **renderer/app.js**: cold front-load slimmed to an Aider-style MAP — repo
+  map + ranked file names/symbols + semantic list + impact + a directive
+  naming the mcp__deck__* tools. REMOVED: whole-file TOP FILE CONTENTS
+  inlining, the 12k symbol-pack inject (cold AND warm), thinPack logic,
+  `packSig`/`lastPackSig`. `retrieveContext` now called with withContent=0.
+  Warm per-message retrieval is a 2-call trio→duo (files list only).
+- **⚠ Activation**: main.js + renderer must go together — a Ctrl+R alone
+  would tell agents to call tools the running main process hasn't
+  registered. Needs a FULL app restart (not performed; operator is testing).
+- **Status**: ✅ `node --check` passes on both; SDK exports verified
+  (tool/createSdkMcpServer present); zod loads.
+
+### change: composer send arrow morphs into a stop button while running
+- **Files**: renderer/index.html, renderer/style.css, renderer/app.js
+- **What**: ChatGPT-style — while the active chat's agent runs, the ↑ send
+  button turns into a red ■ stop square that aborts the run; it reverts to
+  the arrow when the run ends. Previously the arrow just went disabled and
+  stopping required the small header ■.
+- **How**: two SVGs inside `#ad-send` toggled by a `.stop` class (set in
+  `updateChatModal` from `r.running`); click handler stops when running,
+  sends otherwise. Ctrl+Enter still can't double-send (existing running
+  guard in `sendAgentFollowup`). The dock-head `#ad-stop` is now always
+  hidden (superseded); the top-toolbar global stop is untouched.
+- **Status**: ✅ `node --check` passes. Renderer-only; no restart per
+  operator — applies on next Ctrl+R / app launch.
+
+### perf: tighter enrichment ceilings + launch timing instrumentation
+- **File**: renderer/app.js
+- **Why**: operator compared launch feel vs Claude Code CLI. Same SDK, but the
+  deck pays three costs the interactive CLI doesn't: (1) pre-spawn IPC
+  enrichment, (2) a NEW `query()` subprocess per message (node boot + CLI
+  init), (3) session RESUME (CLI re-reads the whole transcript JSONL; if the
+  5-min prompt cache expired, the full input reprocesses server-side).
+- **Timeouts cut**: cold map/memory 4s→2s, impact 6s→3s, retrieval/vector/
+  symbols 8s→3.5s; warm per-message trio 6s→2.5s. A warm index answers in
+  ms; only a busy worker hits the ceiling, and then the run just launches
+  without that enrichment.
+- **Instrumentation**: before spawn, feed logs
+  `⏱ context assembled in Xms · +Y.Yk chars injected · spawning…`; the
+  ⚡session line now appends `· spawned in Z.Zs` (= subprocess + resume cost).
+  Slow starts are now attributable at a glance: prep vs spawn vs model.
+- **Not done (needs main.js + restart, proposed)**: persistent streaming-input
+  SDK session per chat so follow-ups reuse the live process like Claude Code
+  does, instead of spawn+resume per message.
+- **Status**: ✅ `node --check` passes. Renderer-only; operator asked not to
+  restart — applies on next Ctrl+R.
+
+### fix: theme-follow for native dropdowns, feed tag column, parallel enrichment
+- **Files**: renderer/style.css, renderer/app.js
+- **Native select popup was white in dark theme**: Chromium renders the OS
+  popup for `<select>` (the dock's target picker) using `color-scheme`, which
+  was never set. Added `color-scheme: dark` to the dark root and
+  `color-scheme: light` to the light root — popups (and native scrollbars)
+  now follow the app theme.
+- **Repeated chat-title column removed in chat view**: `applyFilter()` now
+  toggles `one-agent` on `#console-feed` whenever a single-agent filter is
+  active; CSS hides `.tag` there. The ALL view keeps tags (they tell agents
+  apart in the mixed feed).
+- **Launch latency — enrichment now parallel**: runAgent's cold-run context
+  chain (hasProjectMap 4s, memoryInject 4s, regressionImpact 6s,
+  retrieveContext 8s, vectorQuery 8s, retrieveSymbols 8s) was awaited
+  SEQUENTIALLY — worst case ~38s stacked before the SDK spawn. All six now
+  kick off together and are awaited in the original order, so the cost is
+  max(slowest) ≈ 8s worst case. Prompt append order unchanged.
+- **Latent bug fixed while in there**: the front-load block's `const r`
+  (retrieveContext result) shadowed the agent-runtime `r`, so
+  `r.lastPackSig` was written to the throwaway result — warm follow-ups
+  always re-sent an identical symbol pack. Renamed the result to `rc`;
+  `r.lastPackSig` now really persists on the runtime.
+- **Status**: ✅ `node --check renderer/app.js` passes. Renderer-only —
+  operator asked NOT to restart; hot-reload via Ctrl+R when convenient.
+
+### feat: Claude-Code-style diff cards in the feed for every agent edit
+- **Files**: main.js, renderer/app.js, renderer/style.css
+- **Why it never showed**: `feedDiff` already existed, but main.js truncated
+  every tool_use input to 400 chars (`JSON.stringify(...).slice(0,400)`), so
+  `JSON.parse` failed for any real Edit/Write and the feed fell back to a
+  bare one-line log. And when it did show, it was collapsed, unnumbered,
+  filename-only.
+- **main.js**: edit tools (Edit/MultiEdit/Write) now also send `editInput`
+  (full input, 400k cap) plus `editLines` — each hunk's real start line,
+  found by reading the target file and locating old_string (new_string as
+  the already-applied fallback). Non-edit tools unchanged.
+- **renderer/app.js** (`feedDiff` rewrite): renders `Update(rel\path)` /
+  `Write(rel\path)` header, `└ Added N lines` summary, a line-number gutter
+  with real file numbers, +/- markers, green/red rows — and the card is
+  OPEN by default (header still toggles). Paths shown relative to the
+  agent's cwd. Huge Writes capped at 400 rows with a "… N more lines" tail.
+- **renderer/style.css**: `.dl > em` gutter, `.diff-sum`, `.dl-cut`,
+  colored gutter numbers on add/del rows; dropped the unused `.diff-ico`.
+- **Status**: ✅ `node --check` passes on both files. main.js changed →
+  full app restart required.
+
+### change: + NEW chat is now ChatGPT-style — no config modal
+- **Files**: renderer/app.js, renderer/index.html
+- **What**: clicking `+ NEW` no longer opens the NEW CHAT modal (title / seed /
+  reasoning / target form). It now calls `openDraftChat()` — the same empty
+  draft state the console already uses — and the first message auto-creates
+  the chat via `createChatFromText`, titling it from that message's first line
+  (≤40 chars), exactly like ChatGPT.
+- **Removed**: the whole `#newchat-modal` block in index.html and its JS in
+  app.js (`openNewChat`, `createChat`, `ncSyncOrigin`, `fillTargetSelect`,
+  `chatBoardTickets`, `ticketSeedPrompt`, `nc-*` wiring) — all were used only
+  by the modal.
+- **Added**: `openDraftChat()` now calls `focusConsoleForTask()` so `+ NEW`
+  works from any surface (editor, board, terminal), matching `openChat`.
+- **Status**: ✅ `node --check renderer/app.js` passes.
+
+### fix: engineers re-researched BRAINX's plan — retrieval was keyed on the
+### dispatch wrapper, not the task
+- **File**: renderer/app.js
+- **Symptom (operator)**: BRAINX (PE) writes task files with full CONTEXT, yet
+  the assigned engineer still does its own research; RAG hits looked like
+  junk ("lots of folders").
+- **Root cause**: `startBuild` dispatches engineers with the prompt
+  `"Execute task-NN.md: read .loveai/pipeline/… per your pipeline rules."` and
+  `runAgent` fed THAT string to every retrieval layer (BM25 retrieveContext,
+  vectorQuery/RAG, retrieveSymbols, memoryInject, regressionImpact). The
+  front-load therefore ranked files matching "execute/read/pipeline/rules" —
+  noise — and the EFFICIENCY directive then pinned the engineer to the wrong
+  files, so it had to ignore them and re-locate the real work by hand.
+  Same flaw in `startFixRound` ("Fix review findings: read …").
+- **Fix**:
+  - `runAgent` now takes `opts.retrievalQuery`: `const rq = opts.retrievalQuery
+    || prompt` and ALL retrieval calls (cold + warm blocks, RAG feed line,
+    memory, impact) query on `rq`. Default unchanged for chats/PE (their
+    prompt IS the issue).
+  - `deployEngineersFromDir` keeps each task file's body in `p.taskContent`
+    (name → content; pipelineRead already loaded it, it was just discarded).
+  - `startBuild` passes the task body (COMPLEXITY/MODEL header stripped,
+    ≤2500 chars) as `retrievalQuery` — engineers' front-load now ranks the
+    files the task is actually about.
+  - `startFixRound` passes the review findings text as `retrievalQuery`.
+  - Vector-hit file extraction hardened in both blocks: `id.lastIndexOf('#')`
+    guarded (`cut > 0`), so a legacy id without `#` no longer yields a
+    chopped/garbled path in TARGET FILES / `top:` feed lines.
+- **Not the cause (checked)**: the user-level SessionStart WORKFLOW hook does
+  NOT reach pipeline agents — they run `lean:true` → `settingSources:
+  ['project']`; only non-lean GENERAL-OPS inherits user settings.
+- **Status**: ✅ `node --check renderer/app.js` passes; app restarted. Verify:
+  run a pipeline, the senior's feed should read `RAG query → "<task text…>"`
+  (not "Execute task-…") with sensible top files.
+
+### fix: agents hit max turns searching — retrieval now runs on EVERY message
+- **File**: renderer/app.js (runAgent)
+- **Symptom**: despite the tree-sitter graph + vector RAG, agents kept hitting
+  their turn ceiling on lots of Glob/Grep searches.
+- **Root cause**: the RAG/symbol front-load only ran on COLD runs (`!warm`).
+  Any resumed/continued run (`opts.resume` — every chat follow-up — or
+  `opts.cont` — shared-session sends) skipped ALL retrieval on the theory that
+  "the transcript already carries it". True only for the FIRST message's
+  topic: a follow-up about something new arrived with zero file targeting, so
+  the model re-located the code by hand over many turns — that search loop is
+  what burned the ceiling.
+- **Fix**: new warm-run block in `runAgent` (after the cold front-load): every
+  warm message runs `retrieveSymbols` (7k budget) + `retrieveContext` (10
+  files, names/symbols only, no content) + `vectorQuery` (12 hits) in
+  parallel (6s timeouts), then injects a "TARGET FILES for THIS message" list
+  (lexical + semantic-only files folded in) and the symbol pack, plus a firm
+  directive: Read the listed paths directly, do NOT search the repo. Kept
+  lean by design — no repo map, no whole-file dump on warm runs. New
+  `packSig(sym)` helper: the pack's signature is remembered per agent
+  (`r.lastPackSig`, also set by the cold path) so a same-topic follow-up
+  doesn't replay an identical pack into a transcript that already has it —
+  then only the file list + directive go out. Feed line: `per-message
+  retrieval: N target files …` (🧬). MAX_TURNS untouched per operator.
+- **Status**: ✅ `node --check renderer/app.js` passes. Renderer-only change;
+  app restarted. Verify: send a chat follow-up about a different file than
+  the first message — the feed should show `per-message retrieval: …` and the
+  run should Read the listed files directly instead of Glob/Grep loops.
+
+### fix: boot crash — dead wiring for the retired global composer broke the whole app
+- **Files**: renderer/app.js, renderer/src/editor.js, renderer/src/explorer.js
+- **Symptom**: app booted to a dead shell — empty project rail, no chats, no
+  composer. DevTools: `Uncaught TypeError: Cannot read properties of null
+  (reading 'addEventListener')` at app.js:2651, plus cascading
+  `usage`/`auth` ReferenceErrors (declared later in app.js, never reached).
+- **Root cause**: the chats redesign removed the global composer markup
+  (`#chat-input`, `#btn-attach`, `#btn-chat-expand`, `#chat-target`,
+  `#chat-plan`, `#chat-think`, `#chat-mention`) from index.html — the per-chat
+  dock (`ad-*`) is now the only chatbox — but app.js still wired those ids at
+  top level. The first null deref (enableDrop on `#chat-input`) threw and
+  killed everything after line 2651: renderRail, chat list, dock wiring, boot.
+- **Fix (renderer/app.js)**: removed the dead top-level wiring — `enableDrop`
+  + `setupMention` on `#chat-input`, the `#btn-attach` handler, the unused
+  `chatInput` const, `openChatExpand`, the `#btn-chat-expand` binding, and
+  `cxDockMode` with its legacy (non-dock) branches in `closeChatExpand` /
+  `cx-send` (which also called the removed `sendChat()`). The wide composer
+  is now dock-only: open via `ad-expand` → `openDockExpand`, close syncs back
+  to `adInput`, send pushes values into the `ad-*` controls and reuses
+  `sendAgentFollowup()`.
+- **renderer/src/editor.js + explorer.js**: "Send to AI" focus and
+  `exSendToChat` retargeted from the deleted `#chat-input` to `#ad-input`
+  (they were null-guarded no-ops after the redesign).
+- **Status**: ✅ `node --check` passes on all three files; id-sweep confirms
+  no remaining references to removed ids; app restarted via `npm start`.
+
+## 2026-07-22
+
+### task-01-chatbox-in-console — Move the main chatbox into the console, drop the sidebar one
+- **Why**: Continue the ChatGPT-style redesign (sidebar CHATS list + agents in
+  Settings). The main composer belonged in the center console by default, not in
+  the left sidebar. "the chatbox by default should be in console, remove the left
+  main chat."
+- **renderer/index.html**:
+  - Removed the `<section class="side-block chatbox">` from the AGENT sidebar.
+    The CHATS section (`grow`) now fills the sidebar.
+  - Added `<section id="console-chat" class="console-chat hidden">` inside
+    `#editor-area`, right after `#agent-dock`. It carries the SAME control ids
+    (`chat-input`, `chat-target`, `btn-send`, `chat-plan`, `chat-think`,
+    `btn-chat-expand`, `btn-new-session`, `slash-menu`, `chat-mention`,
+    `attach-chips`, `file-in`, `btn-attach`, `btn-pipeline-stop`), so every
+    existing JS binding (`sendChat`, slash/mention setup, wide composer,
+    `initThinkSelect`, `buildTargetDropdown`, editor "Send to AI") works unchanged.
+    Header pills moved into a `.cc-actions` row with a `.cc-spacer`.
+- **renderer/style.css**:
+  - `#console-chat` — centered column (`--console-col`/max), `flex:none`, docked
+    at the bottom of the console; `.cc-actions` / `.cc-spacer` for the pill row.
+  - `#editor-area.split > #console-chat { display:none !important; }` — hidden in
+    editor-split, mirroring `#agent-dock` (the split row layout can't host it).
+  - Absolute `inset:0` overlays (welcome z4, tkws/notes/browser z5) cover the
+    console chatbox automatically — no JS needed to hide it under a center screen.
+- **renderer/app.js**:
+  - New `syncConsoleChat()` — shows `#console-chat` only when a project is open
+    AND no per-chat dock is active (`!projectDir || dockOpen` → hidden).
+  - Called from `openChat` (hide when a chat dock takes over), `closeAgentView`
+    (restore + `renderChatList()` to drop the active-row highlight), and
+    `renderWelcome` (hidden on the Welcome screen). Boot path
+    (editor.js `renderWelcome()`) sets the initial state; `switchWorkspace`
+    inherits it via `refreshProjectBindings → renderWelcome`.
+- **Untouched**: `sendChat` dispatch logic (pipeline/model/roster), the per-chat
+  `sendChatMessage`/`agent-dock` flow, session persistence, the `.chatbox` CSS
+  rules (now dead but harmless).
+- **Known edge**: in editor-split mode the console chatbox is hidden (matches
+  agent-dock); "Send to AI" while split focuses a hidden input (chip still
+  attaches). Acceptable — split already hid the per-agent composer.
+- **Status**: ✅ `node --check renderer/app.js` passes; index.html div/section
+  tags balance; all moved ids are unique. Renderer-only → hot-reloads with
+  Ctrl+R. App restart skipped per user request.
+
 ## 2026-07-21
 
 ### fix: persist conversation context when a resumed session goes stale

@@ -34,15 +34,23 @@ function handle(msg) {
         });
         return;
       }
-      const graph = JSON.parse(fs.readFileSync(path.join(dir, 'codegraph.json'), 'utf8'));
       let r;
       if (job === 'sync') {
+        // main ships the changed files' defs with the job — only fall back to
+        // re-reading + parsing the whole codegraph.json when they're absent
+        const graph = Array.isArray(msg.defs)
+          ? { defs: msg.defs }
+          : JSON.parse(fs.readFileSync(path.join(dir, 'codegraph.json'), 'utf8'));
         r = await V.syncFilesVectors(dir, graph, msg.rels || []);
       } else {
+        const graph = JSON.parse(fs.readFileSync(path.join(dir, 'codegraph.json'), 'utf8'));
         r = await V.buildVectorIndex(dir, graph,
           (done, total) => parentPort.postMessage({ id, type: 'progress', done, total }));
       }
-      parentPort.postMessage({ id, type: 'done', ok: !!(r && r.ok), count: (r && r.count) || 0 });
+      parentPort.postMessage({
+        id, type: 'done', ok: !!(r && r.ok), count: (r && r.count) || 0,
+        resumed: (r && r.resumed) || 0,   // rows reused from checkpoint/index
+      });
     } catch (e) {
       parentPort.postMessage({ id, type: 'done', ok: false, error: String(e && e.message ? e.message : e) });
     }
