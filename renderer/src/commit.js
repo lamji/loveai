@@ -7,7 +7,7 @@
 // ============================================================
 const CMT_LABEL = { plain: 'COMMIT', amend: 'COMMIT (AMEND)', push: 'COMMIT & PUSH', sync: 'COMMIT & SYNC' };
 const cmtModal = document.getElementById('cmt-modal');
-const cmt = { kind: 'plain', running: false, aiAgentId: null, streamEl: null, thinkEl: null, gitEl: null, lastError: '', streamId: null, autoPush: false };
+const cmt = { kind: 'plain', running: false, aiAgentId: null, streamEl: null, thinkEl: null, gitEl: null, lastError: '', streamId: null, autoPush: false, repo: null };
 
 function cmtEl(id) { return document.getElementById(id); }
 function cmtStepMark(step, cls) {
@@ -97,11 +97,14 @@ document.addEventListener('click', (e) => {
   }
 });
 
-// pull a diff to feed the message/PR generators (staged first, else all changes)
+// pull a diff to feed the message/PR generators (staged first, else all changes).
+// Always targets cmt.repo — the repo PINNED when this commit session opened,
+// never the live `gitRepo` selector, which can drift to a sibling project in a
+// multi-repo workspace while a long commit/push (hooks/tests) is still running.
 async function cmtChangeDiff() {
-  let d = await window.deck.gitDiff(gitRepo, { staged: true });
+  let d = await window.deck.gitDiff(cmt.repo, { staged: true });
   if (d.ok && d.diff && d.diff.trim()) return d.diff;
-  d = await window.deck.gitDiff(gitRepo, {});
+  d = await window.deck.gitDiff(cmt.repo, {});
   return (d.ok && d.diff) ? d.diff : '';
 }
 
@@ -113,13 +116,19 @@ async function cmtChangeDiff() {
 // back to the local ref, then a two-dot remote range.
 async function cmtBranchDiff(base) {
   const bare = base.replace(/^origin\//, '');
+  // refresh origin/<base> first — this branch may already be fully committed
+  // AND pushed (nothing left in the working tree), so origin is the only place
+  // left to diff against, and a local origin/<base> ref can be stale or entirely
+  // missing if it was never fetched this session. Best-effort: a failed fetch
+  // (offline, unknown ref) just falls through to whatever ref already exists.
+  await window.deck.exec(`git fetch origin ${bare}`, cmt.repo);
   const ranges = [
     `origin/${bare}...HEAD`,
     `${bare}...HEAD`,
     `origin/${bare}..HEAD`,
   ];
   for (const range of ranges) {
-    const r = await window.deck.gitDiff(gitRepo, { range });
+    const r = await window.deck.gitDiff(cmt.repo, { range });
     if (r.ok && r.diff && r.diff.trim()) return r.diff;
   }
   return '';
@@ -139,19 +148,30 @@ async function cmtGenMessage() {
 
 === DIFF ===
 ${diff.slice(0, 30000)}`;
-  const r = await window.deck.aiGenerate(prompt, 'claude-haiku-4-5-20251001', gitRepo);
+  const r = await window.deck.aiGenerate(prompt, 'claude-haiku-4-5-20251001', cmt.repo);
   end();
   if (r.ok && r.text) cmtEl('cmt-msg').value = r.text.replace(/^["'`]|["'`]$/g, '').trim();
   else cmtEl('cmt-summary').textContent = '✗ generate failed: ' + (r.error || 'no text');
+  cmtSyncCommitBtn();   // message just landed (or failed) — COMMIT follows it
 }
 document.getElementById('cmt-gen-msg').onclick = cmtGenMessage;
 
 async function openCommitModal(kind) {
   cmt.kind = kind; cmt.running = false; cmt.lastError = ''; cmt.gitEl = null;
+  cmt.failedStep = 'commit';
+  cmtEl('cmt-fix-hint').value = '';
   cmt.autoPush = (kind === 'push' || kind === 'sync');
+  // pin the repo for this ENTIRE commit/push/PR session — a multi-repo workspace
+  // (a folder holding several unrelated projects) lets `gitRepo` drift to a
+  // sibling project mid-flow (e.g. the repo picker changes, or a background
+  // gitRefresh() reassigns it while this repo is busy with a long commit/push
+  // hook), which would otherwise silently point the commit-message/PR-description
+  // AI, and the PR itself, at the wrong project. Every step below reads cmt.repo,
+  // never the live `gitRepo` global.
+  cmt.repo = gitRepo;
   cmtPushFlags.clear(); cmtPushBadgeSync();   // never carry a flag like --force silently into a new push
   cmtEl('cmt-push-menu').classList.add('hidden');
-  const st = await window.deck.gitStatus(gitRepo);
+  const st = await window.deck.gitStatus(cmt.repo);
   cmt.willStageAll = st.ok && !st.staged.length && (st.unstaged.length || st.untracked.length);
   cmt.branch = st.branch || '';
   const fileCount = cmt.willStageAll ? (st.unstaged.length + st.untracked.length) : (st.ok ? st.staged.length : 0);
@@ -161,7 +181,7 @@ async function openCommitModal(kind) {
   if (kind === 'amend') {
     // show the CURRENT last-commit message so the user edits/confirms it,
     // instead of silently inheriting whatever stale text sits in the header box
-    const log = await window.deck.gitLog(gitRepo, 1);
+    const log = await window.deck.gitLog(cmt.repo, 1);
     cmtEl('cmt-msg').value = (log.ok && log.commits[0]) ? log.commits[0].subject : '';
   } else {
     cmtEl('cmt-msg').value = cmtEl('git-msg').value.trim();
@@ -196,28 +216,50 @@ async function openCommitModal(kind) {
   if (!cmtEl('cmt-msg').value.trim() && kind !== 'amend' && !clean) cmtGenMessage();
 }
 
-// visible buttons per state
+// COMMIT is only clickable when there is a message to commit with (amend may
+// reuse the previous one) and no step is mid-flight — the AI WRITE flow lands
+// here too: disabled while the box is empty, enabled the moment text arrives
+function cmtSyncCommitBtn() {
+  const busy = ['committing', 'pushing', 'fixing', 'creating'].includes(cmt.state);
+  const noMsg = cmt.kind !== 'amend' && !cmtEl('cmt-msg').value.trim();
+  cmtEl('cmt-commit').disabled = busy || noMsg;
+}
+cmtEl('cmt-msg').addEventListener('input', cmtSyncCommitBtn);
+
+// visible buttons per state. 'error' is shared by every step — cmt.failedStep
+// ('commit' | 'push' | 'pr') decides which retry button reappears next to FIX.
 function cmtSetState(state) {
   cmt.state = state;
   const show = (id, on) => cmtEl(id).classList.toggle('hidden', !on);
   const dis = (id, on) => { cmtEl(id).disabled = on; };
   const busy = ['committing', 'pushing', 'fixing', 'creating'].includes(state);
+  const step = cmt.failedStep || 'commit';
+  const errFor = s => state === 'error' && step === s;
+  const fixingFor = s => state === 'fixing' && step === s;
   // the message editor only matters while composing/fixing the commit itself —
   // after that it's dead weight (an empty disabled box), so hide it
-  const composing = ['compose', 'error', 'committing', 'fixing'].includes(state);
+  const composing = ['compose', 'committing'].includes(state)
+    || errFor('commit') || fixingFor('commit');
   cmtEl('cmt-msg-block').classList.toggle('hidden', !composing);
   cmtEl('cmt-commit').classList.remove('btn-working');
-  show('cmt-commit', state === 'compose' || state === 'error');
-  show('cmt-push-wrap', state === 'committed');
-  show('cmt-pr', state === 'pushed');
+  show('cmt-commit', state === 'compose' || errFor('commit'));
+  show('cmt-push-wrap', state === 'committed' || errFor('push'));
+  show('cmt-pr', state === 'pushed' || errFor('pr'));
+  show('cmt-pr-yes', state === 'ask-pr');
+  show('cmt-pr-no', state === 'ask-pr');
   show('cmt-close', state === 'done');
   show('cmt-fix', state === 'error');
   show('cmt-abort', state === 'fixing');
   show('cmt-cancel', state !== 'done');
   dis('cmt-cancel', busy);
-  cmtEl('cmt-msg').disabled = busy || state !== 'compose' && state !== 'error';
-  if (state === 'error') cmtEl('cmt-commit').textContent = '↻ Retry commit';
+  cmtEl('cmt-msg').disabled = busy || !(state === 'compose' || errFor('commit'));
+  if (errFor('commit')) cmtEl('cmt-commit').textContent = '↻ Retry commit';
+  if (errFor('push')) cmtEl('cmt-push').textContent = '↻ Retry push';
+  if (state === 'committed') cmtEl('cmt-push').textContent = '⇡ PUSH';
+  if (errFor('pr')) cmtEl('cmt-pr').textContent = '↻ Retry PR';
+  if (state === 'pushed') cmtEl('cmt-pr').textContent = '⑃ CREATE PR';
   if (state === 'compose') cmtEl('cmt-commit').textContent = '✓ ' + (CMT_LABEL[cmt.kind] || 'COMMIT');
+  cmtSyncCommitBtn();
 }
 
 // ----- live log (git process + AI process share the same panel) -----
@@ -242,7 +284,7 @@ async function cmtGitStream(op, arg) {
     : (arg && typeof arg === 'object') ? [arg.branch, ...(arg.flags || [])].join(' ')
     : (arg && arg !== '*' ? arg : '');
   cmtLive(`$ git ${op}${pretty ? ' ' + pretty : ''}`, 'sys');
-  const r = await window.deck.gitStream(gitRepo, op, arg, cmt.streamId);
+  const r = await window.deck.gitStream(cmt.repo, op, arg, cmt.streamId);
   cmt.streamId = null; cmt.gitEl = null;
   return r;
 }
@@ -277,12 +319,22 @@ cmtEl('cmt-commit').onclick = async () => {
   const msg = cmtEl('cmt-msg').value.trim();
   if (!msg && cmt.kind !== 'amend') { cmtEl('cmt-summary').textContent = '⚠ commit message required'; cmtEl('cmt-msg').focus(); return; }
   cmt.running = true;
+  cmt.failedStep = 'commit';
   cmtEl('cmt-error-wrap').classList.add('hidden');
   cmtEl('cmt-live').innerHTML = '';
   cmtShowLive('COMMIT PROCESS (hooks / tests run here)');
   cmtStepMark('commit', 'active');
   cmtSetState('committing');
-  if (cmt.willStageAll) await cmtGitStream('stage', '*');
+  // stage-check at CLICK time, not modal-open time — willStageAll was computed
+  // when the modal opened, and files staged/changed while it sat open (an agent
+  // finishing its edits, a manual stage/unstage in the panel) make that snapshot
+  // stale; committing with nothing staged just fails with "nothing to commit".
+  const stNow = await window.deck.gitStatus(cmt.repo);
+  const stageFirst = stNow.ok
+    ? (!stNow.staged.length &&
+       (stNow.unstaged.length || stNow.untracked.length))
+    : cmt.willStageAll;
+  if (stageFirst) await cmtGitStream('stage', '*');
   const r = await cmtGitStream(cmt.kind === 'amend' ? 'amend' : 'commit', msg);
   cmt.running = false;
   if (!r.ok) {
@@ -321,17 +373,33 @@ cmtEl('cmt-push').onclick = async () => {
   const r = await cmtGitStream('publish', { branch: cmt.branch || 'HEAD', flags });
   cmt.running = false;
   if (!r.ok) {
-    // the live panel already streamed the full output — no duplicate error pane
+    // same recovery loop as a blocked commit: error pane + 🔧 FIX WITH AI +
+    // a retry button — pre-push hooks fail just as often as pre-commit ones
     cmt.lastError = r.out || 'push failed';
+    cmt.failedStep = 'push';
+    cmtEl('cmt-error').textContent = cmt.lastError;
+    cmtEl('cmt-error-wrap').classList.remove('hidden');
     cmtStepMark('push', 'fail');
-    cmtLive('✗ push failed — fix and press Push again', 'err');
-    cmtSetState('committed');   // let them retry Push
+    cmtLive('✗ push failed — 🔧 fix with AI or retry', 'err');
+    cmtSetState('error');
     return;
   }
   cmtLive('✔ pushed', 'ok');
   cmtStepMark('push', 'done');
   gitRefresh();
-  await cmtPreparePR();
+  // everything is committed + pushed — creating a PR is the operator's call,
+  // not an automatic next step
+  cmtEl('cmt-summary').textContent =
+    `pushed ${cmt.branch} — create a pull request?`;
+  cmtSetState('ask-pr');
+};
+
+// PR is opt-in after a successful push
+cmtEl('cmt-pr-yes').onclick = () => { if (!cmt.running) cmtPreparePR(); };
+cmtEl('cmt-pr-no').onclick = () => {
+  if (cmt.running) return;
+  cmtEl('cmt-summary').textContent = 'done — committed & pushed, no PR created.';
+  cmtSetState('done');
 };
 
 // ===== STEP 3: CREATE PR (pick base branch, AI-written description) =====
@@ -344,7 +412,7 @@ async function cmtPreparePR() {
   cmtStepMark('pr', 'active');
   cmtSetState('pushed');
   // base must exist on the remote for `gh pr create` to work — remote branches only
-  const bases = await remoteBranchNames(gitRepo, cmt.branch);
+  const bases = await remoteBranchNames(cmt.repo, cmt.branch);
   const def = bases.find(x => x === 'main') || bases.find(x => x === 'master') || bases.find(x => x === 'qa') || bases[0];
   cmtPrBasePicker.setBranches(bases, def);
   // auto-write the PR description from the branch's changes (editable)
@@ -389,7 +457,7 @@ Keep it concise. Output ONLY the description, no title, no preamble, no markdown
 
 === DIFF (${cmt.branch} vs ${base}) ===
 ${diff.slice(0, 30000)}`;
-  const r = await window.deck.aiGenerate(prompt, 'claude-haiku-4-5-20251001', gitRepo);
+  const r = await window.deck.aiGenerate(prompt, 'claude-haiku-4-5-20251001', cmt.repo);
   done();
   if (r.ok && r.text) { box.value = r.text.trim(); status.textContent = '✓ AI draft — edit freely'; }
   else { status.textContent = '✗ ' + (r.error || 'generation failed'); }
@@ -403,19 +471,60 @@ cmtEl('cmt-pr').onclick = async () => {
   const base = cmtPrBasePicker.value;
   if (!base) { cmtLive('✗ pick a base branch', 'err'); return; }
   cmt.running = true;
+  cmtEl('cmt-error-wrap').classList.add('hidden');
   cmtShowLive('CREATE PR PROCESS');
   cmtSetState('creating');
   // gh pr create isn't streamed — show a thinking indicator while it runs
   cmt.thinkEl = document.createElement('div'); cmt.thinkEl.className = 'ai-line ai-thinking'; cmt.thinkEl.textContent = '⏳ creating PR';
   cmtEl('cmt-live').appendChild(cmt.thinkEl);
+  // conflict gate BEFORE creating — a PR born conflicted just moves the
+  // problem to GitHub. On conflicts, hand off to the shared resolver flow
+  // (git.js): merge base→head, resolve each file (AI or manual, human
+  // prompts welcome in the resolver), then it auto-commits, pushes, and
+  // creates this exact PR.
+  cmtLive(`$ conflict check ${cmt.branch} → ${base}`, 'sys');
+  const chk = await window.deck.prConflictCheck(cmt.repo, base, cmt.branch);
+  if (chk.ok && chk.conflict) {
+    if (cmt.thinkEl) { cmt.thinkEl.remove(); cmt.thinkEl = null; }
+    cmt.running = false;
+    cmtLive(`⚠ merge conflicts with ${base}: ${chk.files.length} file(s)`, 'err');
+    const proceed = await showAlert({
+      title: 'MERGE CONFLICTS',
+      message: `This PR (${cmt.branch} → ${base}) has merge conflicts in ` +
+        `${chk.files.length} file(s). Merge ${base} into ${cmt.branch} now to ` +
+        `resolve them (AI or manual), then it auto-commits, pushes, and ` +
+        `creates the PR.`,
+      okText: 'RESOLVE NOW', cancelText: 'CANCEL', kind: 'warn',
+      work: () => window.deck.prStartMerge(cmt.repo, base, cmt.branch)
+    });
+    if (proceed === false) { cmtSetState('pushed'); return; }
+    if (!proceed || !proceed.ok) {
+      cmtLive('✗ ' + ((proceed && proceed.error) || 'could not start the merge'), 'err');
+      cmtSetState('pushed');
+      return;
+    }
+    cmtCloseModal();   // resolver takes over the screen from here
+    prConflictCtx = {
+      base, head: cmt.branch, title, body: bodyDesc,
+      files: (proceed.conflict ? proceed.files.slice() : []),
+      total: (proceed.conflict ? proceed.files.length : 0)
+    };
+    if (prConflictCtx.files.length) openNextPrConflict(); else finishPrConflict();
+    return;
+  }
   cmtLive(`$ gh pr create --base ${base} --head ${cmt.branch}`, 'sys');
-  const r = await window.deck.prCreate(gitRepo, { title, body: bodyDesc, base });
+  const r = await window.deck.prCreate(cmt.repo, { title, body: bodyDesc, base });
   if (cmt.thinkEl) { cmt.thinkEl.remove(); cmt.thinkEl = null; }
   cmt.running = false;
   if (!r.ok) {
-    cmtLive('✗ ' + (r.error || r.out || 'PR create failed'), 'err');
+    // same recovery loop as commit/push: error pane + 🔧 FIX WITH AI + retry
+    cmt.lastError = r.error || r.out || 'PR create failed';
+    cmt.failedStep = 'pr';
+    cmtEl('cmt-error').textContent = cmt.lastError;
+    cmtEl('cmt-error-wrap').classList.remove('hidden');
+    cmtLive('✗ ' + cmt.lastError, 'err');
     cmtStepMark('pr', 'fail');
-    cmtSetState('pushed');   // retry
+    cmtSetState('error');
     return;
   }
   cmt.prUrl = (r.out.match(/https?:\/\/\S+/) || [])[0] || '';
@@ -426,32 +535,56 @@ cmtEl('cmt-pr').onclick = async () => {
 };
 
 // 🔧 Fix with AI — reads the failure output, fixes it, streams here with thinking
+// per-step failure context — the failed output is always the MAIN context
+const CMT_FIX_INTRO = {
+  commit: 'A git commit was BLOCKED by a pre-commit hook (lint/tests/etc). ' +
+    'Below is the FULL output, including any failing test details. Diagnose ' +
+    'the cause and FIX it so the hook passes — write or repair the required ' +
+    'tests, satisfy the linter, whatever it demands. Do NOT run "git commit" ' +
+    'yourself; the app retries after you finish.',
+  push: 'A git push FAILED (pre-push hook, remote rejection, or auth). Below ' +
+    'is the FULL output. Diagnose the cause and FIX it so the push succeeds ' +
+    '— repair failing tests/lint the hook demands, or resolve the rejection ' +
+    '(e.g. pull/rebase on a non-fast-forward). Do NOT run "git push" ' +
+    'yourself; the app retries after you finish.',
+  pr: 'Creating a GitHub pull request via `gh pr create` FAILED. Below is ' +
+    'the FULL output. Diagnose the cause and FIX it (missing gh auth, branch ' +
+    'not on remote, PR already exists, invalid base…). Do NOT create the PR ' +
+    'yourself; the app retries after you finish.'
+};
+const CMT_RETRY_LABEL = { commit: 'Retry commit', push: 'Retry push', pr: 'Retry PR' };
+
 cmtEl('cmt-fix').onclick = async () => {
   const agent = byRole('senior')[0] || agents.find(a => a.id === 'def-general') || agents[0];
   if (!agent) return;
   if (R(agent.id).running) { cmtLive('✗ ' + agent.name + ' is busy', 'err'); return; }
+  const step = cmt.failedStep || 'commit';
   cmt.aiAgentId = agent.id; cmt.streamEl = null;
-  cmtShowLive(`🔧 FIXING WITH AI · ${agent.name}`);
+  cmtShowLive(`🔧 FIXING WITH AI · ${agent.name} · sonnet-5`);
   cmtLive('— analyzing the failure —', 'sys');
   cmtSetState('fixing');
   cmt.thinkEl = document.createElement('div');
   cmt.thinkEl.className = 'ai-line ai-thinking';
   cmt.thinkEl.textContent = '⏳ thinking';
   cmtEl('cmt-live').appendChild(cmt.thinkEl);
-  const prompt = `A git commit was BLOCKED by a pre-commit hook (lint/tests/etc). Below is the FULL output, including any failing test details. Diagnose the cause and FIX it so the hook passes — write or repair the required tests, satisfy the linter, whatever it demands. Do NOT run "git commit" yourself; the app retries after you finish. Keep changes minimal and in scope.
-
-=== HOOK / TEST OUTPUT ===
-${cmt.lastError.slice(0, 9000)}`;
+  // operator can steer the fix — their note rides along with the failure output
+  const hint = cmtEl('cmt-fix-hint').value.trim();
+  const prompt = `${CMT_FIX_INTRO[step]} Keep changes minimal and in scope.` +
+    (hint ? `\n\nOPERATOR INSTRUCTIONS (follow these):\n${hint}` : '') +
+    `\n\n=== FAILURE OUTPUT ===\n${cmt.lastError.slice(0, 9000)}`;
   runAgent(agent.id, prompt, false, false, {
     fresh: true,
+    model: 'claude-sonnet-5',   // fixes always run on Sonnet 5
     onEvent: cmtOnEvent,
     onDone: (result) => {
       if (cmt.thinkEl) { cmt.thinkEl.remove(); cmt.thinkEl = null; }
       cmt.aiAgentId = null;
       if (result === 'aborted') { cmtLive('■ fix aborted.', 'err'); cmtSetState('error'); return; }
-      cmtLive(result === 'success' ? '✔ fix complete — press ↻ Retry commit.' : '✗ fix ended: ' + result, result === 'success' ? 'ok' : 'err');
-      cmtEl('cmt-summary').textContent = 'AI applied a fix — retry the commit';
-      cmtSetState('error');
+      cmtLive(result === 'success'
+        ? `✔ fix complete — press ↻ ${CMT_RETRY_LABEL[step]}.`
+        : '✗ fix ended: ' + result, result === 'success' ? 'ok' : 'err');
+      cmtEl('cmt-summary').textContent = `AI applied a fix — retry the ${step}`;
+      cmtSetState('error');   // failedStep intact → the right retry button shows
       gitRefresh();
     }
   });

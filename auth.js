@@ -70,7 +70,14 @@ function init(sendFn) { sendToRenderer = sendFn; }
 async function getSession() {
   if (!configured()) return { configured: false, user: null };
   try {
-    const { data, error } = await sb().auth.getSession();
+    // add a 5s timeout so app startup doesn't hang if Supabase is unreachable
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('session check timed out')), 5000)
+    );
+    const { data, error } = await Promise.race([
+      sb().auth.getSession(),
+      timeoutPromise
+    ]);
     if (error || !data.session) return { configured: true, user: null };
     return { configured: true, user: sessionUser(data.session) };
   } catch (e) { return { configured: true, user: null, error: String(e.message || e) }; }
@@ -169,6 +176,22 @@ async function saveRoster(agents) {
   return error ? { ok: false, error: error.message } : { ok: true };
 }
 
+async function fetchWorkspaces() {
+  const uid = await userId();
+  if (!uid) return { ok: false, error: 'not logged in' };
+  const { data, error } = await sb().from('user_workspaces')
+    .select('workspaces').eq('user_id', uid).maybeSingle();
+  return error ? { ok: false, error: error.message } : { ok: true, workspaces: data && data.workspaces };
+}
+
+async function saveWorkspaces(workspaces) {
+  const uid = await userId();
+  if (!uid) return { ok: false, error: 'not logged in' };
+  const { error } = await sb().from('user_workspaces')
+    .upsert({ user_id: uid, workspaces, updated_at: new Date().toISOString() });
+  return error ? { ok: false, error: error.message } : { ok: true };
+}
+
 async function fetchSkills() {
   const uid = await userId();
   if (!uid) return { ok: false, error: 'not logged in' };
@@ -188,5 +211,6 @@ async function saveSkills(skills) {
 module.exports = {
   init, getSession, startLogin, handleDeepLink, logout,
   fetchProfile, fetchSettings, saveSettings, fetchRoster, saveRoster,
+  fetchWorkspaces, saveWorkspaces,
   fetchSkills, saveSkills
 };

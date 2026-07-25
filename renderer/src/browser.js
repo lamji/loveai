@@ -179,6 +179,37 @@
     wvById.delete(id);
   }
 
+  // ---- idle suspension --------------------------------------------------
+  // Each background tab is a live Chromium renderer (~100-250MB with its own
+  // timers/JS/video) that used to survive for the whole session — "guests stay
+  // alive & hidden". On a laptop that quietly piles up gigabytes. We now tear
+  // down the guest for any tab not viewed in SUSPEND_MS; the tab's url/title
+  // persist, so re-selecting it lazily rebuilds the webview onto the same page.
+  // Dev servers (localhost) are EXEMPT — killing those hides live reloads.
+  const SUSPEND_MS = 5 * 60 * 1000;
+  function isLocalUrl(u) {
+    try {
+      const h = new URL(u).hostname;
+      return /^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[::1\])$/i.test(h);
+    } catch { return false; }
+  }
+  function suspendIdleWebviews() {
+    const now = Date.now();
+    const activeId = curActiveId();
+    for (const [id, wv] of wvById) {
+      if (id === activeId) continue;                 // never the visible one
+      const last = wv._lastActive || 0;
+      if (now - last < SUSPEND_MS) continue;
+      if (isLocalUrl(safeUrl(wv) || (getTab(id) || {}).url || '')) continue;
+      destroyWv(id);                                 // tab metadata stays in `tabs`
+    }
+  }
+  // cheap: a single pass over open guests once a minute
+  const _suspendTimer = setInterval(suspendIdleWebviews, 60 * 1000);
+  if (window.addEventListener) {
+    window.addEventListener('beforeunload', () => clearInterval(_suspendTimer));
+  }
+
   function wireWebview(wv, tabId) {
     const isActive = () => curActiveId() === tabId;
     const storeUrl = () => {
@@ -336,6 +367,7 @@
     else delete activeByWs[activeWorkspaceId];
     saveActiveByWs();
     const wv = resolved ? ensureWv(getTab(resolved)) : null;
+    if (wv) wv._lastActive = Date.now();   // drives idle suspension of the rest
     wvById.forEach((w, tid) => w.classList.toggle('hidden', tid !== resolved));
     if (wv) progress.classList.toggle('hidden', !wv._loading);
     else { progress.classList.add('hidden'); urlInput.value = ''; }

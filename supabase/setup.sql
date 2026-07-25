@@ -35,11 +35,21 @@ create table public.user_skills (
   updated_at timestamptz default now()
 );
 
+-- one row per user: the whole workspaces array (path, agent roster, and each
+-- workspace's chats — a chat only carries an sdkSessionId pointer, never the
+-- transcript itself, so this stays small even with a long chat history)
+create table public.user_workspaces (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  workspaces jsonb not null default '[]',
+  updated_at timestamptz default now()
+);
+
 -- ===== Row Level Security =====
 alter table public.profiles enable row level security;
 alter table public.user_settings enable row level security;
 alter table public.user_roster enable row level security;
 alter table public.user_skills enable row level security;
+alter table public.user_workspaces enable row level security;
 
 -- profiles: user can READ their own row only. No insert/update policy — the
 -- trigger below creates it and plan changes happen via service role only.
@@ -65,6 +75,13 @@ create policy "own skills read" on public.user_skills
 create policy "own skills insert" on public.user_skills
   for insert with check (auth.uid() = user_id);
 create policy "own skills update" on public.user_skills
+  for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+create policy "own workspaces read" on public.user_workspaces
+  for select using (auth.uid() = user_id);
+create policy "own workspaces insert" on public.user_workspaces
+  for insert with check (auth.uid() = user_id);
+create policy "own workspaces update" on public.user_workspaces
   for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
 
 -- ===== Auto-create a profile on signup =====

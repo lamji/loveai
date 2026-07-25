@@ -1,0 +1,68 @@
+{
+  "_doc": "Deterministic task classification → adaptive retrieval budget. tokenBudget is the UPPER CAP of context to assemble for that task class (see Phase 7 of the retrieval spec); charBudget is derived at ~4 chars/token. tiny* applies when the issue text is shorter than tinyThresholdChars — a one-line bug needs far less than a full feature. Matching is by counting keyword hits in the lowercased issue text; highest score wins, ties break by array order (earlier = higher priority).",
+  "tinyThresholdChars": 120,
+  "defaultTokenBudget": 4000,
+  "routes": [
+    {
+      "type": "architecture",
+      "tokenBudget": 12000,
+      "keywords": ["architecture", "redesign", "rewrite", "re-architect", "migrate", "migration", "subsystem", "overhaul", "restructure the", "system-wide"]
+    },
+    {
+      "type": "bugfix",
+      "tokenBudget": 2500,
+      "tinyTokenBudget": 1500,
+      "keywords": ["bug", "fix", "error", "crash", "broken", "fails", "failing", "exception", "regression", "incorrect", "wrong", "not working", "stack trace", "throws", "undefined", "null"]
+    },
+    {
+      "type": "refactor",
+      "tokenBudget": 5000,
+      "keywords": ["refactor", "cleanup", "clean up", "simplify", "rename", "extract", "dedupe", "deduplicate", "tidy", "reorganize"]
+    },
+    {
+      "type": "feature",
+      "tokenBudget": 5000,
+      "keywords": ["feature", "implement", "new ", "add ", "create", "build", "support for", "introduce", "enable"]
+    },
+    {
+      "type": "ui",
+      "tokenBudget": 4000,
+      "keywords": ["ui", "css", "style", "styling", "layout", "button", "modal", "dialog", "component", "render", "frontend", "responsive", "theme", "color", "font"]
+    },
+    {
+      "type": "backend",
+      "tokenBudget": 4000,
+      "keywords": ["api", "endpoint", "server", "route", "handler", "ipc", "backend", "controller", "service", "request", "response"]
+    },
+    {
+      "type": "database",
+      "tokenBudget": 4000,
+      "keywords": ["database", "db", "migration", "sql", "schema", "query", "supabase", "table", "column", "index", "postgres"]
+    },
+    {
+      "type": "testing",
+      "tokenBudget": 3000,
+      "keywords": ["test", "spec", "jest", "playwright", "coverage", "e2e", "unit test", "integration test", "assertion"]
+    },
+    {
+      "type": "devops",
+      "tokenBudget": 3000,
+      "keywords": ["deploy", "deployment", "ci", "cd", "docker", "workflow", "github action", "release", "build pipeline"]
+    },
+    {
+      "type": "dependency",
+      "tokenBudget": 2000,
+      "keywords": ["upgrade", "bump", "dependency", "dependencies", "package", "version", "npm install", "outdated"]
+    },
+    {
+      "type": "config",
+      "tokenBudget": 2000,
+      "keywords": ["config", "configuration", "setting", "settings", "env", "environment variable", "toml", "yaml", ".json", "flag"]
+    },
+    {
+      "type": "documentation",
+      "tokenBudget": 1500,
+      "keywords": ["document", "documentation", "docs", "readme", "comment", "jsdoc", "explain in code", "annotate"]
+    }
+  ]
+}

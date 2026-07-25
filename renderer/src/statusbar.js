@@ -240,6 +240,19 @@ const sbGraph = {
 };
 let sbGraphFetchAt = 0;
 let sbGraphProj = null;
+let sbGraphLast = null;   // last codegraph-status payload (drives the click action)
+// transient "just synced" note — set by the incremental watcher events (a file
+// changed/added/removed while idle) so the operator SEES the index staying live,
+// not just the one-time "watching" label. Cleared by the next repaint once stale.
+let sbSyncFlash = null;   // { text, until }
+function flashSync(text) {
+  sbSyncFlash = { text, until: Date.now() + 2500 };
+  paintGraph(sbGraphLast || {});
+  // guarantee a clean, ACCURATE revert even if the next periodic repaint is
+  // throttled — refetch rather than repaint the (possibly stale/absent) cached
+  // status, so it can't revert to a wrong label like "graph — build".
+  setTimeout(() => refreshGraphStatus(true), 2600);
+}
 
 // plain-language build notes — the status label alternates between the
 // percentage and one of these every few seconds, so a long-running build on a
@@ -303,6 +316,12 @@ function paintGraph(st) {
   }
   item.classList.remove('building');
   if (bar) bar.classList.add('hidden');
+  if (sbSyncFlash && Date.now() < sbSyncFlash.until) {
+    txt.textContent = sbSyncFlash.text;
+    item.title = 'Code graph / semantic index just re-synced with a file change.';
+    return;
+  }
+  sbSyncFlash = null;
   if (st && st.broken) {
     txt.textContent = 'graph ✗';
     item.title = 'Code graph failed: ' + (st.error || 'tree-sitter unavailable')
@@ -310,10 +329,21 @@ function paintGraph(st) {
     return;
   }
   if (st && st.built) {
-    txt.textContent = 'graph ✓ ' + graphAgo(st.lastBuilt) + (st.watching ? ' · watching' : '');
-    item.title = 'Code graph — ' + st.files + ' symbols · built '
-      + (st.lastBuilt ? new Date(st.lastBuilt).toLocaleString() : 'unknown')
-      + (st.watching ? ' · watcher running' : ' · watcher off') + '\nClick to recompute.';
+    // a graph exists but the semantic index was DEFERRED (too big to auto-build
+    // on the user's machine) — surface a one-click "embed" instead of hiding it
+    if (st.vectorsDeferred && !st.vectors) {
+      txt.textContent = 'graph ✓ · embed ↗';
+      item.title = 'Code graph — ' + st.files + ' symbols.\n'
+        + 'Semantic search index not built (' + st.vectorsDeferred + ' symbols — '
+        + 'skipped automatically to keep your machine responsive).\n'
+        + 'Click to build it now (runs in the background, ~2 lean threads).';
+    } else {
+      txt.textContent = 'graph ✓ ' + graphAgo(st.lastBuilt) + (st.watching ? ' · watching' : '');
+      item.title = 'Code graph — ' + st.files + ' symbols · built '
+        + (st.lastBuilt ? new Date(st.lastBuilt).toLocaleString() : 'unknown')
+        + (st.watching ? ' · watcher running' : ' · watcher off')
+        + (st.vectors ? ' · semantic index on' : '') + '\nClick to recompute.';
+    }
   } else if (st && st.empty) {
     // the build completed (the bar hit 100%) but produced no symbols — say so,
     // instead of repainting as "no graph yet" like the build never happened
@@ -353,11 +383,23 @@ async function refreshGraphStatus(force) {
   if (!force && now - sbGraphFetchAt < 4000) return;            // throttle — not every 1s tick
   sbGraphFetchAt = now;
   let st; try { st = await window.deck.codegraphStatus(pd); } catch { return; }
-  if (st && st.ok) paintGraph(st);
+  if (st && st.ok) { sbGraphLast = st; paintGraph(st); }
 }
 document.getElementById('sb-graph').onclick = async () => {
   const pd = (typeof projectDir !== 'undefined') && projectDir;
   if (!pd || sbGraph.building) return;
+  // deferred semantic index → this click means "build vectors", not "rebuild
+  // the graph". The graph already exists; only the embedding step was skipped.
+  if (sbGraphLast && sbGraphLast.built && sbGraphLast.vectorsDeferred
+      && !sbGraphLast.vectors) {
+    sbGraph.building = true; sbGraph.pct = 0; sbGraph.phase = 'vectors';
+    sbGraph.startedAt = Date.now(); sbGraph.lastProgressAt = Date.now();
+    paintGraph({ building: true });
+    try { await window.deck.vectorBuild(pd); } catch {}
+    sbGraph.building = false;
+    refreshGraphStatus(true);
+    return;
+  }
   sbGraph.building = true; sbGraph.pct = 0; sbGraph.phase = 'graph';
   sbGraph.startedAt = Date.now(); sbGraph.lastProgressAt = Date.now();
   paintGraph({ building: true });
@@ -425,13 +467,31 @@ window.deck.onVectorProgress((p) => {
 window.deck.onVectorUpdated((p) => {
   const pd = (typeof projectDir !== 'undefined') && projectDir;
   if (!pd || (p && p.cwd && p.cwd !== pd)) return;
-  // ignore the incremental re-embeds the file watcher emits — only a running
-  // build (vectors phase) should finalize the bar.
-  if (sbGraph.phase !== 'vectors' || !sbGraph.building) return;
+  // a running build (vectors phase) finalizes the bar as before; otherwise this
+  // is the file watcher's incremental re-embed — flash it so the operator sees
+  // the semantic index actually staying live, not just a silent background job.
+  if (sbGraph.phase !== 'vectors' || !sbGraph.building) {
+    flashSync('embeddings ✓ synced');
+    return;
+  }
   sbGraph.building = false; sbGraph.pct = 100; sbGraph.phase = 'graph';
   sbGraph.startedAt = 0; sbGraph.lastProgressAt = 0; sbGraph.resumed = false;
   sbGraph.lastError = (p && p.ok === false)
     ? ('vector embedding failed' + (p.error ? ': ' + p.error : '')) : '';
+  refreshGraphStatus(true);
+});
+// tree-sitter/symbol index re-synced after a file changed/was added/removed —
+// same live-sync visibility as the vector flash above.
+window.deck.onSymbolUpdated((p) => {
+  const pd = (typeof projectDir !== 'undefined') && projectDir;
+  if (!pd || (p && p.cwd && p.cwd !== pd)) return;
+  flashSync(`graph ✓ synced (${p && p.changed ? '+/-' + p.changed : 'updated'})`);
+});
+// the semantic index was intentionally NOT auto-built (big project) — refresh so
+// the status item repaints as "graph ✓ · embed ↗" offering the manual build
+window.deck.onVectorDeferred((p) => {
+  const pd = (typeof projectDir !== 'undefined') && projectDir;
+  if (!pd || (p && p.cwd && p.cwd !== pd)) return;
   refreshGraphStatus(true);
 });
 

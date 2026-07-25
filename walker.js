@@ -8,7 +8,8 @@ const fs = require('fs');
 const path = require('path');
 
 const INDEX_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.loveai',
-  '.next', 'coverage', 'out', 'target', 'vendor', 'venv', '__pycache__', 'local_cache']);
+  '.next', 'coverage', 'out', 'target', 'vendor', 'venv', '__pycache__', 'local_cache',
+  '.myai']);
 const INDEX_EXTS = new Set(['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'json', 'html',
   'css', 'scss', 'md', 'py', 'go', 'rs', 'java', 'cs', 'php', 'rb', 'vue', 'svelte',
   'yml', 'yaml', 'toml', 'sql']);

@@ -1,14 +1,15 @@
 // ===== Per-user cloud sync (Supabase via main process) =====
 // Loaded BEFORE app.js. Patches localStorage.setItem once so every existing
-// save site (agents roster, theme, projectDir, learn, ai_* prefs) syncs to the
-// user's row without touching the rest of the codebase. localStorage stays the
-// offline cache; the cloud copy is last-write-wins.
+// save site (agents roster, workspaces incl. chats/session ids, theme,
+// projectDir, learn, ai_* prefs) syncs to the user's row without touching the
+// rest of the codebase. localStorage stays the offline cache; the cloud copy
+// is last-write-wins.
 const Sync = (() => {
-  const SETTINGS_KEYS = ['theme', 'projectDir', 'learn'];
+  const SETTINGS_KEYS = ['theme', 'projectDir', 'learn', 'activeWorkspaceId'];
   const isSettingsKey = k => SETTINGS_KEYS.includes(k) || k.startsWith('ai_');
   let enabled = false;
   let timer = null;
-  let dirty = { roster: false, settings: false };
+  let dirty = { roster: false, settings: false, workspaces: false };
 
   function snapshotSettings() {
     const out = {};
@@ -34,6 +35,12 @@ const Sync = (() => {
         const r = await window.deck.saasSettingsSet(snapshotSettings());
         if (!r.ok) { dirty.settings = true; console.warn('sync: settings push failed:', r.error); }
       }
+      if (dirty.workspaces) {
+        dirty.workspaces = false;
+        const workspaces = JSON.parse(localStorage.getItem('workspaces') || '[]');
+        const r = await window.deck.saasWorkspacesSet(workspaces);
+        if (!r.ok) { dirty.workspaces = true; console.warn('sync: workspaces push failed:', r.error); }
+      }
     } catch (e) { console.warn('sync: push failed:', e); }
   }
 
@@ -45,6 +52,7 @@ const Sync = (() => {
 
   function onSet(key) {
     if (key === 'agents') { dirty.roster = true; schedule(); }
+    else if (key === 'workspaces') { dirty.workspaces = true; schedule(); }
     else if (isSettingsKey(key)) { dirty.settings = true; schedule(); }
   }
 
@@ -87,6 +95,16 @@ const Sync = (() => {
       } else if (rr.ok) {
         dirty.roster = true;            // seed cloud after enable()
       }
+      // workspaces: path + roster + chats (each chat's sdkSessionId is the
+      // resume pointer) — the whole "what was I working on" state
+      const rw = await window.deck.saasWorkspacesGet();
+      if (rw.ok && Array.isArray(rw.workspaces) && rw.workspaces.length) {
+        const local = localStorage.getItem('workspaces') || '[]';
+        const remote = JSON.stringify(rw.workspaces);
+        if (local !== remote) { _set('workspaces', remote); changed = true; }
+      } else if (rw.ok) {
+        dirty.workspaces = true;        // seed cloud after enable()
+      }
       const rs = await window.deck.saasSettingsGet();
       if (rs.ok && rs.settings && Object.keys(rs.settings).length) {
         for (const [k, v] of Object.entries(rs.settings)) {
@@ -108,7 +126,7 @@ const Sync = (() => {
 
   function enable() {
     enabled = true;
-    if (dirty.roster || dirty.settings) schedule();
+    if (dirty.roster || dirty.settings || dirty.workspaces) schedule();
     // full skills backup on every launch — catches skills created or edited
     // OUTSIDE the app (Claude Code CLI, manual edits), so a dead machine never
     // takes skills with it: any login on a new machine restores the lot

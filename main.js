@@ -4,6 +4,10 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const http = require('http');
+// global word-list store + self-updating engine (userData JSON, not per-project)
+const dictStore = require('./dictionary');
+// deterministic task classifier → adaptive retrieval budget (Phase 1 + 7)
+const { classifyTask } = require('./src/retrieval/classifier');
 const crypto = require('crypto');
 const { execFile, spawn } = require('child_process');
 let query, sdkTool, createSdkMcpServer;
@@ -71,7 +75,14 @@ function deepLinkIn(argv) {
 // Windows delivers the URL to a SECOND instance's argv — keep one instance and
 // route the link to it.
 const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) app.quit();
+if (!gotLock) {
+  // app.quit() only SCHEDULES a quit — without this return, app.whenReady()
+  // below still resolves in this doomed second process and briefly opens a
+  // duplicate window that reads/writes the SAME on-disk storage as the real
+  // instance, racing it and risking clobbering the just-saved workspace data.
+  app.quit();
+  return;
+}
 app.on('second-instance', (_e, argv) => {
   const url = deepLinkIn(argv);
   if (url) saas.handleDeepLink(url);
@@ -91,6 +102,11 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Electron sandboxes preload scripts by default (v20+), which blocks
+      // `require()` of local project files (only a small built-in allowlist
+      // resolves). preload.js requires ./src/retrieval/classifier, so the
+      // sandbox must stay off here.
+      sandbox: false,
       webviewTag: true
     }
   });
@@ -120,6 +136,7 @@ function configureSandboxSession() {
 }
 
 app.whenReady().then(() => {
+  dictStore.init(app.getPath('userData'));   // pin the word-list store to userData
   saas.init(send);
   configureSandboxSession();
   wireNetworkLog();
@@ -129,7 +146,19 @@ app.whenReady().then(() => {
   const url = deepLinkIn(process.argv);
   if (url) saas.handleDeepLink(url);
 });
-app.on('window-all-closed', () => app.quit());
+// Chromium's Storage Service batches localStorage writes and commits them to
+// disk on a delay/idle timer, not on every setItem(). A plain app.quit() on
+// window-all-closed can race that commit and tear the process down before
+// the workspace roster/chats just saved by the renderer ever hit disk - the
+// exact "opens empty, previous session gone" symptom. flushStorageData()
+// forces the pending writes out before we let the app actually quit.
+app.on('window-all-closed', () => {
+  try { session.defaultSession.flushStorageData(); } catch {}
+  app.quit();
+});
+app.on('before-quit', () => {
+  try { session.defaultSession.flushStorageData(); } catch {}
+});
 
 // ===== SaaS IPC — Supabase session + per-user data =====
 ipcMain.handle('saas-session', () => saas.getSession());
@@ -140,6 +169,8 @@ ipcMain.handle('saas-settings-get', () => saas.fetchSettings());
 ipcMain.handle('saas-settings-set', (_e, s) => saas.saveSettings(s));
 ipcMain.handle('saas-roster-get', () => saas.fetchRoster());
 ipcMain.handle('saas-roster-set', (_e, a) => saas.saveRoster(a));
+ipcMain.handle('saas-workspaces-get', () => saas.fetchWorkspaces());
+ipcMain.handle('saas-workspaces-set', (_e, w) => saas.saveWorkspaces(w));
 
 // ===== Skills sync — ~/.claude/skills/<name>/SKILL.md ↔ user_skills table =====
 function userSkillsDir() {
@@ -698,7 +729,9 @@ ipcMain.handle('index-mark', async (_e, cwd) => {
 // ===== Lexical retrieval — symbol index + BM25 (no embeddings, no Python) =====
 // Gives the Prompt Engineer the files most likely involved in an issue up front,
 // so it reads a handful instead of grepping the whole repo. Pure Node, offline.
-const STOP = new Set(['the', 'and', 'for', 'with', 'this', 'that', 'from', 'into', 'when', 'then', 'not', 'but', 'you', 'are', 'was', 'will', 'add', 'fix', 'use', 'get', 'set', 'new', 'now', 'has', 'have', 'should', 'need', 'want', 'make', 'change', 'update', 'issue', 'bug', 'feature', 'file', 'code', 'function', 'const', 'let', 'var', 'return', 'import', 'export']);
+// BM25 stop-words now live in the global dictionary store (category 'retrieval',
+// seeded from the original list). Auto-promotion is OFF for retrieval so ranking
+// never drifts on its own — curate via tools/dict.js. See dictionary.js.
 
 // null-prototype map for identifier-keyed lookups. Source symbols are OFTEN
 // named after Object.prototype members (constructor, toString, valueOf, ...)
@@ -715,7 +748,7 @@ function tokenize(s) {
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')   // split camelCase
     .split(/[^A-Za-z0-9]+/)
     .map(t => t.toLowerCase())
-    .filter(t => t.length >= 3 && t.length <= 40 && !STOP.has(t));
+    .filter(t => t.length >= 3 && t.length <= 40 && !dictStore.isStop('retrieval', t));
 }
 function extractSymbols(text) {
   const syms = new Set();
@@ -820,12 +853,8 @@ async function indexOneFile(cwd, abs) {
 }
 // ===== Purpose blurbs for repoMapFromIndex — offline heuristics only =====
 // Tokens too common to ever describe a directory's purpose on their own.
-const GENERIC = new Set([
-  'index', 'main', 'app', 'src', 'lib', 'data', 'item', 'value', 'list',
-  'key', 'val', 'obj', 'props', 'params', 'err', 'res', 'req', 'str', 'num',
-  'tmp', 'util', 'utils', 'test', 'spec', 'page', 'node', 'module',
-  'default', 'string', 'number', 'object', 'options', 'config', 'result'
-]);
+// Generic-token list also lives in the dictionary store (category 'generic',
+// seeded from the original list; curate via tools/dict.js). See dictionary.js.
 // last path segment (or 2nd-to-last, for these generic container names) -> phrase
 const GENERIC_SEGMENT = new Set(['src', 'lib', 'v1', 'v2', 'app', 'source']);
 const DIR_PURPOSE = {
@@ -934,7 +963,7 @@ function domainTokens(dir, list, idx) {
   for (const f of list) {
     const tf = (idx.files[f.rel] && idx.files[f.rel].tf) || {};
     for (const t of Object.keys(tf)) {
-      if (STOP.has(t) || GENERIC.has(t) || pathTokens.has(t)) continue;
+      if (dictStore.isStop('retrieval', t) || dictStore.isStop('generic', t) || pathTokens.has(t)) continue;
       df[t] = (df[t] || 0) + 1;
     }
   }
@@ -1015,6 +1044,16 @@ function retrieve(idx, query, k) {
   }
   out.sort((a, b2) => b2.score - a.score);
   return out.slice(0, k || 8);
+}
+// keep only the highest-confidence hits from an already-sorted, already-scored
+// list — a human dev doesn't open every file that vaguely matched, just the
+// ones that clearly do. Floor so a legitimately close pack (several files
+// scoring near the top) isn't cut down to one.
+function strongestOnly(ranked, ratio = 0.4, floor = 3) {
+  if (!ranked.length) return ranked;
+  const top = ranked[0].score;
+  const strong = ranked.filter((r) => r.score >= top * ratio);
+  return strong.length >= floor ? strong : ranked.slice(0, floor);
 }
 
 // ===== NATIVE code knowledge graph — tree-sitter, parsed in a WORKER =====
@@ -1437,6 +1476,40 @@ function regressionImpact(graph, idx, files) {
   }
   return lexicalImpact(idx, files);
 }
+// one lean line: `symbol (in a.ts) calls → api.post, setLoading (+N)`, ~90 chars
+function fmtCallsLine(name, rel, callees) {
+  const shown = callees.slice(0, 6).map((c) => c.name);
+  const extra = callees.length > 6 ? ` (+${callees.length - 6})` : '';
+  let line = `${name} (in ${impactBase(rel)}) calls → ${shown.join(', ')}${extra}`;
+  if (line.length > 90) line = line.slice(0, 89) + '…';
+  return line;
+}
+// what the trigger point ITSELF depends on — direct callees only (1 hop), the
+// "this button also sets loading, saves the token, redirects" a human dev
+// checks before touching it. Mirrors regressionImpact's seed collection but
+// walks forward (forwardReach) instead of backward (reverseReach).
+function callsOutImpact(graph, files) {
+  if (!graph || !graph.defs || !graph.defs.length) return '';
+  const seeds = [];
+  const seenKey = new Set();
+  for (const f of (files || []).slice(0, 6)) {
+    for (const id of (graph.fileDefs[f.rel] || [])) {
+      const d = graph.defById[id];
+      if (!d || seenKey.has(id)) continue;
+      seenKey.add(id);
+      seeds.push(d);
+    }
+  }
+  const scored = [];
+  for (const d of seeds) {
+    const callees = [...forwardReach(graph, d.id, 1, 8)]
+      .map((id) => graph.defById[id]).filter(Boolean);
+    if (callees.length) scored.push({ d, callees });
+  }
+  scored.sort((a, b) => b.callees.length - a.callees.length);
+  const lines = scored.slice(0, 8).map((s) => fmtCallsLine(s.d.name, s.d.rel, s.callees));
+  return lines.join('\n');
+}
 
 // ===== Symbol-level repository map (tree-sitter) — names only, no bodies =====
 // Spec: a lightweight overview listing ONLY symbol names per file, grouped by
@@ -1760,7 +1833,7 @@ ipcMain.handle('regression-impact', async (_e, { cwd, prompt }) => {
   try {
     if (!cwd) return { ok: true, impact: '' };
     const idx = await loadOrBuildIndex(cwd);
-    const files = retrieve(idx, prompt || '', 8);
+    const files = strongestOnly(retrieve(idx, prompt || '', 8));
     const impact = regressionImpact(getGraphForQuery(cwd), idx, files);
     ensureGraph(cwd).catch(() => {});   // warm for next time; never blocks the run
     return { ok: true, impact };
@@ -1787,7 +1860,10 @@ ipcMain.handle('codegraph-status', (_e, cwd) => {
     lastBuilt: g && g.built ? g.built : 0,
     files: g && g.defs ? g.defs.length : 0,
     broken: !!tsBroken,
-    error: tsBroken ? tsInitError : ''
+    error: tsBroken ? tsInitError : '',
+    // semantic index present? deliberately skipped as too costly to auto-build?
+    vectors: V.hasVectorIndex(indexDir(cwd)),
+    vectorsDeferred: vectorsDeferred[cwd] || 0
   };
 });
 
@@ -1849,6 +1925,7 @@ const vectorBuilding = {};
 function buildVectorsBg(cwd, graph) {
   if (!cwd || !graph || !graph.defs || !graph.defs.length) return;
   if (vectorBuilding[cwd]) return;
+  delete vectorsDeferred[cwd];   // an actual build is starting — no longer deferred
   vectorBuilding[cwd] = true;
   const total = graph.defs.length || 1;
   send('vector-progress', { cwd, done: 0, total, phase: 'build' });
@@ -1863,14 +1940,33 @@ function buildVectorsBg(cwd, graph) {
     .finally(() => { delete vectorBuilding[cwd]; });
 }
 
+// Above this many symbols a first-time build is no longer something to start
+// behind the user's back — it's minutes of sustained CPU on their laptop, so we
+// defer to an explicit click (the status bar offers it). Small projects still
+// bootstrap silently because they finish in seconds. Override with
+// LOVEAI_AUTO_EMBED_MAX (0 = never auto-build, -1 = always).
+const AUTO_EMBED_MAX = (() => {
+  const raw = parseInt(process.env.LOVEAI_AUTO_EMBED_MAX || '', 10);
+  return Number.isFinite(raw) ? raw : 2000;
+})();
+
+// projects where we chose NOT to auto-build, so the UI can offer the button
+const vectorsDeferred = {};
+
 // auto-bootstrap: RAG stayed lexical-only forever unless a user manually clicked
 // "build graph" — kick a first-time vector build once a graph is available on open.
 // No-op once an index exists (watch-sync keeps it fresh) or while one is building.
 function maybeBootstrapVectors(cwd, graph) {
   try {
     if (!cwd || !graph || !graph.defs || !graph.defs.length) return;
-    if (V.hasVectorIndex(indexDir(cwd))) return;
+    if (V.hasVectorIndex(indexDir(cwd))) { delete vectorsDeferred[cwd]; return; }
     if (vectorBuilding[cwd]) return;
+    if (AUTO_EMBED_MAX >= 0 && graph.defs.length > AUTO_EMBED_MAX) {
+      vectorsDeferred[cwd] = graph.defs.length;   // wait for an explicit build
+      send('vector-deferred', { cwd, symbols: graph.defs.length });
+      return;
+    }
+    delete vectorsDeferred[cwd];
     buildVectorsBg(cwd, graph);
   } catch {}
 }
@@ -1939,12 +2035,16 @@ ipcMain.handle('watch-files', (_e, { root, files }) => {
 ipcMain.handle('retrieve-context', async (_e, { cwd, query, k }) => {
   try {
     const idx = await loadOrBuildIndex(cwd);
-    const files = retrieve(idx, query, k || 8);
+    const files = strongestOnly(retrieve(idx, query, k || 8));
     // regression blast-radius from the cached code graph (never triggers a build here);
     // background-refresh it for next time so a cold first run still returns via fallback.
-    const impact = regressionImpact(getGraphForQuery(cwd), idx, files);
+    const graph = getGraphForQuery(cwd);
+    const impact = regressionImpact(graph, idx, files);
+    // what the trigger point ITSELF calls out to (API, state, redirect...) —
+    // the other half of a human dev's "what does this touch" check
+    const callsOut = callsOutImpact(graph, files);
     ensureGraph(cwd).catch(() => {});
-    return { ok: true, files, repoMap: repoMapFromIndex(idx, cwd), impact };
+    return { ok: true, files, repoMap: repoMapFromIndex(idx, cwd), impact, callsOut };
   } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e), files: [] }; }
 });
 
@@ -2025,6 +2125,7 @@ ipcMain.handle('vector-build', async (_e, cwd) => {
       const m = await runVectorJob(cwd, { job: 'build', dir: indexDir(cwd) },
         (d, t) => send('vector-progress', { cwd, done: d, total: t }));
       V.invalidateCache();
+      if (m && m.ok) delete vectorsDeferred[cwd];   // user built it explicitly
       send('vector-updated', { cwd, count: (m && m.count) || 0, ok: !!(m && m.ok), error: m && m.error });
       return m || { ok: false };
     } finally { delete vectorBuilding[cwd]; }
@@ -2070,18 +2171,72 @@ async function fuseRetrieval(cwd, q, k) {
   const RRF = 60, score = new Map(), meta = new Map();
   bm.forEach((f, i) => { score.set(f.rel, (score.get(f.rel) || 0) + 1 / (RRF + i)); meta.set(f.rel, f); });
   vfiles.forEach((rel, i) => { score.set(rel, (score.get(rel) || 0) + 1 / (RRF + i)); });
-  const files = [...score.keys()]
-    .sort((a, b) => score.get(b) - score.get(a))
+  const ranked = [...score.keys()].sort((a, b) => score.get(b) - score.get(a));
+  // keep only the highest-confidence hits — same "not all, only the strong
+  // ones" cutoff as strongestOnly, adapted to the RRF score map's shape
+  const top = ranked.length ? score.get(ranked[0]) : 0;
+  const strong = ranked.filter((rel) => score.get(rel) >= top * 0.4);
+  const files = (strong.length >= 3 ? strong : ranked.slice(0, 3))
     .slice(0, k || 8)
     .map((rel) => meta.get(rel) || { rel });
   return { idx, files, symbolHits };
 }
 
-// Deterministic, LLM-free context bundle for the planner: fused ranked files +
+// One-shot, tool-less text generation via the SDK — no events, just returns
+// text. Defaults to Haiku (cheap + fast). Shared by the ai-generate IPC
+// handler and anything that needs a quick LLM call without an agent loop.
+async function generateOneShot(prompt, opts = {}) {
+  await sdkReady;
+  const o = {
+    model: opts.model || 'claude-haiku-4-5-20251001',
+    cwd: opts.cwd || process.env.USERPROFILE,
+    permissionMode: 'bypassPermissions',
+    systemPrompt: opts.systemPrompt || 'You are a text generator. Reply with ONLY ' +
+      'the requested text — no preamble, no explanations, no markdown fences.',
+    settingSources: [],
+    allowedTools: [],
+    maxTurns: 6
+  };
+  if (CLAUDE_EXE) o.pathToClaudeCodeExecutable = CLAUDE_EXE;
+  let text = '';
+  for await (const msg of query({ prompt, options: o })) {
+    if (msg.type === 'assistant') {
+      for (const b of msg.message.content || []) if (b.type === 'text') text += b.text;
+    }
+  }
+  return text.trim();
+}
+
+// Distill a possibly long issue/prompt into a short, focused search query
+// before it hits fuseRetrieval — BM25 + vector search score worse against a
+// full paragraph than against the actual keywords/files/features it names.
+// Short prompts already ARE a query, so skip the extra model call for those.
+const INTENT_DISTILL_MIN_CHARS = 200;
+async function distillSearchIntent(cwd, issue) {
+  const text = String(issue || '').trim();
+  if (text.length < INTENT_DISTILL_MIN_CHARS) return text;
+  const sys = 'You extract search queries from user requests for a code search ' +
+    'index (BM25 + embeddings). Reply with ONLY space-separated keywords: ' +
+    'symbol/function/file/folder names, feature names, and error text ' +
+    'mentioned in the request. No sentences, no punctuation, max 20 words.';
+  try {
+    const q = await generateOneShot(text, { cwd, systemPrompt: sys });
+    return q || text;
+  } catch { return text; }
+}
+
+// Deterministic, LLM-free* context bundle for the planner: fused ranked files +
 // implementations of the top semantic symbols + regression impact. This is the
 // package that replaces 32 turns of agentic grep/read with one prepared payload.
+// (*retrieval itself is LLM-free — distillSearchIntent's one cheap Haiku call
+// is the only exception, and only kicks in for long, prose-y issue text.)
 async function buildPlanContext(cwd, q, opts = {}) {
-  const { idx, files, symbolHits } = await fuseRetrieval(cwd, q, opts.files || 10);
+  // classify FIRST so the token budget adapts to the task class — a tiny bug no
+  // longer assembles the same context an architecture change does. An explicit
+  // opts.budget still wins (callers can override); otherwise the class decides.
+  const task = classifyTask(q);
+  const searchQuery = await distillSearchIntent(cwd, q);
+  const { idx, files, symbolHits } = await fuseRetrieval(cwd, searchQuery, opts.files || 10);
   const graph = getGraphForQuery(cwd);
   const cache = new Map();
   const parts = [];
@@ -2090,7 +2245,7 @@ async function buildPlanContext(cwd, q, opts = {}) {
   if (graph && graph.defById && symbolHits.length) {
     const seen = new Set();
     const blocks = [];
-    let budget = opts.budget || 16000;
+    let budget = opts.budget || task.charBudget;
     for (const h of symbolHits) {
       if (budget <= 0) break;
       const d = graph.defById[h.id];
@@ -2104,11 +2259,39 @@ async function buildPlanContext(cwd, q, opts = {}) {
       blocks.push(block);
     }
     if (blocks.length) parts.push('KEY SYMBOLS (implementations):\n' + blocks.join('\n\n'));
+    // what each key symbol calls out to (API calls, state setters, redirects,
+    // ...) — the "what else does this touch" a human dev checks before editing
+    const callsLines = [];
+    for (const id of seen) {
+      const d = graph.defById[id];
+      const callees = [...forwardReach(graph, id, 1, 8)]
+        .map((nid) => graph.defById[nid]).filter(Boolean);
+      if (callees.length) callsLines.push(fmtCallsLine(d.name, d.rel, callees));
+    }
+    if (callsLines.length) {
+      parts.push('CALLS OUT TO (what the trigger point itself depends on):\n' + callsLines.join('\n'));
+    }
   }
   const impact = regressionImpact(graph, idx, files);
   if (impact) parts.push('REGRESSION IMPACT (who references what you may change):\n' + impact);
   const text = parts.join('\n\n');
-  return { text, files: files.map((f) => f.rel), chars: text.length };
+  return {
+    text,
+    files: files.map((f) => f.rel),
+    chars: text.length,
+    retrieval: {
+      query: searchQuery,
+      issue: q,
+      taskType: task.type,
+      tokenBudget: task.tokenBudget,
+      charBudget: opts.budget || task.charBudget,
+      filesFound: files.length,
+      symbolsFound: symbolHits.length,
+      filesMatched: files.slice(0, 5).map((f) => ({ path: f.rel })),
+      symbols: symbolHits.slice(0, 12).map((h) => ({ id: h.id, score: h.score }))
+    },
+    impactLines: impact ? impact.split('\n').filter(Boolean) : []
+  };
 }
 
 // expose the deterministic bundle on its own (preview / debugging / renderer reuse)
@@ -3365,34 +3548,28 @@ ipcMain.handle('agent-stop', (_e, runId) => {
 // one-shot text generation (commit messages, PR descriptions) — no tools, no
 // events, returns just the text. Cheap + quiet (defaults to Haiku).
 ipcMain.handle('ai-generate', async (_e, { prompt, model, cwd }) => {
-  await sdkReady;
-  try {
-    const opts = {
-      model: model || 'claude-haiku-4-5-20251001',
-      cwd: cwd || process.env.USERPROFILE,
-      permissionMode: 'bypassPermissions',
-      // NOT the claude_code preset: that system prompt costs ~10k+ tokens and
-      // buys nothing here — this path is tool-less one-shot text generation
-      // (commit messages, PR bodies, fix routing), so a tiny prompt suffices.
-      systemPrompt: 'You are a text generator. Reply with ONLY the requested ' +
-        'text — no preamble, no explanations, no markdown fences.',
-      settingSources: [],
-      // pure text-gen: forbid ALL tools so it can't try to explore the repo and
-      // burn turns (that caused "reached maximum number of turns"). One-shot.
-      allowedTools: [],
-      maxTurns: 6
-    };
-    if (CLAUDE_EXE) opts.pathToClaudeCodeExecutable = CLAUDE_EXE;
-    let text = '';
-    for await (const msg of query({ prompt, options: opts })) {
-      if (msg.type === 'assistant') {
-        for (const b of msg.message.content || []) if (b.type === 'text') text += b.text;
-      }
-    }
-    return { ok: true, text: text.trim() };
-  } catch (e) {
-    return { ok: false, error: String(e && e.message ? e.message : e) };
-  }
+  try { return { ok: true, text: await generateOneShot(prompt, { model, cwd }) }; }
+  catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+
+// ---- global dictionary store (word lists + learning engine) ----
+// The renderer hydrates its in-memory stop-word Sets from here at boot and
+// streams new tokens back so the lists stay current. See dictionary.js.
+ipcMain.handle('dict-get', (_e, category) => {
+  try { return { ok: true, words: dictStore.words(category) }; }
+  catch (e) { return { ok: false, error: String(e && e.message || e), words: [] }; }
+});
+ipcMain.handle('dict-learn', (_e, { category, tokens }) => {
+  try { return { ok: true, promoted: dictStore.learn(category, tokens) }; }
+  catch (e) { return { ok: false, error: String(e && e.message || e), promoted: [] }; }
+});
+ipcMain.handle('dict-stats', (_e, category) => {
+  try { return { ok: true, stats: dictStore.stats(category) }; }
+  catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+});
+ipcMain.handle('dict-reset', (_e, category) => {
+  try { return { ok: dictStore.reset(category) }; }
+  catch (e) { return { ok: false, error: String(e && e.message || e) }; }
 });
 
 // ============================================================
@@ -3507,7 +3684,7 @@ function buildDeckServer(cwd) {
     async (args) => {
       try {
         const idx = await loadOrBuildIndex(cwd);
-        const files = retrieve(idx, args.query, 8);
+        const files = strongestOnly(retrieve(idx, args.query, 8));
         const impact = regressionImpact(getGraphForQuery(cwd), idx, files);
         ensureGraph(cwd).catch(() => {});
         return deckToolText(impact && impact.trim()
@@ -3533,10 +3710,106 @@ function buildDeckServer(cwd) {
     RO
   );
 
+  // ===== execution-first gates — the policy as tools, not prose ===========
+  // The four tools above cover DISCOVERY. These two impose the execution-first
+  // DISCIPLINE: a front gate that forces a root-cause + whole-workflow plan
+  // before editing, and a back gate that refuses to call a task done without
+  // validation. They have no side effects (readOnly) — they reflect structured
+  // judgement back to the agent so it commits and finishes instead of drifting.
+
+  const executionPlan = sdkTool(
+    'execution_plan',
+    'FRONT GATE — call this ONCE, right after discovery narrows the area and ' +
+    'BEFORE editing. Locks in an execution-first plan: the real root cause, ' +
+    'the WHOLE workflow to change (never one isolated line), and how each ' +
+    'change gets validated. Investigation exists only to enable this — once ' +
+    'confidence is ~80%+, stop searching and plan. Returns the plan plus the ' +
+    'Definition-of-Done to run done_check against at the end.',
+    {
+      root_cause: z.string()
+        .describe('The ACTUAL root cause, not a symptom. What truly makes the request needed.'),
+      workflow: z.array(z.string()).min(1)
+        .describe('Every file/step to change for the COMPLETE workflow — path builders, ' +
+          'constants, config, gitignore, history load/save, init, migration, tests. ' +
+          'A one-item list usually means you have not thought in workflows yet.'),
+      validation: z.array(z.string()).min(1)
+        .describe('How each change is proven: behavior, data flow, filesystem, config, ' +
+          'backwards-compat, expected output.')
+    },
+    async (args) => {
+      try {
+        const steps = (args.workflow || []).map((s, i) => `  ${i + 1}. ${s}`).join('\n');
+        const checks = (args.validation || []).map(s => `  - ${s}`).join('\n');
+        const thin = (args.workflow || []).length < 2
+          ? '\n\n[WARNING] Single-step workflow — most real fixes touch several ' +
+            'sites (constants, callers, config, gitignore, migration, tests). ' +
+            'Re-scan with search_code / who_references before you settle for one edit.'
+          : '';
+        return deckToolText(
+          `ROOT CAUSE:\n  ${args.root_cause}\n\n` +
+          `WORKFLOW TO IMPLEMENT (all of it, not one line):\n${steps}\n\n` +
+          `VALIDATION PLAN:\n${checks}${thin}\n\n` +
+          'BEGIN IMPLEMENTING NOW — do not gather more evidence for a decision ' +
+          'that is already ~80% clear. When finished, call done_check and pass ' +
+          'only when every gate is true with concrete evidence.');
+      } catch (e) { return deckToolErr('execution_plan failed: ' + (e && e.message ? e.message : e)); }
+    },
+    RO
+  );
+
+  const doneCheck = sdkTool(
+    'done_check',
+    'BACK GATE — call this BEFORE telling the operator the task is complete. ' +
+    'It scores the work against the Definition of Done and returns DONE only ' +
+    'when every gate is true AND backed by concrete evidence. A NOT DONE ' +
+    'verdict means keep working — you own the task until the outcome is real, ' +
+    'not until the bug is merely located. Finding the problem is not success; ' +
+    'fixing and validating it is.',
+    {
+      root_cause_identified: z.boolean().describe('The real cause was found, not a symptom'),
+      code_implemented: z.boolean().describe('The fix is actually written in the files'),
+      workflow_updated: z.boolean()
+        .describe('Every related site changed — all occurrences, callers, config, not one line'),
+      validation_done: z.boolean().describe('Behavior/output was actually verified, not assumed'),
+      regressions_checked: z.boolean().describe('No obvious regressions introduced'),
+      outcome_achieved: z.boolean().describe('The operator\'s requested outcome is genuinely met'),
+      evidence: z.string()
+        .describe('Concrete proof: test/command output, files changed, behavior observed')
+    },
+    async (args) => {
+      try {
+        const gates = [
+          ['root cause identified', args.root_cause_identified],
+          ['code implemented', args.code_implemented],
+          ['whole workflow updated', args.workflow_updated],
+          ['validation completed', args.validation_done],
+          ['regressions checked', args.regressions_checked],
+          ['requested outcome achieved', args.outcome_achieved]
+        ];
+        const failed = gates.filter(([, ok]) => !ok).map(([label]) => label);
+        const noEvidence = !args.evidence || !String(args.evidence).trim();
+        if (failed.length || noEvidence) {
+          const reasons = failed.map(l => `  ✗ ${l}`);
+          if (noEvidence) reasons.push('  ✗ no concrete evidence supplied');
+          return deckToolText(
+            'NOT DONE — keep working. Unmet gates:\n' + reasons.join('\n') +
+            '\n\nDo not stop and do not report success. Resolve each gate, ' +
+            're-validate, then call done_check again.');
+        }
+        const passed = gates.map(([l]) => `  ✓ ${l}`).join('\n');
+        return deckToolText(
+          'DONE — all gates satisfied:\n' + passed +
+          '\n\nEVIDENCE:\n  ' + String(args.evidence).trim() +
+          '\n\nYou may report completion.');
+      } catch (e) { return deckToolErr('done_check failed: ' + (e && e.message ? e.message : e)); }
+    },
+    RO
+  );
+
   return createSdkMcpServer({
     name: 'deck',
     version: '1.0.0',
-    tools: [searchCode, getSymbols, whoReferences, topicMemory]
+    tools: [searchCode, getSymbols, whoReferences, topicMemory, executionPlan, doneCheck]
   });
 }
 
@@ -3802,12 +4075,20 @@ ipcMain.handle('agent-run', async (_e, cfg) => {
     try {
       if (tool === 'Write') return [1];
       const file = input.file_path || input.path || '';
-      const txt = fs.readFileSync(file, 'utf8');
+      let txt = fs.readFileSync(file, 'utf8');
       const edits = (tool === 'MultiEdit' && Array.isArray(input.edits))
         ? input.edits : [input];
+      // MultiEdit hunks apply sequentially, so each hunk's real line must be
+      // located against the text as left by the hunks before it — searching
+      // the original unmodified file for every hunk can match a stale/earlier
+      // occurrence of old_string and report the wrong line.
       return edits.map(e => {
         const ln = hunkLine(txt, e.old_string);
-        return ln !== null ? ln : hunkLine(txt, e.new_string);
+        const result = ln !== null ? ln : hunkLine(txt, e.new_string);
+        if (e.old_string && txt.includes(e.old_string)) {
+          txt = txt.replace(e.old_string, e.new_string);
+        }
+        return result;
       });
     } catch { return null; }
   }

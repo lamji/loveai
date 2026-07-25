@@ -813,6 +813,9 @@ render();
 [...workspaces].reverse().forEach(w => { if (w.path) addRecentFolder(w.path); });
 renderRail();
 renderWelcome();
+// land on the active project's latest chat (hydrating its stored session
+// logs) instead of an empty draft — same landing rule as a project switch
+autoOpenProjectChat();
 setStage(null);
 
 // on load: if a project is already imported, ensure its map (cached under

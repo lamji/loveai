@@ -1,6 +1,6 @@
 {
   "name": "loveai",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "LoveAi — futuristic multi-agent desktop console for Claude Code",
   "author": "Anthropic",
   "main": "main.js",
@@ -32,9 +32,14 @@
       "main.js",
       "preload.js",
       "auth.js",
+      "dictionary.js",
       "config.js",
       "vectors.js",
       "vectors-worker.js",
+      "walker.js",
+      "codegraph-parse.js",
+      "codegraph-worker.js",
+      "src/**/*",
       "renderer/**/*",
       "node_modules/**/*"
     ],

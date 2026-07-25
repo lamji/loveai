@@ -1,8 +1,17 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
+// deterministic task classifier → adaptive front-load caps. Pure, synchronous
+// (no IPC): the renderer classifies the request locally to decide how much
+// context to inject at spawn time. Single source of truth with main.js.
+const { classifyTask } = require('./src/retrieval/classifier');
 
 contextBridge.exposeInMainWorld('deck', {
   runAgent: (cfg) => ipcRenderer.invoke('agent-run', cfg),
+  classifyTask: (issue) => classifyTask(issue),
   aiGenerate: (prompt, model, cwd) => ipcRenderer.invoke('ai-generate', { prompt, model, cwd }),
+  dictGet: (category) => ipcRenderer.invoke('dict-get', category),
+  dictLearn: (category, tokens) => ipcRenderer.invoke('dict-learn', { category, tokens }),
+  dictStats: (category) => ipcRenderer.invoke('dict-stats', category),
+  dictReset: (category) => ipcRenderer.invoke('dict-reset', category),
   stopAgent: (runId) => ipcRenderer.invoke('agent-stop', runId),
   pickFolder: () => ipcRenderer.invoke('pick-folder'),
   pickFiles: (images) => ipcRenderer.invoke('pick-files', { images }),
@@ -87,6 +96,7 @@ contextBridge.exposeInMainWorld('deck', {
   vectorQuery: (cwd, query, k) => ipcRenderer.invoke('vector-query', { cwd, query, k }),
   onVectorProgress: (cb) => ipcRenderer.on('vector-progress', (_e, p) => cb(p)),
   onVectorUpdated: (cb) => ipcRenderer.on('vector-updated', (_e, p) => cb(p)),
+  onVectorDeferred: (cb) => ipcRenderer.on('vector-deferred', (_e, p) => cb(p)),
   planContext: (cwd, issue) => ipcRenderer.invoke('plan-context', { cwd, issue }),
   planGenerate: (cwd, issue, model, effort) =>
     ipcRenderer.invoke('plan-generate', { cwd, issue, model, effort }),
@@ -112,6 +122,8 @@ contextBridge.exposeInMainWorld('deck', {
   saasSettingsSet: (s) => ipcRenderer.invoke('saas-settings-set', s),
   saasRosterGet: () => ipcRenderer.invoke('saas-roster-get'),
   saasRosterSet: (a) => ipcRenderer.invoke('saas-roster-set', a),
+  saasWorkspacesGet: () => ipcRenderer.invoke('saas-workspaces-get'),
+  saasWorkspacesSet: (w) => ipcRenderer.invoke('saas-workspaces-set', w),
   listFiles: (root) => ipcRenderer.invoke('list-files', root),
   watchFiles: (root, files) => ipcRenderer.invoke('watch-files', { root, files }),
   onFileDiskChange: (cb) => ipcRenderer.on('file-disk-change', (_e, p) => cb(p)),

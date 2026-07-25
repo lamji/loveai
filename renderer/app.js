@@ -10,6 +10,8 @@ CONTEXT DISCIPLINE (binding):
 - If .loveai/index/PROJECT-MAP.md exists, trust it for orientation instead of exploring.
 - No speculative web searches. Don't paste back full file contents or dump large code blocks.
 - CODE STYLE: keep lines SHORT and readable — no long lines (aim <= ~100 chars). Break long statements across lines, pull complex expressions into named variables, and extract helpers instead of writing one giant line/function. Match the file's existing formatting.
+- REGRESSION-AWARE EDITS: before changing a function/symbol, check the REGRESSION IMPACT (who calls/imports it) and CALLS OUT TO (what it calls) sections if present in your context. If it's reused elsewhere, keep the change minimal/backward-compatible or flag the conflict instead of breaking callers.
+- VERIFY BEFORE DONE: no dead code, no unused imports/vars/functions, no leftover fragments (half-applied renames, orphaned branches) from your own edit.
 - DO THE WORK YOURSELF. Never delegate via the Task/Agent tool and never invoke the project's own subagents (its .claude/agents) — you ARE the engineer for this pipeline.
 - Keep the reply focused, but ALWAYS explain your reasoning and decisions clearly — state what you did, what you found, and WHY. The operator reads this reply; never go silent or reply with just a status word.
 - TOPIC MEMORY (shared brain at .loveai/memory/topics/<topic>.md, one file per feature): relevant topic(s) are inlined in your prompt. Trust fresh memory; for a [STALE] topic re-read ONLY its listed changed files. AFTER your work, if you touched or learned a feature's flow, create/update its topic file — Line1 "# <topic>", Line2 "keywords: ...", Line3 "files: <exact project-relative paths the feature depends on>", blank line, then a dot-by-dot flow (entry points, paths, key functions, steps, gotchas). Keep it ONE feature, <= ~150 lines, deduped; update the files: list when you change what the feature spans. This is how the whole team avoids re-exploring next time.`;
@@ -50,11 +52,13 @@ IMPLEMENT-MODEL: claude-haiku-4-5-20251001 | claude-sonnet-5 | claude-opus-4-8
 JOB:
 1. "execute task-NN-..." → read that file in .loveai/pipeline/ and follow it LITERALLY. Its CONTEXT is complete — do not re-explore.
 2. NO OVERSCOPING: touch only SCOPE files. Problems outside scope go in your final summary, not in code.
-3. Do the TO-DO in order; verify ACCEPTANCE CRITERIA before finishing.
-4. Append to .loveai/pipeline/changes-log.md: task file, files changed, how verified.
-5. "fix review findings" → read review-findings.md, fix ONLY findings for your files, update changes-log.md.
-6. If the task file is ambiguous or forces overscoping, stop and report instead of guessing.
-7. If you change a file's responsibility, update its PROJECT-MAP.md section.${DISCIPLINE}`,
+3. BEFORE editing a function/symbol: check the CONTEXT's REGRESSION IMPACT (who calls/imports it) and CALLS OUT TO (what it calls) sections. If it's reused elsewhere, keep the change minimal/backward-compatible or flag the conflict instead of breaking callers.
+4. Do the TO-DO in order; verify ACCEPTANCE CRITERIA before finishing.
+5. VERIFY before declaring done: no dead code, no unused imports/vars/functions, no leftover fragments (half-applied renames, orphaned branches) from your own edit.
+6. Append to .loveai/pipeline/changes-log.md: task file, files changed, how verified.
+7. "fix review findings" → read review-findings.md, fix ONLY findings for your files, update changes-log.md.
+8. If the task file is ambiguous or forces overscoping, stop and report instead of guessing.
+9. If you change a file's responsibility, update its PROJECT-MAP.md section.${DISCIPLINE}`,
 
   indexer: `You are the PROJECT INDEXER. Read the codebase (skip node_modules, dist, .git, .loveai) and write .loveai/index/PROJECT-MAP.md: purpose, tech stack, architecture, module map with EXACT paths + each file's responsibilities/key symbols, data flow, entry points, conventions. Max ~400 lines. Given a changed-file list, update ONLY affected sections in place. Never modify source; write only inside .loveai/index/.${DISCIPLINE}`,
 
@@ -72,7 +76,7 @@ CODE RULES (strict):
 - NO LONG CODE: functions <= ~40 lines, components/files <= ~250 lines, lines <= 120 chars — split into smaller components/helpers instead.
 - Reuse existing components/tokens before creating new ones; delete dead styles you replace.
 
-PIPELINE CONTRACT (same as Senior Engineer): "execute task-NN-..." → read the file in .loveai/pipeline/, follow it literally, no overscoping, append to changes-log.md when done; "fix review findings" → fix only your findings. If a request lacks design direction, choose the modern option and state your choice in one line.${DISCIPLINE}`,
+PIPELINE CONTRACT (same as Senior Engineer): "execute task-NN-..." → read the file in .loveai/pipeline/, follow it literally, no overscoping; before editing a shared component/token check the CONTEXT's REGRESSION IMPACT/CALLS OUT TO sections for who else uses it; verify no dead code/unused imports before declaring done; append to changes-log.md when done; "fix review findings" → fix only your findings. If a request lacks design direction, choose the modern option and state your choice in one line.${DISCIPLINE}`,
 
   reviewer: `You are the REVIEWER, final gate of the pipeline.
 
@@ -252,7 +256,11 @@ function normalizeRoster(roster) {
         if (legacy.model && existing.model === legacy.model) existing.model = d.model;
       }
     } else {
-      kept.push({ ...d, defId: d.id });
+      // suffix like freshRoster() so a backfilled default never shares its
+      // id with another workspace's copy — rt/agentWs/streamEls are keyed
+      // by agent id alone, so duplicate ids leak running state and console
+      // output across projects. defId keeps its managed identity.
+      kept.push({ ...d, id: d.id + '-' + uid(), defId: d.id });
     }
   }
   // agents saved by earlier builds have no lean flag — default by role
@@ -339,6 +347,8 @@ const rt = {};
 let editingId = null;
 let feedFilter = null; // agentId or null = all
 const streamEls = {};  // agentId -> current streaming feed element
+const streamMdPending = {}; // agentId -> live markdown re-render scheduled for next frame
+const streamMdCache = {};   // agentId -> text last rendered to markdown (memo guard)
 const toolRowEls = {}; // tool_use id -> its console row, so its result chip lands there
 const runDoneCallbacks = {};  // runId -> one-shot (result, finalText) callback
 const runEventSinks = {};     // runId -> per-event sink (streams a run into a modal)
@@ -372,6 +382,7 @@ function pinFeedToBottom() {
 
 // ---- Phase 3: route each run's output to the project that owns it ----
 const feedBuf = {};   // wsId -> detached <div> holding that project's .ev nodes
+const chatFeedBuf = {}; // chatId -> detached <div> holding that chat's .ev nodes
 const runWs = {};     // runId  -> wsId that started the run
 const agentWs = {};   // agentId -> wsId (set when a run starts; survives cleanup)
 
@@ -400,14 +411,25 @@ function getFeedBuf(wsId) {
   if (!feedBuf[wsId]) feedBuf[wsId] = document.createElement('div');
   return feedBuf[wsId];
 }
+// the detached buffer div for a chat (created on first use)
+function getChatBuf(chatId) {
+  if (!chatFeedBuf[chatId]) chatFeedBuf[chatId] = document.createElement('div');
+  return chatFeedBuf[chatId];
+}
 // the container a project's output should append to: the visible feed when
 // it's the active project, otherwise its off-screen buffer.
 function feedElForWs(wsId) {
   return wsId === activeWorkspaceId ? consoleFeed : getFeedBuf(wsId);
 }
 // the container an agent's output should append to: the visible feed when its
-// project is active, otherwise that project's off-screen buffer.
+// project is active AND it's the active chat (if a chat agent), otherwise its
+// off-screen buffer.
 function feedElFor(agentId) {
+  // chat agents (data-agent='chat-*') get their own isolated buffers
+  if (agentId.startsWith('chat-')) {
+    const chatId = agentId.slice('chat-'.length);
+    return chatId === activeChatId ? feedElForWs(wsForAgent(agentId)) : getChatBuf(chatId);
+  }
   return feedElForWs(wsForAgent(agentId));
 }
 
@@ -647,13 +669,19 @@ function chatOnDone(chat) {
 // open a chat in the center dock (reuses the roster dock, minus the close btn)
 function openChatUI(chat) {
   activeChatId = chat.id;
+  // recency stamp: the chat you focused last is the project's "latest" —
+  // it becomes the default landing chat when this project is re-activated
+  chat.lastAt = Date.now();
+  saveChats();
   ensureChatAgent(chat);
   // replay the chat's stored transcript when its live feed is empty (post
   // app-restart) — openChatSession opens the dock view itself, async replay.
-  // Fall back to the project's shared deck session: sdkSessionId is only
-  // captured when a run completes (chatOnDone), so older/interrupted chats
-  // have null and would land on a blank console.
-  openChatSession('chat-' + chat.id, chat.sdkSessionId || getSession());
+  // ONLY this chat's own session: sdkSessionId is persisted at 'init' now
+  // (sendChatDispatch onSession), so any chat that ever ran has one. The old
+  // fallback to the shared deck session (getSession()) replayed whatever ran
+  // LAST anywhere in the project into a fresh chat's console — mixed-up logs.
+  // A chat with no session of its own correctly starts on an empty feed.
+  openChatSession('chat-' + chat.id, chat.sdkSessionId);
   // AUTO PIPELINE fans a chat out across many real agent ids (indexer, PE,
   // senior, reviewer...), never the chat's own hidden 'chat-<id>' agent —
   // openChatSession just filtered the console down to that lone id, which
@@ -678,6 +706,8 @@ function sendChatMessage(text) {
 // route a chat's message: AUTO PIPELINE → launchPipeline, else the chat's own
 // isolated agent (resuming only that chat's session). PLAN comes from the chat.
 function sendChatDispatch(chat, text) {
+  chat.lastAt = Date.now();   // sending keeps this chat the project's latest
+  saveChats();
   if (chat.target === '__pipeline__') {
     if (pipeFor(activeWorkspaceId).active) {
       plog('err', 'pipeline already running for this project — abort it first.');
@@ -725,6 +755,35 @@ function createChatFromText(titleText, message) {
   openChatUI(chat);
   activeChatId = chat.id;
   sendChatDispatch(chat, message || titleText);
+}
+
+// which chat a project should land on when it becomes active:
+// the most recently STARTED running chat when any are in flight (two runs
+// in parallel → the latest one wins), else the most recently used chat.
+// Returns null when the project has no chats yet (draft stays).
+function defaultChatFor() {
+  const chats = chatList();
+  if (!chats.length) return null;
+  // pipeline chats never run on their own 'chat-<id>' agent — the pipeline's
+  // active flag is their run state
+  const pipeActive = pipeFor(activeWorkspaceId).active;
+  const isRunning = c => R('chat-' + c.id).running
+    || (pipeActive && c.target === '__pipeline__');
+  const lastUsed = c => c.lastAt || c.createdAt || 0;
+  const startedAt = c => R('chat-' + c.id).startedAt || lastUsed(c);
+  const pool = chats.filter(isRunning);
+  const rank = pool.length ? startedAt : lastUsed;
+  return (pool.length ? pool : chats)
+    .reduce((a, b) => (rank(b) > rank(a) ? b : a));
+}
+
+// landing view for a freshly-activated project: focus its default chat —
+// marked active in the chat list, its session logs in the console — instead
+// of the empty draft chatbox. Draft only when the project has no chats.
+function autoOpenProjectChat() {
+  if (!projectDir) return;             // Welcome screen — nothing to open
+  const chat = defaultChatFor();
+  if (chat) openChatUI(chat);
 }
 
 // ---- New Chat: ChatGPT-style — no modal, just open an empty draft. The
@@ -922,7 +981,10 @@ function feed(agentId, cls, text, ico, sameLine = false) {
   const el = document.createElement('div');
   el.className = 'ev';
   el.dataset.agent = agentId;
-  el.innerHTML = `<span class="tag">${esc(a ? a.name : '?')}</span><span class="ico">${ico || ''}</span><span class="body ${cls}"></span>`;
+  // icon slot kept (16px) for row alignment, but emoji glyphs are suppressed —
+  // the operator asked for a clean, icon-free main chat. `ico` is intentionally
+  // not rendered; callers still pass it harmlessly.
+  el.innerHTML = `<span class="tag">${esc(a ? a.name : '?')}</span><span class="ico"></span><span class="body ${cls}"></span>`;
   el.querySelector('.body').textContent = text;
   if (feedFilter && feedFilter !== agentId) el.style.display = 'none';
   cont.appendChild(el);
@@ -932,10 +994,32 @@ function feed(agentId, cls, text, ico, sameLine = false) {
   return el;
 }
 
+// live markdown re-render while a response streams in. Throttled to one
+// parse per animation frame and memoized against the last-rendered text, so
+// a burst of deltas re-renders the growing message once per paint instead of
+// once per token — without this it reads like raw markdown syntax scrolling
+// by (a log) rather than formatted text while it's being written.
+function scheduleMdRender(agentId) {
+  if (streamMdPending[agentId]) return;
+  streamMdPending[agentId] = true;
+  requestAnimationFrame(() => {
+    streamMdPending[agentId] = false;
+    const s = streamEls[agentId];
+    const bodyEl = s && s.parentNode && s.querySelector('.body');
+    if (!bodyEl) return;
+    const src = R(agentId).lastText || '';
+    if (streamMdCache[agentId] === src) return;
+    streamMdCache[agentId] = src;
+    bodyEl.innerHTML = renderMarkdown(src);
+    bodyEl.classList.add('md-body');
+  });
+}
+
 function endStream(agentId) {
   const s = streamEls[agentId];
   if (s) s.classList.remove('streaming');   // drop the live typing caret
   delete streamEls[agentId];
+  delete streamMdCache[agentId];
 }
 
 // THINKING MODE — a live animated row at the bottom of the feed shown whenever
@@ -1310,7 +1394,11 @@ let lastBusy = null;
 
 function anyBusy() {
   const p = pipelines.get(activeWorkspaceId);
-  return (p && p.active) || agents.some(a => R(a.id).running);
+  // a pipeline PAUSED at plan review isn't working — nothing is running,
+  // it's waiting on the operator. Counting it as busy kept forcing the
+  // console pane onto the screen for as long as the plan sat unreviewed.
+  const pipeWorking = !!(p && p.active && p.stage !== 'plan');
+  return pipeWorking || agents.some(a => R(a.id).running);
 }
 
 function syncPane() {
@@ -1422,6 +1510,48 @@ function withTimeout(promise, ms, fallback) {
     Promise.resolve(promise).catch(() => fallback),
     guard,
   ]).finally(() => clearTimeout(t));
+}
+
+// Filler words that add nothing to a code search — dropping them stops a long,
+// chatty message from drowning the actual identifiers/features under BM25.
+const INTENT_STOP = new Set([
+  'the','a','an','is','are','was','were','be','been','being','it','its','this',
+  'that','these','those','i','you','we','they','he','she','me','my','your','our',
+  'and','or','but','if','then','else','so','because','as','of','to','in','on','at',
+  'for','from','with','without','by','into','onto','over','under','off','out','up',
+  'down','here','there','where','when','how','what','which','who','why','again',
+  'also','just','only','very','really','still','not','no','yes','do','does','did',
+  'done','can','could','should','would','will','shall','may','might','must','have',
+  'has','had','get','got','see','look','looking','want','need','make','made','use',
+  'using','please','fucking','shit','thing','stuff','etc','example','another','some',
+  'any','all','each','both','more','most','than','about','like','okay','ok','now',
+  'them','they','their','view','read','open','attached','file','files','disk'
+]);
+
+// LOCAL, LLM-FREE intent distillation — instant and always available. Keeps the
+// code-ish tokens (paths, camelCase, dotted names, identifiers) and strips
+// conversational filler, so even when the model refine below times out the RAG
+// query is the keywords the user meant — NOT the whole misspelled paragraph.
+function localIntentQuery(text) {
+  const raw = String(text || '');
+  const seen = new Set();
+  const kept = [];
+  for (let tok of raw.split(/\s+/)) {
+    // trim surrounding punctuation but keep inner . / _ - (paths, snake_case)
+    tok = tok.replace(/^[^\w./-]+|[^\w./-]+$/g, '');
+    if (!tok) continue;
+    const low = tok.toLowerCase();
+    const codeish = /[/._]/.test(tok) || /[a-z][A-Z]/.test(tok) || /\d/.test(tok);
+    if (!codeish) {
+      if (tok.length < 3 || INTENT_STOP.has(low)) continue;
+    }
+    if (seen.has(low)) continue;
+    seen.add(low);
+    kept.push(tok);
+    if (kept.length >= 20) break;
+  }
+  // if stripping ate everything (all filler / very short), keep the original
+  return kept.length ? kept.join(' ') : raw.trim();
 }
 
 // ===== Retrieval eval (hit@k) — closes the measurement loop =====
@@ -1538,6 +1668,13 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   r.evalPredicted = null;
   r.evalQuery = rq;
   let fullPrompt = prompt;
+  // ADAPTIVE FRONT-LOAD — classify the request so a tiny bug injects a lean map
+  // (few files, no whole-repo survey, one-line tool hint) while a feature or
+  // architecture task still gets the full context. Deterministic + synchronous
+  // (no IPC — runs in preload). inj holds the concrete caps used below.
+  const task = cwd ? window.deck.classifyTask(rq) : null;
+  const inj = (task && task.inject)
+    || { files: 12, semantic: 12, repoMap: true, repoMapDirs: 30, tools: 'full' };
   const prepT0 = performance.now();   // how long context assembly holds the spawn
   // ---- COLD-RUN ENRICHMENT, kicked off in PARALLEL ----
   // These lookups (map check, topic memory, regression impact, lexical
@@ -1558,12 +1695,42 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
     ? withTimeout(memoryInject(cwd, rq), 2000, '') : null;
   const pImp = (!warm && !isIdx && !heavyRole && cwd)
     ? withTimeout(window.deck.regressionImpact(cwd, rq), 3000, null) : null;
+  // SMART QUERY — a long free-form issue/prompt dilutes BM25 + vector search
+  // (every filler word competes with the actual intent), so distill it into a
+  // short, focused query via a fast model BEFORE the RAG front-load fires.
+  // Short prompts already ARE a query — skip the extra call for those. Only
+  // the heavy roles hit the RAG front-load below, so only they pay for this.
+  // Baseline is the LOCAL distill (instant, always runs) — never the raw
+  // paragraph. The model call below only REFINES it; if it times out or the
+  // worker is busy, we still search on clean keywords, not the whole message.
+  let ragQuery = frontLoad && rq.length > 200 ? localIntentQuery(rq) : rq;
+  const ragWs = frontLoad ? wsForAgent(agentId) : null;
+  if (frontLoad && rq.length > 200) {
+    feedRaw('RAG', 'sys', `Intent → "${ragQuery}"`, '', ragWs);
+    // feed the surviving tokens to the global engine — recurring non-code filler
+    // gets promoted into the stop list over time so it stops diluting search.
+    try { window.deck.dictLearn('intent', ragQuery.split(' ')).catch(() => {}); } catch {}
+    try {
+      const intent = await withTimeout(
+        window.deck.aiGenerate(
+          'Extract a focused search query from this request, for a code search ' +
+          'index (BM25 + embeddings). Reply with ONLY space-separated keywords: ' +
+          'symbol/function/file/folder names, feature names, and error text ' +
+          'mentioned. No sentences, no punctuation, max 20 words.\n\nREQUEST:\n' + rq,
+          'claude-haiku-4-5-20251001', cwd),
+        9000, null);
+      if (intent && intent.ok && intent.text && intent.text.trim()) {
+        ragQuery = intent.text.trim();
+        feedRaw('RAG', 'sys', `Intent (AI) → "${ragQuery}"`, '', ragWs);
+      }
+    } catch {}
+  }
   // withContent=0: the push is a MAP now (file names + symbols), never code —
   // the agent PULLS code mid-task via the mcp__deck__* retrieval tools
   const pCtx = frontLoad
-    ? withTimeout(window.deck.retrieveContext(cwd, rq, 12), 3500, null) : null;
+    ? withTimeout(window.deck.retrieveContext(cwd, ragQuery, 12), 3500, null) : null;
   const pVec = frontLoad
-    ? withTimeout(window.deck.vectorQuery(cwd, rq, 20), 3500, null) : null;
+    ? withTimeout(window.deck.vectorQuery(cwd, ragQuery, 20), 3500, null) : null;
 
   if (pMap && await pMap) {
     fullPrompt += '\n\nOrientation: read .loveai/index/PROJECT-MAP.md first and open only the files relevant to this task — do not survey the repo.';
@@ -1620,7 +1787,7 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
       // vectors already exist just loops them (build succeeds, query still empty).
       let ragMsg;
       if (vhits.length) {
-        ragMsg = `RAG query → "${rq.replace(/\s+/g, ' ').slice(0, 70)}" · ` +
+        ragMsg = `RAG query → "${ragQuery.replace(/\s+/g, ' ').slice(0, 70)}" · ` +
           `${vhits.length} semantic hits · top: ${vTopFiles.join(', ')}`;
       } else if (vq && vq.indexed && vq.embedErr) {
         ragMsg = `RAG: vector index exists but the embedder won't load ` +
@@ -1642,7 +1809,7 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
             `(build the graph to enable semantic retrieval)`;
         }
       }
-      feed(agentId, 'sys', ragMsg, '🧬');
+      feedRaw('RAG', 'sys', ragMsg, '', ragWs);
       if (rc.ok && rc.files && rc.files.length) {
         // fold semantic-only files into the ranked list so they're surfaced too
         const haveRel = new Set(rc.files.map(f => f.rel));
@@ -1656,18 +1823,24 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
         // names + symbols, never code. The heavy context (symbol packs, file
         // contents, blast radius) is PULLED by the agent mid-task via the
         // in-process mcp__deck__* tools, when it knows what it actually needs.
-        // 1) repo map for orientation
-        if (rc.repoMap) {
-          fullPrompt += `\n\nREPO MAP (directories by file count + notable files — use this for orientation instead of exploring):\n${rc.repoMap}`;
+        // 1) repo map for orientation — the single biggest front-load chunk, and
+        // pure noise for a targeted bug/config/docs task where the ranked files
+        // below already pinpoint the code. Injected (trimmed to the task's dir
+        // budget) only for feature/backend/architecture-class work.
+        if (rc.repoMap && inj.repoMap) {
+          // every repoMap-enabled tier sets repoMapDirs >= 12, so a trim always
+          // applies — keeps the whole-repo survey from ballooning the front-load
+          const map = rc.repoMap.split('\n').slice(0, inj.repoMapDirs).join('\n');
+          fullPrompt += `\n\nREPO MAP (directories by file count + notable files — use this for orientation instead of exploring):\n${map}`;
         }
-        // 2) ranked candidate files for this specific issue
-        const lines = rc.files
+        // 2) ranked candidate files for this specific issue (capped by task class)
+        const lines = rc.files.slice(0, inj.files)
           .map(f => `- ${f.rel}${f.symbols && f.symbols.length ? ' — ' + f.symbols.slice(0, 8).join(', ') : ''}`)
           .join('\n');
         fullPrompt += `\n\nPRE-RANKED RELEVANT FILES (lexical match on the issue):\n${lines}`;
         // semantic matches from the vector index — meaning-based, complements lexical
         if (vhits.length) {
-          const symLines = vhits.slice(0, 12)
+          const symLines = vhits.slice(0, inj.semantic)
             .map(h => `- ${h.id} (${h.score.toFixed(2)})`).join('\n');
           fullPrompt += `\n\nSEMANTIC MATCHES (vector/RAG search — meaning-based, ` +
             `use alongside the lexical list):\n${symLines}`;
@@ -1681,16 +1854,38 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
             `breakage, prefer a minimal backward-compatible change, and RECORD the ` +
             `affected files in your task's CONTEXT so the engineers inherit this.\n${rc.impact}`;
         }
-        // 4) firm directive: pull code through the indexed tools, not tree surveys
-        fullPrompt += `\n\nRETRIEVAL TOOLS (indexed, answer in milliseconds — ` +
-          `PREFER these over Glob/Grep surveys):\n` +
-          `- mcp__deck__search_code — hybrid ranked file/symbol search (lexical+semantic)\n` +
-          `- mcp__deck__get_symbols — implementations + dependencies for a topic (actual code)\n` +
-          `- mcp__deck__who_references — blast radius of a symbol/file before you change it\n` +
-          `- mcp__deck__topic_memory — feature notes recorded by previous runs\n` +
-          `Workflow: the lists above say WHERE the task lives → pull code with ` +
-          `get_symbols/search_code → Read only the exact spans you will edit. ` +
-          `Do not survey the tree.`;
+        // 3b) the other half of "what does this touch": what the trigger point
+        // ITSELF calls out to (API calls, state setters, redirects, ...) — a
+        // human dev traces this before editing, same as who calls it back
+        if (rc.callsOut) {
+          fullPrompt += `\n\nCALLS OUT TO (auto, computed from the index — NOT ` +
+            `exhaustive, verify): what the symbols above depend on one hop out. ` +
+            `Editing a symbol below can also change what it calls — check each one.\n${rc.callsOut}`;
+        }
+        // 4) firm directive: pull code through the indexed tools, not tree surveys.
+        // The full pitch is ~1k chars injected EVERY run — overkill for a small
+        // task, so those get a one-liner that still names the tools.
+        if (inj.tools === 'full') {
+          fullPrompt += `\n\nRETRIEVAL TOOLS (indexed, answer in milliseconds — ` +
+            `PREFER these over Glob/Grep surveys):\n` +
+            `- mcp__deck__search_code — hybrid ranked file/symbol search (lexical+semantic)\n` +
+            `- mcp__deck__get_symbols — implementations + dependencies for a topic (actual code)\n` +
+            `- mcp__deck__who_references — blast radius of a symbol/file before you change it\n` +
+            `- mcp__deck__topic_memory — feature notes recorded by previous runs\n` +
+            `Workflow: the lists above say WHERE the task lives → pull code with ` +
+            `get_symbols/search_code → Read only the exact spans you will edit. ` +
+            `Do not survey the tree.\n\n` +
+            `EXECUTION GATES (call these — they keep you execution-first):\n` +
+            `- mcp__deck__execution_plan — BEFORE editing, lock in root cause + the ` +
+            `WHOLE workflow to change + how you'll validate. Stop investigating once ` +
+            `~80% sure.\n` +
+            `- mcp__deck__done_check — BEFORE reporting done, verify every gate with ` +
+            `evidence. NOT DONE means keep working; locating the bug is not fixing it.`;
+        } else {
+          fullPrompt += `\n\nRETRIEVAL: prefer the indexed mcp__deck__* tools ` +
+            `(search_code, get_symbols, who_references) over Glob/Grep — pull only ` +
+            `the exact spans you will edit; do not survey the tree.`;
+        }
       }
     } catch {}
   }
@@ -1705,13 +1900,37 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   // no whole-file dump (the transcript already holds the session's context).
   if (warm && cwd && a.role !== 'indexer') {
     try {
+      // SMART QUERY — same distillation as the cold front-load above: a long
+      // follow-up message dilutes BM25/vector search just as much as a long
+      // initial issue does. Tight ceiling here too — a follow-up should FEEL
+      // instant, so a slow/failed distill just falls back to the raw message.
+      // Local distill first (instant) so a busy index worker never sends the
+      // raw follow-up into search; the model only refines when it answers fast.
+      let warmQuery = rq.length > 200 ? localIntentQuery(rq) : rq;
+      const warmWs = wsForAgent(agentId);
+      if (rq.length > 200) {
+        feedRaw('RAG', 'sys', `Intent → "${warmQuery}"`, '', warmWs);
+        try { window.deck.dictLearn('intent', warmQuery.split(' ')).catch(() => {}); } catch {}
+        const intent = await withTimeout(
+          window.deck.aiGenerate(
+            'Extract a focused search query from this request, for a code search ' +
+            'index (BM25 + embeddings). Reply with ONLY space-separated keywords: ' +
+            'symbol/function/file/folder names, feature names, and error text ' +
+            'mentioned. No sentences, no punctuation, max 20 words.\n\nREQUEST:\n' + rq,
+            'claude-haiku-4-5-20251001', cwd),
+          5000, null).catch(() => null);
+        if (intent && intent.ok && intent.text && intent.text.trim()) {
+          warmQuery = intent.text.trim();
+          feedRaw('RAG', 'sys', `Intent (AI) → "${warmQuery}"`, '', warmWs);
+        }
+      }
       // tight ceiling (was 6s): a follow-up should FEEL instant — if the index
       // worker is busy the message just goes out without per-message targeting.
       // No symbol-pack push here anymore: the agent pulls code via mcp__deck__*.
       const [rc, vq] = await Promise.all([
-        withTimeout(window.deck.retrieveContext(cwd, rq, 10), 2500, null)
+        withTimeout(window.deck.retrieveContext(cwd, warmQuery, 10), 2500, null)
           .catch(() => null),
-        withTimeout(window.deck.vectorQuery(cwd, rq, 12), 2500, null)
+        withTimeout(window.deck.vectorQuery(cwd, warmQuery, 12), 2500, null)
           .catch(() => null),
       ]);
       // ranked lexical files + semantic-only files folded in, name + symbols
@@ -1725,7 +1944,7 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
         const rel = cut > 0 ? h.id.slice(0, cut) : h.id;
         if (rel && !files.some(f => f.rel === rel)) files.push({ rel });
       }
-      const shown = files.slice(0, 10);
+      const shown = files.slice(0, inj.files);
       // eval prediction recorded even when the inject below gets deduped —
       // retrieval still ranked these files for this message
       if (files.length) {
@@ -1739,8 +1958,8 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
       if (files.length && lastTargets.get(agentId) === targetKey) {
         // same target set as the previous message — the transcript already
         // carries the block; re-injecting it would just duplicate tokens
-        feed(agentId, 'sys',
-          `per-message retrieval: targets unchanged — inject skipped`, '🧬');
+        feedRaw('RAG', 'sys',
+          `Targets unchanged — inject skipped`, '', warmWs);
       } else if (files.length) {
         lastTargets.set(agentId, targetKey);
         const lines = shown.map(f =>
@@ -1752,8 +1971,8 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
           `message's code (list above). Pull implementations via ` +
           `mcp__deck__search_code / mcp__deck__get_symbols (indexed, instant) ` +
           `instead of Glob/Grep surveys; Read only the exact spans you will edit.`;
-        feed(agentId, 'sys',
-          `per-message retrieval: ${files.length} target files`, '🧬');
+        feedRaw('RAG', 'sys',
+          `${files.length} target files`, '', warmWs);
       }
     } catch {}
   }
@@ -1764,8 +1983,9 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   const prepMs = Math.round(performance.now() - prepT0);
   const injectedK = (fullPrompt.length - prompt.length) / 1000;
   if (prepMs > 300 || injectedK > 0.5) {
+    const cls = task ? ` · ${task.type} budget` : '';
     feed(agentId, 'sys',
-      `context assembled in ${prepMs}ms · +${injectedK.toFixed(1)}k chars injected · spawning…`, '⏱');
+      `context assembled in ${prepMs}ms · +${injectedK.toFixed(1)}k chars injected${cls} · spawning…`, '⏱');
   }
   r.spawnT0 = Date.now();
   await window.deck.runAgent({
@@ -1881,17 +2101,22 @@ window.deck.onAgentEvent(ev => {
       // a delta with no open stream element starts a fresh assistant message —
       // keep only the latest one, it's the agent's closing summary
       hideThinking(ev.agentId);                 // text is arriving — stop "thinking"
-      if (!streamEls[ev.agentId]) { r.lastText = ''; ticker(ev.agentId, 'writing response...'); }
+      if (!streamEls[ev.agentId]) {
+        r.lastText = '';
+        ticker(ev.agentId, 'writing response...');
+        feed(ev.agentId, 'txt', '', '', true);  // bootstrap the streaming row
+      }
       r.lastText = (r.lastText || '') + ev.text;
-      feed(ev.agentId, 'txt', ev.text, '', true);
+      scheduleMdRender(ev.agentId);
       break;
     case 'text-end': {
-      // the message is complete — swap the raw streamed text for rendered
-      // markdown so headings/lists/code read cleanly instead of # and *.
+      // the message is complete — do a final render straight from the
+      // accumulated text (not the DOM, which scheduleMdRender already left
+      // as rendered markdown) so headings/lists/code read cleanly.
       const sEl = streamEls[ev.agentId];
       const bodyEl = sEl && sEl.querySelector('.body');
       if (bodyEl) {
-        bodyEl.innerHTML = renderMarkdown(bodyEl.textContent);
+        bodyEl.innerHTML = renderMarkdown(r.lastText || '');
         bodyEl.classList.add('md-body');
       }
       endStream(ev.agentId);
@@ -2140,6 +2365,17 @@ async function launchPipeline(issue, effort, wsId) {
     return;
   }
 
+  // guard against a roster agent's cwd drifting from the workspace's own
+  // path (stale import, manual edit, legacy migration) — every stage below
+  // trusts p.cwd for both retrieval and live tool execution, so a mismatch
+  // here would silently point the whole run at the wrong project
+  const target = workspaces.find((w) => w.id === wsId);
+  if (target && target.path && pe.cwd !== target.path) {
+    plog('info', `PROMPT-ENGINEER cwd was out of sync with the workspace path — corrected.`, wsId);
+    for (const a of target.agents) a.cwd = target.path;
+    saveWorkspaces();
+  }
+
   const p = pipeFor(wsId);
   p.active = true;
   p.cwd = pe.cwd;
@@ -2188,6 +2424,15 @@ async function startStage1(issue, wsId) {
   const pe = byRoleIn(wsId, 'prompt')[0];
   plog('info', 'Stage 1: PROMPT ENGINEER analyzing...', wsId);
   setStage(wsId, 'prompt');
+  // Display retrieval metadata before running the agent
+  try {
+    const ctx = await window.deck.planContext(p.cwd, issue);
+    if (ctx && ctx.ok && ctx.retrieval) {
+      feedRetrieval(ctx.retrieval, ctx.impactLines, wsId);
+    }
+  } catch (e) {
+    console.debug('retrieval metadata fetch:', e);
+  }
   // token-lean: every issue starts the PE FRESH. Topic memory + the retrieval
   // front-load ARE its warm context — resuming (and forking) the stored PE
   // session here replayed every PRIOR issue's full planning transcript (front-
@@ -2202,7 +2447,10 @@ async function startStage1(issue, wsId) {
   runAgent(pe.id,
     `ISSUE: ${issue}\n\nUsing the retrieved context provided, produce the executable ` +
     `task prompt file(s) and review-brief.md per your pipeline rules. Do AT MOST ` +
-    `1-2 targeted reads only if a specific symbol you need is missing.`,
+    `1-2 targeted reads only if a specific symbol you need is missing — read the exact ` +
+    `path from RANKED FILES/KEY SYMBOLS above, never a guessed filename. Do NOT run ` +
+    `git status/git log or other exploratory shell commands; they are not part of the ` +
+    `provided context and are not needed to plan.`,
     false, false, { effort: p.effort });
 }
 
@@ -2751,7 +2999,9 @@ async function onPipelineAgentDone(agentId, result) {
 // Infrastructure/status chatter that should NOT clutter the console — the
 // central console is reserved for AI activity. These still go to devtools for
 // debugging, and live status is shown in the activity strip instead.
-const SILENT_FEED_TAGS = new Set(['PIPELINE', 'EXPLORER', 'EDITOR']);
+// 'RAG' too: the intent/RAG-query diagnostics are useful in devtools but were
+// cluttering the main chat with the raw prompt — keep the console clean.
+const SILENT_FEED_TAGS = new Set(['PIPELINE', 'EXPLORER', 'EDITOR', 'RAG']);
 
 // raw console line not tied to an agent (operator/shell output). wsId lets a
 // background project's system message land in ITS buffer instead of leaking
@@ -2765,10 +3015,28 @@ function feedRaw(tag, cls, text, ico, wsId = activeWorkspaceId) {
   if (cont === consoleFeed) hideFeedEmpty();
   const el = document.createElement('div');
   el.className = 'ev';
-  el.innerHTML = `<span class="tag op">${esc(tag)}</span><span class="ico">${ico || ''}</span><span class="body ${cls}"></span>`;
+  // emoji glyph suppressed (see feed()); 16px slot kept for alignment.
+  el.innerHTML = `<span class="tag op">${esc(tag)}</span><span class="ico"></span><span class="body ${cls}"></span>`;
   el.querySelector('.body').textContent = text;
   cont.appendChild(el);
   if (cont === consoleFeed) pinFeedToBottom();
+}
+
+function feedRetrieval(retrieval, impactLines, wsId = activeWorkspaceId) {
+  if (!retrieval) return;
+  const { query, filesFound, symbolsFound, filesMatched } = retrieval;
+  if (!filesFound && !symbolsFound) return;
+  const filesList = (filesMatched || []).slice(0, 3).map((f) => f.path).join(', ');
+  const summary = [
+    `Query: "${query}"`,
+    `Files: ${filesFound}` + (filesList ? ` (${filesList}...)` : ''),
+    symbolsFound > 0 ? `Symbols: ${symbolsFound}` : null
+  ].filter(Boolean).join(' · ');
+  feedRaw('RETRIEVAL', 'sys', summary, '', wsId);
+  if (impactLines && impactLines.length) {
+    const impactSummary = impactLines.slice(0, 2).join(' | ');
+    feedRaw('IMPACT', 'txt', impactSummary + (impactLines.length > 2 ? ` (+${impactLines.length - 2} more)` : ''), '', wsId);
+  }
 }
 
 // ===== Attachments (drag & drop or 📎) =====
@@ -3205,6 +3473,25 @@ let chatAgentId = null;   // the focused agent (kept name for existing callers)
 function openChat(agentId) {   // called by the roster card click
   const a = agents.find(x => x.id === agentId);
   if (!a) return;
+
+  // for chat agents, swap buffers: move this chat's messages to consoleFeed,
+  // move other chats' messages to their off-screen buffers
+  if (agentId.startsWith('chat-')) {
+    const newChatId = agentId.slice('chat-'.length);
+    // move current consoleFeed contents (old chat's messages) to old chat's buffer
+    if (activeChatId && activeChatId !== newChatId) {
+      const oldBuf = getChatBuf(activeChatId);
+      while (consoleFeed.firstChild) {
+        oldBuf.appendChild(consoleFeed.firstChild);
+      }
+    }
+    // move this chat's messages from its buffer back to consoleFeed
+    const newBuf = getChatBuf(newChatId);
+    while (newBuf.firstChild) {
+      consoleFeed.appendChild(newBuf.firstChild);
+    }
+  }
+
   chatAgentId = agentId;
   feedFilter = agentId;
   applyFilter();
@@ -3443,7 +3730,13 @@ function syncDockControls() {
     e.value = chat.effort || getEffort();
     p.checked = !!chat.plan;
   } else {
-    if (!t.value) t.value = 'model:claude-sonnet-5';
+    // drafts must never silently inherit AUTO PIPELINE — it is the first
+    // <option>, so an untouched select auto-picks it and a casual first
+    // message would launch the full pipeline. Default drafts to a plain
+    // model chat; picking AUTO PIPELINE stays a deliberate per-draft act.
+    if (!t.value || t.value === '__pipeline__') {
+      t.value = 'model:claude-sonnet-5';
+    }
     e.value = getEffort();
     p.checked = false;
   }
@@ -3461,6 +3754,14 @@ function openDraftChat() {
   document.getElementById('ad-status').textContent = '';
   document.getElementById('ad-all').classList.add('hidden');
   document.getElementById('ad-stop').classList.add('hidden');
+  // the dock DOM is shared across every project/chat — a run or plan-review
+  // elsewhere may have left the send control disabled or morphed into the
+  // red STOP square, and updateChatModal() early-returns for drafts, so the
+  // stale state would otherwise stick to every project's draft chatbox.
+  const sendBtn = document.getElementById('ad-send');
+  sendBtn.disabled = false;
+  sendBtn.classList.remove('stop');
+  sendBtn.title = 'Send  (Ctrl+Enter)';
   agentDock.classList.remove('hidden');
   document.getElementById('console-feed').classList.add('has-dock');
   syncDockControls();
@@ -3518,8 +3819,12 @@ function effectiveRules(a) {
     const extra = (a.extraRules || '').trim();
     return extra ? `${base}\n\n--- OPERATOR ADDITIONS ---\n${extra}` : base;
   }
-  // GENERAL-OPS with no custom rules still gets the token discipline block
-  if (a && a.id === 'def-general' && !(a.rules || '').trim()) return DISCIPLINE.trim();
+  // any agent without its own custom rules still gets the token/regression/
+  // verification discipline block — a bare "chat with a model" is not a
+  // managed pipeline role, but it edits the same codebase and should follow
+  // the same guardrails (was GENERAL-OPS-only; that excluded every ephemeral
+  // model-chat agent, which is most of what "chat with a model" actually is)
+  if (a && !(a.rules || '').trim()) return DISCIPLINE.trim();
   return a.rules || '';
 }
 
@@ -3592,6 +3897,21 @@ function learnUiWords(text) {
   }
   saveLearn();
 }
+
+// Hydrate the in-memory stop-word Sets from the GLOBAL dictionary store (main
+// process, userData JSON — shared across every project) so words the engine has
+// already learned apply from the first query this session. Seeds are baked in
+// as `const`s above, so this only ADDS learned extras; failure is a no-op.
+(async () => {
+  try {
+    const hydrate = async (cat, set) => {
+      const r = await window.deck.dictGet(cat);
+      if (r && r.ok && Array.isArray(r.words)) for (const w of r.words) set.add(w);
+    };
+    await hydrate('intent', INTENT_STOP);
+    await hydrate('ui', UI_STOPWORDS);
+  } catch { /* old preload / store unavailable — seeds still work */ }
+})();
 
 // a corrective follow-up right after a "successful" run means it wasn't really
 // good — count it against the model that produced it
@@ -3725,6 +4045,12 @@ function showFeedEmpty() {
 function feedContentNodes() {
   return consoleFeed.querySelectorAll(':scope > *:not(#feed-empty)');
 }
+// per-workspace composer draft — #ad-input is ONE shared textarea across
+// every project, so an unsent draft typed in project A used to show up in
+// project B's chatbox after a switch. Stash/restore it like the feed nodes.
+const wsDrafts = {};   // wsId -> unsent composer text
+function stashDraft(wsId) { wsDrafts[wsId] = adInput.value; }
+function restoreDraft(wsId) { adInput.value = wsDrafts[wsId] || ''; }
 // active project → move its live nodes into its buffer (keeps streaming there)
 function stashFeed(wsId) {
   const buf = getFeedBuf(wsId);
@@ -3821,6 +4147,7 @@ function switchWorkspace(id) {
   const target = workspaces.find(w => w.id === id);
   if (!target) return;
   stashFeed(activeWorkspaceId);            // keep the old project's console
+  stashDraft(activeWorkspaceId);           // …and its unsent composer text
   activeWorkspaceId = id;
   agents = ws().agents;                    // re-point the live references
   projectDir = ws().path || '';
@@ -3832,6 +4159,10 @@ function switchWorkspace(id) {
   restoreFeed(id);                         // show the new project's console
   renderRail();
   refreshProjectBindings();
+  // land on this project's default chat (latest running, else latest used)
+  // with its session logs on screen — not an empty draft chatbox
+  autoOpenProjectChat();
+  restoreDraft(id);   // last: openChat/openDraftChat above must not clobber it
 }
 
 // open a fresh blank project tab — the Welcome screen takes it from here
@@ -3877,6 +4208,7 @@ function setWorkspaceFolder(dir) {
     if (blankId && blankId !== existing.id) {
       workspaces = workspaces.filter(w => w.id !== blankId);
       delete feedBuf[blankId];
+      delete wsDrafts[blankId];
       saveWorkspaces(); renderRail();
     }
     return;
@@ -3939,6 +4271,7 @@ async function closeWorkspace(id) {
     if (rt[a.id] && rt[a.id].running) stopAgent(a.id);
   }
   delete feedBuf[id];
+  delete wsDrafts[id];
   if (typeof killWorkspaceTerms === 'function') killWorkspaceTerms(id);
 
   if (isLast) {
@@ -3951,6 +4284,7 @@ async function closeWorkspace(id) {
     feedFilter = null;
     localStorage.removeItem('projectDir');
     restoreFeed(w.id);
+    restoreDraft(w.id);   // draft was deleted above → clears the box
     saveWorkspaces();
     renderRail();
     refreshProjectBindings();   // shows the Welcome screen
@@ -3964,6 +4298,7 @@ async function closeWorkspace(id) {
     projectDir = ws().path || '';
     feedFilter = null;
     restoreFeed(activeWorkspaceId);
+    restoreDraft(activeWorkspaceId);
     refreshProjectBindings();
   }
   saveWorkspaces();

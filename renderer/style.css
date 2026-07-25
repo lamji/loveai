@@ -794,6 +794,10 @@ body {
 }
 .feed .ev { display: flex; gap: 8px; }
 .feed .ev .ico { flex: none; width: 16px; text-align: center; }
+.feed .ev .body {
+  flex: 1 1 auto; min-width: 0;
+  overflow-wrap: anywhere; word-break: break-word;
+}
 .feed .sys { color: var(--dim); }
 .feed .tool { color: var(--amber); }
 .feed .txt { color: var(--text); white-space: pre-wrap; word-break: break-word; }
@@ -2163,6 +2167,9 @@ textarea.dropping { border-color: var(--accent) !important; background: var(--ac
   font-family: var(--sans); font-size: 12.5px; padding: 8px 10px;
 }
 .git-panel textarea:focus { outline: none; border-color: var(--cyan); }
+/* commit message box: a real multi-line textarea the operator can drag
+   taller (horizontal is capped by the panel, so vertical only) */
+#git-msg { resize: vertical; min-height: 40px; max-height: 240px; }
 
 /* split commit button */
 .commit-split { position: relative; display: flex; }
@@ -2683,6 +2690,8 @@ textarea.dropping { border-color: var(--accent) !important; background: var(--ac
 }
 #cmt-msg:focus { outline: none; border-color: var(--cyan); }
 .cmt-error-wrap { margin-bottom: 10px; }
+/* optional operator note that rides along with 🔧 FIX WITH AI */
+.cmt-fix-hint { width: 100%; margin-top: 8px; }
 .cmt-error {
   max-height: 200px; overflow: auto; margin: 4px 0 0;
   background: rgba(248,81,73,.08); border: 1px solid var(--red); border-radius: 6px;
@@ -3221,6 +3230,9 @@ body.panel-fullscreen .ws-rail { display: none; }
   flex-direction: column; margin: 0;
 }
 #editor-area.split > #agent-dock { display: none !important; }
+/* full-screen explorer/editor (no split): the chatbox belongs to the console —
+   hide it while #viewer is the visible surface; it returns with the console */
+#editor-area:not(.split):has(> #viewer:not(.hidden)) > #agent-dock { display: none; }
 #esplit-divider {
   flex: none; width: 6px; cursor: ew-resize; background: transparent; align-self: stretch;
 }

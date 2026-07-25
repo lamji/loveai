@@ -221,7 +221,7 @@
             <div class="git-sec-head"><span class="sec-caret">▾</span> ⚠ Merge Conflicts <span class="sec-count" id="conflicts-count"></span><button id="git-merge-abort" class="mini-btn" title="Abort merge">✕</button></div>
             <div class="git-files" id="git-conflicts"></div>
           </div>
-          <textarea id="git-msg" rows="1" placeholder="Message (Ctrl+Enter to commit)"></textarea>
+          <textarea id="git-msg" rows="3" placeholder="Message (Ctrl+Enter to commit)"></textarea>
           <div class="commit-split">
             <button id="git-commit" class="commit-main">✔ Commit</button>
             <button id="git-commit-more" class="commit-caret">
@@ -1095,6 +1095,8 @@
         <section class="cmt-sec cmt-sec-err hidden" id="cmt-error-wrap">
           <div class="cmt-sec-label err">✗ BLOCKED — output below</div>
           <pre id="cmt-error" class="cmt-error"></pre>
+          <input id="cmt-fix-hint" class="ask-input cmt-fix-hint"
+            placeholder="Optional: extra instructions for 🔧 FIX WITH AI…" spellcheck="false" />
         </section>
 
         <section class="cmt-sec cmt-sec-live hidden" id="cmt-live-wrap">
@@ -1120,6 +1122,8 @@
             <div id="cmt-push-flaglist" class="cmt-push-flaglist"></div>
           </div>
         </div>
+        <button id="cmt-pr-no" class="btn hidden">SKIP</button>
+        <button id="cmt-pr-yes" class="btn btn-launch hidden">⑃ YES, CREATE A PR</button>
         <button id="cmt-pr" class="btn btn-launch hidden">⑃ CREATE PR</button>
         <button id="cmt-close" class="btn btn-launch hidden">✓ DONE</button>
       </footer>
