@@ -816,6 +816,8 @@ renderWelcome();
 // land on the active project's latest chat (hydrating its stored session
 // logs) instead of an empty draft — same landing rule as a project switch
 autoOpenProjectChat();
+// populate the sidebar HISTORY with this project's past sessions on launch
+renderSessionHistory();
 setStage(null);
 
 // on load: if a project is already imported, ensure its map (cached under

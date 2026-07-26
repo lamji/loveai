@@ -60,8 +60,50 @@ function sb() {
       },
       realtime: { transport: WebSocketImpl }
     });
+    // Keep the in-memory cache in step with background token refreshes and
+    // sign-in/out so cached reads never serve a stale (or expired) session.
+    client.auth.onAuthStateChange((_event, session) => {
+      setSessionCache(session || null);
+    });
   }
   return client;
+}
+
+// ---- in-memory session cache ----
+// getSession() and userId() are called many times during startup (the login
+// gate, then hydrate() pulling roster/workspaces/settings/skills). Each raw
+// sb().auth.getSession() decrypts session.bin and takes supabase's auth lock,
+// so firing 5+ sequentially makes "checking session" feel slow. Cache the
+// resolved session for a short TTL and dedupe concurrent misses.
+let _sessionCache = { at: 0, session: null };
+let _sessionInflight = null;
+const SESSION_TTL_MS = 30_000;
+
+function setSessionCache(session) {
+  _sessionCache = { at: Date.now(), session };
+}
+
+function clearSessionCache() {
+  _sessionCache = { at: 0, session: null };
+  _sessionInflight = null;
+}
+
+// Returns the current supabase session (or null), served from cache when fresh.
+async function cachedSession() {
+  const fresh = Date.now() - _sessionCache.at < SESSION_TTL_MS;
+  if (fresh && _sessionCache.session !== undefined) return _sessionCache.session;
+  if (_sessionInflight) return _sessionInflight;
+  _sessionInflight = (async () => {
+    try {
+      const { data, error } = await sb().auth.getSession();
+      const session = error ? null : (data.session || null);
+      setSessionCache(session);
+      return session;
+    } finally {
+      _sessionInflight = null;
+    }
+  })();
+  return _sessionInflight;
 }
 
 // ---- public API ----
@@ -74,12 +116,9 @@ async function getSession() {
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('session check timed out')), 5000)
     );
-    const { data, error } = await Promise.race([
-      sb().auth.getSession(),
-      timeoutPromise
-    ]);
-    if (error || !data.session) return { configured: true, user: null };
-    return { configured: true, user: sessionUser(data.session) };
+    const session = await Promise.race([cachedSession(), timeoutPromise]);
+    if (!session) return { configured: true, user: null };
+    return { configured: true, user: sessionUser(session) };
   } catch (e) { return { configured: true, user: null, error: String(e.message || e) }; }
 }
 
@@ -118,6 +157,7 @@ async function handleDeepLink(url) {
     if (!code) return;
     const { data, error } = await sb().auth.exchangeCodeForSession(code);
     if (error) { sendToRenderer('auth-changed', { user: null, error: error.message }); return; }
+    setSessionCache(data.session || null);
     sendToRenderer('auth-changed', { user: sessionUser(data.session) });
   } catch (e) {
     sendToRenderer('auth-changed', { user: null, error: String(e.message || e) });
@@ -128,13 +168,14 @@ async function logout() {
   try { await sb().auth.signOut(); } catch {}
   try { fs.rmSync(storeFile(), { force: true }); } catch {}
   client = null;
+  clearSessionCache();
   return { ok: true };
 }
 
 // ---- per-user data (RLS-scoped tables) ----
 async function userId() {
-  const { data } = await sb().auth.getSession();
-  return data.session ? data.session.user.id : null;
+  const session = await cachedSession();
+  return session ? session.user.id : null;
 }
 
 async function fetchProfile() {

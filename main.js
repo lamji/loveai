@@ -848,6 +848,8 @@ async function indexOneFile(cwd, abs) {
     for (const id of ids) { for (const t of tokenize(id)) { tf[t] = (tf[t] || 0) + 1; len++; } }
     idx.files[rel] = { symbols: symbols.slice(0, 30), tf, len: len || 1 };
     invCache.delete(idx);   // file contents changed → cached inverted map is stale
+    idx.built = Date.now(); // revision bump — fuseCache keys on it, so an
+                            // incremental reindex invalidates cached rankings
     return true;
   } catch { return false; }
 }
@@ -1767,7 +1769,11 @@ ipcMain.handle('symbol-watch', async (_e, cwd) => {
             if (await reparseFileInGraph(cwd, abs)) gChanged = true;
           }
         } catch {                      // gone → remove from index + graph
-          if (idx.files[rel]) { delete idx.files[rel]; invCache.delete(idx); changed++; }
+          if (idx.files[rel]) {
+            delete idx.files[rel]; invCache.delete(idx);
+            idx.built = Date.now();   // revision bump → fuseCache misses
+            changed++;
+          }
           if (graph) { removeFileFromGraph(graph, rel); indexGraph(graph); gChanged = true; }
         }
       }
@@ -1793,7 +1799,11 @@ ipcMain.handle('symbol-watch', async (_e, cwd) => {
           }
           runVectorJob(cwd, { job: 'sync', dir: indexDir(cwd), rels, defs })
             .then((m) => {
-              if (m && m.ok) { V.invalidateCache(); send('vector-updated', { cwd, count: m.count }); }
+              if (m && m.ok) {
+                V.invalidateCache();
+                fuseCache.clear();   // cached symbolHits predate the new vectors
+                send('vector-updated', { cwd, count: m.count });
+              }
             })
             .catch(() => {});
         }
@@ -1933,6 +1943,7 @@ function buildVectorsBg(cwd, graph) {
     (done, t) => send('vector-progress', { cwd, done, total: t || total, phase: 'build' }))
     .then((m) => {
       V.invalidateCache();   // worker rewrote the file — drop main's stale copy
+      fuseCache.clear();     // cached symbolHits predate the new vectors
       // ALWAYS report completion (ok true/false) so the bar finalizes instead of
       // hanging at "vectors 0%" when embedding is unavailable.
       send('vector-updated', { cwd, count: (m && m.count) || 0, ok: !!(m && m.ok), error: m && m.error });
@@ -2125,6 +2136,7 @@ ipcMain.handle('vector-build', async (_e, cwd) => {
       const m = await runVectorJob(cwd, { job: 'build', dir: indexDir(cwd) },
         (d, t) => send('vector-progress', { cwd, done: d, total: t }));
       V.invalidateCache();
+      fuseCache.clear();   // cached symbolHits predate the new vectors
       if (m && m.ok) delete vectorsDeferred[cwd];   // user built it explicitly
       send('vector-updated', { cwd, count: (m && m.count) || 0, ok: !!(m && m.ok), error: m && m.error });
       return m || { ok: false };
@@ -2155,11 +2167,96 @@ async function workerVectorHits(cwd, q, k) {
   return (m && Array.isArray(m.hits)) ? m.hits : [];
 }
 
+// GIT ACTIVITY SIGNAL — files the user is changing right now (working tree)
+// or touched in the last few commits. Retrieval ranking uses this to lift
+// actively-edited files: "fix the bug" almost always means the code someone
+// just touched. Cached per cwd with a short TTL (two agents spawning together
+// share one git call); a slow/failed git yields [] and ranking proceeds.
+const gitActivityCache = new Map();   // cwd -> { at, rels }
+const GIT_ACTIVITY_TTL = 15000;
+// stdout ONLY — gitExec merges stderr into `out`, which is fine for display
+// but poison for machine parsing (CRLF warnings would be parsed as paths)
+function gitStdout(cwd, args) {
+  return new Promise((resolve) => {
+    execFile('git', ['-C', cwd, ...args], {
+      timeout: 5000, maxBuffer: 4 * 1024 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }
+    }, (err, stdout) => resolve(err ? null : String(stdout || '')));
+  });
+}
+// a C-quoted path (core.quotepath octal escapes, e.g. "caf\303\251.js") can
+// never string-match an index rel — skip it so it doesn't waste a boost slot
+function cleanGitPath(p) {
+  const quoted = /^".*"$/.test(p);
+  const s = p.replace(/^"|"$/g, '');
+  if (quoted && /\\/.test(s)) return '';
+  return s.replace(/\\/g, '/');
+}
+async function gitActiveFiles(cwd) {
+  const hit = gitActivityCache.get(cwd);
+  if (hit && Date.now() - hit.at < GIT_ACTIVITY_TTL) return hit.rels;
+  const timeout = new Promise((res) => setTimeout(res, 1500, null));
+  const rels = [];
+  try {
+    const both = await Promise.race([
+      Promise.all([
+        gitStdout(cwd, ['status', '--porcelain']),
+        gitStdout(cwd, ['log', '--name-only', '-n', '5', '--pretty=format:'])
+      ]),
+      timeout
+    ]);
+    if (both) {
+      const [st, lg] = both;
+      const seen = new Set();
+      const add = (p) => {
+        if (p && !seen.has(p) && rels.length < 15) { seen.add(p); rels.push(p); }
+      };
+      // working-tree changes first (strongest signal), then recent commits
+      if (st) {
+        for (const line of st.split('\n')) {
+          add(cleanGitPath(line.slice(3).trim().replace(/^.* -> /, '')));
+        }
+      }
+      if (lg) {
+        for (const line of lg.split('\n')) add(cleanGitPath(line.trim()));
+      }
+    }
+  } catch {}
+  gitActivityCache.set(cwd, { at: Date.now(), rels });
+  return rels;
+}
+
+// SEMANTIC RETRIEVAL CACHE — fuseRetrieval is deterministic given (query,
+// index state), and identical calls repeat constantly: an agent re-running
+// the same search_code query mid-task, pipeline stages racing on one issue.
+// Memoize on query + index build stamp with a short TTL; index rebuilds
+// change `built` and naturally miss.
+const fuseCache = new Map();   // key -> { at, res }
+const FUSE_TTL = 60000, FUSE_MAX = 30;
+function fuseCacheGet(key) {
+  const hit = fuseCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > FUSE_TTL) { fuseCache.delete(key); return null; }
+  return hit.res;
+}
+function fuseCachePut(key, res) {
+  fuseCache.set(key, { at: Date.now(), res });
+  if (fuseCache.size > FUSE_MAX) {
+    fuseCache.delete(fuseCache.keys().next().value);
+  }
+}
+
 // Fuse semantic (vector) + lexical (BM25) file rankings via reciprocal-rank fusion.
 // Vector catches meaning ("timezone bug" -> formatUnixDate); BM25 nails exact
-// identifiers. Pure local math, no LLM. Returns { idx, files:[{rel,...}], symbolHits }.
+// identifiers; git activity lifts what's being worked on. Pure local math, no
+// LLM. Returns { idx, files:[{rel,...}], symbolHits }.
 async function fuseRetrieval(cwd, q, k) {
+  const pGit = gitActiveFiles(cwd);   // parallel with the index load
   const idx = await loadOrBuildIndex(cwd);
+  const cacheKey = `${cwd}|${k || 8}|${idx.built || 0}|${q}`;
+  const cached = fuseCacheGet(cacheKey);
+  // shallow-copy on hit so a caller mutating the arrays can't poison the cache
+  if (cached) return { idx, files: cached.files.slice(), symbolHits: cached.symbolHits.slice() };
   const bm = retrieve(idx, q, (k || 8) * 2);
   const symbolHits = await workerVectorHits(cwd, q, (k || 8) * 4);
   const vBest = new Map();
@@ -2171,6 +2268,12 @@ async function fuseRetrieval(cwd, q, k) {
   const RRF = 60, score = new Map(), meta = new Map();
   bm.forEach((f, i) => { score.set(f.rel, (score.get(f.rel) || 0) + 1 / (RRF + i)); meta.set(f.rel, f); });
   vfiles.forEach((rel, i) => { score.set(rel, (score.get(rel) || 0) + 1 / (RRF + i)); });
+  // git activity is a BOOST, not a source: it reorders files the query already
+  // surfaced (half weight — can't outrank a lexical+semantic consensus) but
+  // never injects an unrelated file just because it was recently edited.
+  (await pGit).forEach((rel, i) => {
+    if (score.has(rel)) score.set(rel, score.get(rel) + 0.5 / (RRF + i));
+  });
   const ranked = [...score.keys()].sort((a, b) => score.get(b) - score.get(a));
   // keep only the highest-confidence hits — same "not all, only the strong
   // ones" cutoff as strongestOnly, adapted to the RRF score map's shape
@@ -2179,6 +2282,7 @@ async function fuseRetrieval(cwd, q, k) {
   const files = (strong.length >= 3 ? strong : ranked.slice(0, 3))
     .slice(0, k || 8)
     .map((rel) => meta.get(rel) || { rel });
+  fuseCachePut(cacheKey, { files, symbolHits });
   return { idx, files, symbolHits };
 }
 
@@ -2212,15 +2316,26 @@ async function generateOneShot(prompt, opts = {}) {
 // full paragraph than against the actual keywords/files/features it names.
 // Short prompts already ARE a query, so skip the extra model call for those.
 const INTENT_DISTILL_MIN_CHARS = 200;
+// distillation cache: the same issue text is distilled repeatedly across a
+// pipeline (plan preview → plan-generate → PE spawn) — one Haiku call, not three
+const distillCache = new Map();   // issue text -> distilled query (LRU 40)
 async function distillSearchIntent(cwd, issue) {
   const text = String(issue || '').trim();
   if (text.length < INTENT_DISTILL_MIN_CHARS) return text;
+  const hit = distillCache.get(text);
+  if (hit) return hit;
   const sys = 'You extract search queries from user requests for a code search ' +
     'index (BM25 + embeddings). Reply with ONLY space-separated keywords: ' +
     'symbol/function/file/folder names, feature names, and error text ' +
     'mentioned in the request. No sentences, no punctuation, max 20 words.';
   try {
     const q = await generateOneShot(text, { cwd, systemPrompt: sys });
+    if (q) {
+      distillCache.set(text, q);
+      if (distillCache.size > 40) {
+        distillCache.delete(distillCache.keys().next().value);
+      }
+    }
     return q || text;
   } catch { return text; }
 }
@@ -2594,6 +2709,39 @@ ipcMain.handle('memory-reindex', (_e, { cwd }) => {
   } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
 });
 
+// ===== Recent-work memory (conversation compression, cross-session) =====
+// After each successful run the renderer posts a compact record: task class,
+// distilled task line, files edited, outcome. Cold runs inject the last few
+// records as a tiny RECENT WORK section — cross-session continuity for a few
+// hundred chars, instead of ever replaying a transcript.
+const RUNLOG_MAX = 30;
+function runlogPath(cwd) { return path.join(cwd, '.loveai', 'memory', 'recent-runs.json'); }
+ipcMain.handle('runlog-append', (_e, { cwd, entry }) => {
+  try {
+    if (!cwd || !entry) return { ok: false };
+    const fp = runlogPath(cwd);
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    let arr = [];
+    try { arr = JSON.parse(fs.readFileSync(fp, 'utf8')); } catch {}
+    if (!Array.isArray(arr)) arr = [];
+    arr.push({
+      at: Date.now(),
+      type: String(entry.type || '').slice(0, 24),
+      task: String(entry.task || '').replace(/\s+/g, ' ').slice(0, 160),
+      files: (Array.isArray(entry.files) ? entry.files : []).slice(0, 8).map(String),
+      outcome: String(entry.outcome || '').replace(/\s+/g, ' ').slice(0, 200)
+    });
+    fs.writeFileSync(fp, JSON.stringify(arr.slice(-RUNLOG_MAX), null, 1), 'utf8');
+    return { ok: true };
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+});
+ipcMain.handle('runlog-recent', (_e, { cwd, n }) => {
+  try {
+    const arr = JSON.parse(fs.readFileSync(runlogPath(cwd), 'utf8'));
+    return { ok: true, runs: Array.isArray(arr) ? arr.slice(-(n || 3)).reverse() : [] };
+  } catch { return { ok: true, runs: [] }; }
+});
+
 // create a new file or folder (VS Code-style). `rel` may include subfolders,
 // e.g. "components/Button.tsx" — intermediate dirs are created.
 ipcMain.handle('fs-create', (_e, { root, dir, rel, isDir }) => {
@@ -2880,6 +3028,74 @@ function readSessionTranscript(sessionId, limit = 80) {
 }
 
 ipcMain.handle('session-load', (_e, sessionId) => readSessionTranscript(sessionId, 80));
+
+// Claude Code stores each session under ~/.claude/projects/<slug> where the
+// slug is the absolute cwd with every path separator / colon / dot replaced
+// by '-' (no collapsing of runs — "C:\a" → "C--a"). Used as the fast path for
+// the project-scoped history list below.
+function sessionSlug(cwd) {
+  return String(cwd || '').replace(/[\\/:.]/g, '-');
+}
+
+// Sessions scoped to ONE project — powers the sidebar HISTORY list (the
+// top-right panel is global across all projects). Matched AUTHORITATIVELY by
+// the `cwd` recorded inside each transcript, so it is correct regardless of
+// how the slug is encoded; the slug only picks the folder to read first.
+// Returns { id, mtime, snippet } newest-first, same shape as sessions-list.
+ipcMain.handle('sessions-for-cwd', (_e, cwd) => {
+  const out = [];
+  if (!cwd) return out;
+  try {
+    const base = path.join(process.env.USERPROFILE || '', '.claude', 'projects');
+    const abs = path.resolve(String(cwd));
+    const want = abs.toLowerCase();
+    const slug = sessionSlug(abs);
+    // one folder read when the slug dir exists; otherwise scan every project
+    // dir and confirm each session by its recorded cwd
+    const fast = fs.existsSync(path.join(base, slug));
+    const dirs = fast ? [slug] : fs.readdirSync(base);
+    for (const dir of dirs) {
+      let files;
+      try {
+        files = fs.readdirSync(path.join(base, dir)).filter(f => f.endsWith('.jsonl'));
+      } catch { continue; }
+      for (const f of files) {
+        const fp = path.join(base, dir, f);
+        let stat;
+        try { stat = fs.statSync(fp); } catch { continue; }
+        let snippet = '', scwd = '';
+        try {
+          const fd = fs.openSync(fp, 'r');
+          const buf = Buffer.alloc(65536);
+          const n = fs.readSync(fd, buf, 0, 65536, 0);
+          fs.closeSync(fd);
+          for (const line of buf.toString('utf8', 0, n).split('\n')) {
+            let j;
+            try { j = JSON.parse(line); } catch { continue; }
+            if (j.cwd && !scwd) scwd = j.cwd;
+            if (!snippet) {
+              if (j.type === 'summary' && j.summary) {
+                snippet = String(j.summary).slice(0, 140);
+              } else if (j.type === 'user' && j.message && j.message.content) {
+                const c = j.message.content;
+                const text = typeof c === 'string'
+                  ? c : ((c.find(x => x.type === 'text') || {}).text || '');
+                if (text) snippet = text.slice(0, 140);
+              }
+            }
+            if (scwd && snippet) break;
+          }
+        } catch {}
+        // the transcript's own cwd is authoritative; only fall back to trusting
+        // the slug folder when a session never recorded one (fast path only)
+        const match = scwd ? path.resolve(scwd).toLowerCase() === want : fast;
+        if (match) out.push({ id: f.replace('.jsonl', ''), mtime: stat.mtimeMs, snippet });
+      }
+    }
+  } catch {}
+  out.sort((a, b) => b.mtime - a.mtime);
+  return out.slice(0, 50);
+});
 
 // ===== Git integration (VS Code-style source control) =====
 // Every app-issued git command for a repo runs through a per-repo queue, so the
@@ -4051,8 +4267,23 @@ ipcMain.handle('agent-run', async (_e, cfg) => {
   function buildStalePrompt() {
     const prior = cfg.resumeSessionId ? readSessionTranscript(cfg.resumeSessionId, 40) : [];
     if (!prior.length) return { prompt: cfg.prompt, restored: false };
-    const ROLE_PREFIX = { user: 'YOU:', assistant: 'ASSISTANT:', tool: 'TOOL:' };
-    const lines = prior.map(m => `${ROLE_PREFIX[m.role] || 'TOOL:'} ${m.text}`);
+    // COMPRESS before capping: raw transcripts are mostly tool noise ("TOOL:
+    // Read {...}") that teaches the fresh session nothing. Keep the semantic
+    // turns — what was asked and what was concluded — and collapse each tool
+    // run to a one-line marker, so the 12k cap holds ~all real exchanges
+    // instead of the last few noisy ones.
+    const lines = [];
+    let toolRun = 0;
+    const flushTools = () => {
+      if (toolRun > 0) { lines.push(`[${toolRun} tool call${toolRun > 1 ? 's' : ''}]`); toolRun = 0; }
+    };
+    for (const m of prior) {
+      if (m.role === 'tool') { toolRun++; continue; }
+      flushTools();
+      if (m.role === 'user') lines.push('YOU: ' + m.text.slice(0, 600));
+      else lines.push('ASSISTANT: ' + m.text.slice(0, 800));
+    }
+    flushTools();
     let body = lines.join('\n');
     while (body.length > STALE_PREAMBLE_CAP && lines.length > 1) {
       lines.shift();

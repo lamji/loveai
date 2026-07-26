@@ -1,5 +1,72 @@
 # Changes Log
 
+## 2026-07-26
+
+### feat: Context engineering phase 1 — hard budgets, dedupe, caches, git signal, run memory
+- **Spec**: docs/context-engineering-architecture.md (new) maps the target
+  pipeline (intent → plan → retrieve → rank → compress → assemble → execute →
+  memory → cache) onto the existing code and records these changes.
+- **src/retrieval/assembler.js** (new, pure/sync like classifier.js):
+  `assembleSections(sections, charBudget)` — prompt sections carry
+  `{id, priority, required, trimmable, minLines}`; lowest-priority sections
+  drop first, oversized ones trim at line boundaries, required ones always
+  survive, output preserves append order. Plus `dedupeSemanticHits(vhits,
+  rankedFiles)` — vector hits already visible on ranked-file lines are
+  removed. Exposed via preload as `assembleContext` / `dedupeSemanticHits`.
+- **renderer/app.js runAgent()**:
+  - Every inject (orientation, topic memory, recent work, impact, repo map,
+    ranked files, semantic, calls-out, tools/efficiency) is now a section;
+    the classifier's `charBudget` is enforced as a HARD ceiling (was
+    advisory — item counts only). Warm follow-ups: `min(4000, charBudget)`.
+  - New shared `distillRagQuery()` replaces the two drifted cold/warm haiku
+    distill blocks (9s/5s ceilings kept); refinements cached per message
+    text (`intentCache`, LRU 40).
+  - Semantic matches deduped against the ranked-file lines before injection.
+  - Launch line now shows real accounting: `+X.Xk/Yk chars (class budget) ·
+    trimmed: … · dropped: …`.
+  - `case 'done'`: successful non-indexer runs append a compact record
+    (task class, distilled task, edited files, outcome line) via
+    `runlogAppend` — written before `logRetrievalEval` nulls the edit set.
+- **main.js**:
+  - `gitActiveFiles(cwd)` — working-tree + last-5-commit files, 15s TTL
+    cache, 1.5s race timeout. `fuseRetrieval` adds it as a half-weight RRF
+    BOOST (reorders files the query already surfaced; never injects
+    unrelated recently-edited files).
+  - `fuseCache` — 60s/30-entry memo of fuseRetrieval keyed on
+    `cwd|k|idx.built|query` (covers agents re-running identical search_code
+    queries and pipeline stages racing on one issue); shallow-copied on hit.
+  - `distillCache` — LRU 40 for `distillSearchIntent` (same issue text
+    distilled once across plan preview → plan-generate → PE spawn).
+  - `buildStalePrompt` — compress BEFORE capping: tool lines collapse to
+    `[N tool calls]`, user turns ≤600 / assistant turns ≤800 chars, so the
+    12k preamble holds ~all real exchanges instead of tool noise.
+  - New IPC `runlog-append` / `runlog-recent` →
+    `.loveai/memory/recent-runs.json` (capped 30 records). Cold runs inject
+    the last 3 as a tiny RECENT WORK section (priority 6).
+- **preload.js**: exposes `assembleContext`, `dedupeSemanticHits`,
+  `runlogAppend`, `runlogRecent`.
+- **Untouched (deliberate)**: retrieval infra (vectors.js, codegraph,
+  walker, dictionary), mcp__deck__* tool surface, packSymbols budgets,
+  pipeline orchestration, session persistence, SDK autoCompact.
+- **Review fixes** (adversarial pass over the diff):
+  - `gitActiveFiles` parses **stdout only** via a local `gitStdout` helper —
+    `gitExec` merges stderr into `out`, so CRLF warnings were parsed as
+    porcelain paths and evicted real files from the 15-slot boost list.
+  - C-quoted paths (core.quotepath octal escapes) are skipped
+    (`cleanGitPath`) — they can never match an index rel.
+  - `indexOneFile` + the watcher delete path now bump `idx.built`, so the
+    fuseCache key misses after an incremental reindex (it previously served
+    pre-edit rankings for up to 60s — exactly the post-edit re-search case).
+    All three `V.invalidateCache()` sites also `fuseCache.clear()` (cached
+    symbolHits predate a vector rebuild).
+  - RECENT WORK inject guards `x.at` per record (one malformed record no
+    longer kills the whole section); runlog records are only written for
+    runs that actually edited files (chat answers would churn the 30-cap).
+- **Status**: ✅ `node --check` passes on main.js / renderer/app.js /
+  preload.js / assembler.js; assembler unit-smoked (drop/trim/required/order);
+  git porcelain+log parsing smoked against this repo. main.js + preload
+  changed → manual app restart required (see [[rerun-app-after-changes]]).
+
 ## 2026-07-23
 
 ### fix: Stop button looked like it wasn't working

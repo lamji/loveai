@@ -3,10 +3,15 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 // (no IPC): the renderer classifies the request locally to decide how much
 // context to inject at spawn time. Single source of truth with main.js.
 const { classifyTask } = require('./src/retrieval/classifier');
+// budgeted section assembler — enforces the classifier's charBudget as a hard
+// ceiling on injected context. Pure + synchronous, same pattern as classifyTask.
+const { assembleSections, dedupeSemanticHits } = require('./src/retrieval/assembler');
 
 contextBridge.exposeInMainWorld('deck', {
   runAgent: (cfg) => ipcRenderer.invoke('agent-run', cfg),
   classifyTask: (issue) => classifyTask(issue),
+  assembleContext: (sections, charBudget) => assembleSections(sections, charBudget),
+  dedupeSemanticHits: (vhits, rankedFiles) => dedupeSemanticHits(vhits, rankedFiles),
   aiGenerate: (prompt, model, cwd) => ipcRenderer.invoke('ai-generate', { prompt, model, cwd }),
   dictGet: (category) => ipcRenderer.invoke('dict-get', category),
   dictLearn: (category, tokens) => ipcRenderer.invoke('dict-learn', { category, tokens }),
@@ -57,6 +62,8 @@ contextBridge.exposeInMainWorld('deck', {
   fsReadImage: (root, file) => ipcRenderer.invoke('fs-read-image', { root, file }),
   fsWrite: (root, file, content) => ipcRenderer.invoke('fs-write', { root, file, content }),
   memoryList: (cwd) => ipcRenderer.invoke('memory-list', { cwd }),
+  runlogAppend: (cwd, entry) => ipcRenderer.invoke('runlog-append', { cwd, entry }),
+  runlogRecent: (cwd, n) => ipcRenderer.invoke('runlog-recent', { cwd, n }),
   memoryReindex: (cwd) => ipcRenderer.invoke('memory-reindex', { cwd }),
   fsCreate: (root, dir, rel, isDir) => ipcRenderer.invoke('fs-create', { root, dir, rel, isDir }),
   fsRename: (root, from, to) => ipcRenderer.invoke('fs-rename', { root, from, to }),
@@ -104,6 +111,7 @@ contextBridge.exposeInMainWorld('deck', {
   effortLevels: () => ipcRenderer.invoke('effort-levels'),
   planUsage: () => ipcRenderer.invoke('plan-usage'),
   sessionsList: () => ipcRenderer.invoke('sessions-list'),
+  sessionsForCwd: (cwd) => ipcRenderer.invoke('sessions-for-cwd', cwd),
   sessionLoad: (sessionId) => ipcRenderer.invoke('session-load', sessionId),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
   openAuthWindow: (url, returnOrigin) =>

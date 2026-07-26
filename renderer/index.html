@@ -84,7 +84,8 @@
       </div>
     </section>
 
-    <!-- Chats -->
+    <!-- Chats — user chats AND this project's past sessions (a chat is a
+         session too), unified into one list. -->
     <section class="side-block grow">
       <div class="side-title">◈ CHATS <button id="btn-new-chat" class="mini-btn">+ NEW</button></div>
       <div id="chat-list"></div>
@@ -109,16 +110,9 @@
         <div id="ex-tree" class="ex-tree"></div>
       </section>
     </div>
-  </aside>
 
-  <!-- ===== Central console ===== -->
-  <main id="main">
-    <div id="console-head">
-      <div class="console-title">◈ CENTRAL CONSOLE</div>
-      <div id="console-chips" class="console-chips hidden"></div>
-      <div class="head-spacer"></div>
-      <input type="file" id="file-in" multiple hidden />
-      <button id="btn-new-session" class="mini-btn icon-only" title="Start a fresh shared session (clears context for all agents)">↺</button>
+    <!-- ===== Sidebar footer — LoveAi account (moved from console header) ===== -->
+    <div class="side-foot">
       <div class="account-bar" id="account-bar" title="Your LoveAi account">
         <div class="acct-avatar" id="acct-avatar"><span id="acct-initial">·</span></div>
         <div class="acct-info">
@@ -145,6 +139,16 @@
         <div class="pm-sep"></div>
         <button class="pm-item danger" id="pm-signout">⏻ Sign out of LoveAi</button>
       </div>
+    </div>
+  </aside>
+
+  <!-- ===== Central console ===== -->
+  <main id="main">
+    <div id="console-head">
+      <div class="console-title">◈ CENTRAL CONSOLE</div>
+      <div id="console-chips" class="console-chips hidden"></div>
+      <div class="head-spacer"></div>
+      <input type="file" id="file-in" multiple hidden />
       <button id="btn-tickets" class="git-badge head-ico" title="Workspace — tickets &amp; board">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <rect x="3" y="3" width="18" height="18" rx="2.5"/>
