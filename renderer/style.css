@@ -560,6 +560,14 @@ body {
 .cr-del { flex: none; opacity: 0; font-size: 11px; }
 .chat-row:hover .cr-del { opacity: .7; }
 .cr-del:hover { opacity: 1; color: var(--red); }
+/* past-session rows folded into the CHATS list: clock icon in the spinner slot */
+.chat-row .cr-ico {
+  width: 12px; flex: none; font-size: 11px; opacity: .55; text-align: center;
+}
+.chat-row.history .cr-title { font-weight: 500; }
+
+/* ===== Sidebar › past sessions (folded into the CHATS list) ===== */
+.sh-empty { font-size: 11px; color: var(--dim); padding: 4px 2px; line-height: 1.5; }
 
 /* ===== Settings › AGENTS tab ===== */
 .set-agents-head { display: flex; justify-content: flex-end; padding: 2px 0 8px; }
@@ -948,12 +956,9 @@ body {
 .cc-x:hover { color: var(--red); }
 /* one height for every control in the header row */
 #console-head { align-items: center; padding-right: 4px; gap: 8px; }
-#console-head .account-bar {
-  margin: 0; padding: 0 12px; max-width: 240px;
-  height: var(--head-h); border-radius: 10px;
-}
-#console-head .account-bar .acct-email { font-size: 10.5px; line-height: 1.25; }
-#console-head .account-bar .acct-plan { line-height: 1.25; }
+/* sidebar footer — LoveAi account (moved out of the console header) */
+.side-foot { flex: none; border-top: 1px solid var(--stroke); padding: 10px 14px; }
+.side-foot .account-bar { margin: 0; }
 
 .agent-chip {
   display: flex; align-items: center; gap: 10px; cursor: pointer;

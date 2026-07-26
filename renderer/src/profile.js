@@ -77,12 +77,18 @@
     const wasHidden = menu.classList.contains('hidden');
     if (wasHidden) { menu.style.visibility = 'hidden'; menu.classList.remove('hidden'); }
     const w = menu.offsetWidth || 260;
+    const h = menu.offsetHeight || 300;
     if (wasHidden) { menu.classList.add('hidden'); menu.style.visibility = ''; }
     let left = r.left + r.width / 2 - w / 2;             // center under the bar
     left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
     menu.style.left = left + 'px';
     menu.style.right = 'auto';
-    menu.style.top = (r.bottom + 6) + 'px';
+    // the bar now lives at the bottom of the sidebar — drop the menu upward when
+    // there isn't room below, so it can't spill off the bottom of the viewport.
+    const openUp = r.bottom + 6 + h > window.innerHeight - 8;
+    menu.style.top = openUp
+      ? Math.max(8, r.top - 6 - h) + 'px'
+      : (r.bottom + 6) + 'px';
   }
   function setOpen(open) {
     if (open) { positionMenu(); loadUsage(); }

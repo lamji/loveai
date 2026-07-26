@@ -572,6 +572,9 @@ let activeChatId = null;
 // chat agent ids whose stored transcript is being replayed right now — the
 // chat row shows its spinner while this is in flight (see openChatSession)
 const hydratingChats = new Set();
+// this project's past SDK sessions, cached so the frequent renderChatList()
+// repaints never hit disk. Refreshed by renderSessionHistory().
+let _cachedSessions = [];
 
 function chatList() { return ws().chats || (ws().chats = []); }
 function saveChats() { saveWorkspaces(); }
@@ -645,6 +648,36 @@ function renderChatList() {
     el.onclick = () => openChatUI(chat);
     box.appendChild(el);
   }
+  appendHistoryRows(box, chats);
+}
+
+// Append this project's past SDK sessions to the SAME CHATS list — a chat is
+// itself a session, so both live under one unified list. Sessions already
+// owned by a chat are skipped (they show as the chat row above). Clicking a
+// session opens it as a continuable chat (openHistorySession).
+function appendHistoryRows(box, chats) {
+  const owned = new Set(chats.map(c => c.sdkSessionId).filter(Boolean));
+  const past = _cachedSessions.filter(s => !owned.has(s.id));
+  if (!chats.length && !past.length) {
+    box.innerHTML = '<div class="sh-empty">No chats yet — start one with ' +
+      '<b>+ NEW</b>. Past sessions in this project appear here too.</div>';
+    return;
+  }
+  for (const s of past) {
+    const el = document.createElement('div');
+    el.className = 'chat-row history';
+    el.title = (s.snippet ? s.snippet + '\n' : '') + sessionTimeLabel(s.mtime);
+    el.innerHTML = `
+      <span class="cr-ico">🕘</span>
+      <span class="cr-body">
+        <span class="cr-title"></span>
+        <span class="cr-sub"></span>
+      </span>`;
+    el.querySelector('.cr-title').textContent = s.snippet || 'Session ' + s.id.slice(0, 8);
+    el.querySelector('.cr-sub').textContent = agoText(s.mtime) + ' · ' + s.id.slice(0, 8);
+    el.onclick = () => openHistorySession(s);
+    box.appendChild(el);
+  }
 }
 
 function deleteChat(id) {
@@ -655,6 +688,51 @@ function deleteChat(id) {
   saveChats();
   if (activeChatId === id) { activeChatId = null; closeAgentView(); }
   renderChatList();
+}
+
+// ===== This project's past SDK sessions (folded into the CHATS list) =====
+// The top-right panel lists sessions across ALL projects; this list is scoped
+// to the ACTIVE project (matched by the cwd recorded inside each transcript).
+// A chat is itself a session, so instead of a separate HISTORY box these rows
+// now render at the bottom of the unified CHATS list (see appendHistoryRows).
+// This just refreshes the cached session list, then repaints that list.
+let _histTimer = null;
+async function renderSessionHistory() {
+  if (!projectDir) { _cachedSessions = []; renderChatList(); return; }
+  const dir = projectDir;
+  let sessions = [];
+  try { sessions = (await window.deck.sessionsForCwd(dir)) || []; } catch {}
+  // bail if the active project changed while the disk read was in flight —
+  // otherwise project A's sessions would paint under project B
+  if (projectDir !== dir) return;
+  _cachedSessions = sessions;
+  renderChatList();
+}
+
+// coalesce bursts (a pipeline finishing many agents) into one refresh
+function scheduleHistoryRefresh() {
+  clearTimeout(_histTimer);
+  _histTimer = setTimeout(() => { renderSessionHistory(); }, 800);
+}
+
+// Open a past session as a CONTINUABLE chat: reuse the chat already bound to it,
+// else mint one carrying its sdkSessionId so openChatUI replays the transcript
+// and the next message resumes that exact SDK context.
+function openHistorySession(s) {
+  const existing = chatList().find(c => c.sdkSessionId === s.id);
+  if (existing) { openChatUI(existing); return; }
+  const title = String(s.snippet || '').split('\n')[0].trim().slice(0, 40)
+    || 'Session ' + s.id.slice(0, 8);
+  const chat = {
+    id: uid(), title, target: 'model:claude-sonnet-5', model: 'claude-sonnet-5',
+    effort: getEffort(), plan: false, origin: 'history', ticketId: null,
+    seedPrompt: '', sdkSessionId: s.id, createdAt: Date.now(), lastAt: Date.now()
+  };
+  chatList().push(chat);
+  saveChats();
+  ensureChatAgent(chat);
+  openChatUI(chat);          // replays the transcript, then renderChatList()
+  renderSessionHistory();    // the session now lives in CHATS — drop it here
 }
 
 // one-shot done handler: capture the SDK session id the run just created/continued
@@ -1554,6 +1632,46 @@ function localIntentQuery(text) {
   return kept.length ? kept.join(' ') : raw.trim();
 }
 
+// ONE shared distillation path for cold + warm runs — they used to carry
+// drifted copies of the same haiku-refine block (9s vs 5s ceilings, duplicate
+// prompt text). Local keyword distill is the instant baseline; the model only
+// REFINES it. Refinements are cached per message text so a retry (or the warm
+// re-ask of an identical prompt) never pays the model call twice.
+const INTENT_REFINE_PROMPT =
+  'Extract a focused search query from this request, for a code search ' +
+  'index (BM25 + embeddings). Reply with ONLY space-separated keywords: ' +
+  'symbol/function/file/folder names, feature names, and error text ' +
+  'mentioned. No sentences, no punctuation, max 20 words.\n\nREQUEST:\n';
+const intentCache = new Map();   // rq -> refined query (session-lifetime)
+async function distillRagQuery(rq, cwd, ws, refineMs) {
+  if (rq.length <= 200) return rq;   // short prompts already ARE a query
+  let q = localIntentQuery(rq);
+  feedRaw('RAG', 'sys', `Intent → "${q}"`, '', ws);
+  // feed surviving tokens to the global engine — recurring non-code filler
+  // gets promoted into the stop list over time so it stops diluting search
+  try { window.deck.dictLearn('intent', q.split(' ')).catch(() => {}); } catch {}
+  const hit = intentCache.get(rq);
+  if (hit) {
+    feedRaw('RAG', 'sys', `Intent (cached) → "${hit}"`, '', ws);
+    return hit;
+  }
+  try {
+    const intent = await withTimeout(
+      window.deck.aiGenerate(
+        INTENT_REFINE_PROMPT + rq, 'claude-haiku-4-5-20251001', cwd),
+      refineMs, null);
+    if (intent && intent.ok && intent.text && intent.text.trim()) {
+      q = intent.text.trim();
+      feedRaw('RAG', 'sys', `Intent (AI) → "${q}"`, '', ws);
+      intentCache.set(rq, q);
+      if (intentCache.size > 40) {
+        intentCache.delete(intentCache.keys().next().value);
+      }
+    }
+  } catch {}
+  return q;
+}
+
 // ===== Retrieval eval (hit@k) — closes the measurement loop =====
 // At launch we record what retrieval PREDICTED (the pre-ranked file list);
 // during the run we record what the agent actually EDITED; on done this logs
@@ -1668,6 +1786,11 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   r.evalPredicted = null;
   r.evalQuery = rq;
   let fullPrompt = prompt;
+  // BUDGETED SECTIONS — every inject below is pushed here instead of being
+  // concatenated directly, then assembled through the shared assembler which
+  // enforces the classifier's charBudget as a HARD ceiling (lowest-priority
+  // sections dropped first, oversized ranked lists trimmed at line bounds).
+  const sections = [];
   // ADAPTIVE FRONT-LOAD — classify the request so a tiny bug injects a lean map
   // (few files, no whole-repo survey, one-line tool hint) while a feature or
   // architecture task still gets the full context. Deterministic + synchronous
@@ -1675,6 +1798,7 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   const task = cwd ? window.deck.classifyTask(rq) : null;
   const inj = (task && task.inject)
     || { files: 12, semantic: 12, repoMap: true, repoMapDirs: 30, tools: 'full' };
+  r.taskType = task ? task.type : 'general';
   const prepT0 = performance.now();   // how long context assembly holds the spawn
   // ---- COLD-RUN ENRICHMENT, kicked off in PARALLEL ----
   // These lookups (map check, topic memory, regression impact, lexical
@@ -1695,6 +1819,10 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
     ? withTimeout(memoryInject(cwd, rq), 2000, '') : null;
   const pImp = (!warm && !isIdx && !heavyRole && cwd)
     ? withTimeout(window.deck.regressionImpact(cwd, rq), 3000, null) : null;
+  // RECENT WORK — the compressed cross-session run log (a few hundred chars),
+  // so a fresh session knows what the last runs changed without any transcript
+  const pRecent = (!warm && !isIdx && cwd)
+    ? withTimeout(window.deck.runlogRecent(cwd, 3), 1000, null) : null;
   // SMART QUERY — a long free-form issue/prompt dilutes BM25 + vector search
   // (every filler word competes with the actual intent), so distill it into a
   // short, focused query via a fast model BEFORE the RAG front-load fires.
@@ -1703,28 +1831,8 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   // Baseline is the LOCAL distill (instant, always runs) — never the raw
   // paragraph. The model call below only REFINES it; if it times out or the
   // worker is busy, we still search on clean keywords, not the whole message.
-  let ragQuery = frontLoad && rq.length > 200 ? localIntentQuery(rq) : rq;
   const ragWs = frontLoad ? wsForAgent(agentId) : null;
-  if (frontLoad && rq.length > 200) {
-    feedRaw('RAG', 'sys', `Intent → "${ragQuery}"`, '', ragWs);
-    // feed the surviving tokens to the global engine — recurring non-code filler
-    // gets promoted into the stop list over time so it stops diluting search.
-    try { window.deck.dictLearn('intent', ragQuery.split(' ')).catch(() => {}); } catch {}
-    try {
-      const intent = await withTimeout(
-        window.deck.aiGenerate(
-          'Extract a focused search query from this request, for a code search ' +
-          'index (BM25 + embeddings). Reply with ONLY space-separated keywords: ' +
-          'symbol/function/file/folder names, feature names, and error text ' +
-          'mentioned. No sentences, no punctuation, max 20 words.\n\nREQUEST:\n' + rq,
-          'claude-haiku-4-5-20251001', cwd),
-        9000, null);
-      if (intent && intent.ok && intent.text && intent.text.trim()) {
-        ragQuery = intent.text.trim();
-        feedRaw('RAG', 'sys', `Intent (AI) → "${ragQuery}"`, '', ragWs);
-      }
-    } catch {}
-  }
+  const ragQuery = frontLoad ? await distillRagQuery(rq, cwd, ragWs, 9000) : rq;
   // withContent=0: the push is a MAP now (file names + symbols), never code —
   // the agent PULLS code mid-task via the mcp__deck__* retrieval tools
   const pCtx = frontLoad
@@ -1733,13 +1841,40 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
     ? withTimeout(window.deck.vectorQuery(cwd, ragQuery, 20), 3500, null) : null;
 
   if (pMap && await pMap) {
-    fullPrompt += '\n\nOrientation: read .loveai/index/PROJECT-MAP.md first and open only the files relevant to this task — do not survey the repo.';
+    sections.push({
+      id: 'orientation', priority: 1, required: true,
+      text: '\n\nOrientation: read .loveai/index/PROJECT-MAP.md first and open only the files relevant to this task — do not survey the repo.'
+    });
   }
   // TOPIC MEMORY — front-load only the feature memory relevant to this run so
   // the agent already knows the flow (paths, functions, step-by-step) without
   // re-exploring. Light by design: at most 1-2 topics, not the whole codebase.
   // Every role reads it and (per DISCIPLINE) every role maintains it.
-  if (pMem) fullPrompt += await pMem;
+  if (pMem) {
+    const mem = await pMem;
+    if (mem) sections.push({
+      id: 'topic-memory', priority: 5, trimmable: true, minLines: 4, text: mem
+    });
+  }
+  if (pRecent) {
+    try {
+      const rl = await pRecent;
+      if (rl && rl.ok && rl.runs && rl.runs.length) {
+        // per-record guard: one malformed record must not kill the section
+        const when = x => Number.isFinite(x.at)
+          ? new Date(x.at).toISOString().slice(0, 10) : '—';
+        const lines = rl.runs.map(x =>
+          `- [${x.type || 'task'} · ${when(x)}] ` +
+          `${x.task}${x.files && x.files.length ? ` → edited ${x.files.join(', ')}` : ''}`
+        ).join('\n');
+        sections.push({
+          id: 'recent-work', priority: 6, trimmable: true, minLines: 1,
+          text: `\n\nRECENT WORK (compressed log of the last completed runs in ` +
+            `this project — build on these, don't redo them):\n${lines}`
+        });
+      }
+    } catch {}
+  }
   // REGRESSION IMPACT (global) — the native code graph's blast-radius, injected
   // for EVERY non-indexer run so any agent/model sees what a change touches. The
   // Prompt Engineer / custom already get a richer version inside the retrieval
@@ -1748,10 +1883,13 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
     try {
       const im = await pImp;
       if (im && im.ok && im.impact && im.impact.trim()) {
-        fullPrompt += `\n\nREGRESSION IMPACT (auto, from the code graph — NOT ` +
-          `exhaustive, verify): the symbols you may change and what calls/imports ` +
-          `them. Before altering any symbol below, check EACH listed reference for ` +
-          `breakage and prefer a minimal, backward-compatible change.\n${im.impact}`;
+        sections.push({
+          id: 'impact', priority: 3, trimmable: true,
+          text: `\n\nREGRESSION IMPACT (auto, from the code graph — NOT ` +
+            `exhaustive, verify): the symbols you may change and what calls/imports ` +
+            `them. Before altering any symbol below, check EACH listed reference for ` +
+            `breakage and prefer a minimal, backward-compatible change.\n${im.impact}`
+        });
       }
     } catch {}
   }
@@ -1829,62 +1967,91 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
         // budget) only for feature/backend/architecture-class work.
         if (rc.repoMap && inj.repoMap) {
           // every repoMap-enabled tier sets repoMapDirs >= 12, so a trim always
-          // applies — keeps the whole-repo survey from ballooning the front-load
+          // applies — keeps the whole-repo survey from ballooning the front-load.
+          // Lowest priority: when the budget is tight the map is the first to
+          // shrink — the ranked files below already pinpoint the code.
           const map = rc.repoMap.split('\n').slice(0, inj.repoMapDirs).join('\n');
-          fullPrompt += `\n\nREPO MAP (directories by file count + notable files — use this for orientation instead of exploring):\n${map}`;
+          sections.push({
+            id: 'repo-map', priority: 7, trimmable: true,
+            text: `\n\nREPO MAP (directories by file count + notable files — use this for orientation instead of exploring):\n${map}`
+          });
         }
         // 2) ranked candidate files for this specific issue (capped by task class)
-        const lines = rc.files.slice(0, inj.files)
-          .map(f => `- ${f.rel}${f.symbols && f.symbols.length ? ' — ' + f.symbols.slice(0, 8).join(', ') : ''}`)
+        const shownFiles = rc.files.slice(0, inj.files)
+          .map(f => ({ rel: f.rel, symbols: (f.symbols || []).slice(0, 8) }));
+        const lines = shownFiles
+          .map(f => `- ${f.rel}${f.symbols.length ? ' — ' + f.symbols.join(', ') : ''}`)
           .join('\n');
-        fullPrompt += `\n\nPRE-RANKED RELEVANT FILES (lexical match on the issue):\n${lines}`;
-        // semantic matches from the vector index — meaning-based, complements lexical
-        if (vhits.length) {
-          const symLines = vhits.slice(0, inj.semantic)
+        sections.push({
+          id: 'ranked-files', priority: 2, trimmable: true,
+          text: `\n\nPRE-RANKED RELEVANT FILES (lexical match on the issue):\n${lines}`
+        });
+        // semantic matches from the vector index — DEDUPED against the ranked
+        // lines above so the block only carries symbols the lexical list missed
+        // (restating the same file#symbol with a score attached was pure dupe).
+        const freshHits = window.deck.dedupeSemanticHits(vhits, shownFiles);
+        if (freshHits.length) {
+          const symLines = freshHits.slice(0, inj.semantic)
             .map(h => `- ${h.id} (${h.score.toFixed(2)})`).join('\n');
-          fullPrompt += `\n\nSEMANTIC MATCHES (vector/RAG search — meaning-based, ` +
-            `use alongside the lexical list):\n${symLines}`;
+          sections.push({
+            id: 'semantic', priority: 6, trimmable: true,
+            text: `\n\nSEMANTIC MATCHES (vector/RAG search — meaning-based, ` +
+              `use alongside the lexical list):\n${symLines}`
+          });
         }
         // 3) regression blast-radius — who references the symbols you may touch.
         // The planner bakes it into the task CONTEXT so seniors inherit it.
         if (rc.impact) {
-          fullPrompt += `\n\nREGRESSION IMPACT (auto, computed from the index — NOT ` +
-            `exhaustive, verify): symbols you may change and the files that reference ` +
-            `them. Before altering any symbol below, check EACH listed reference for ` +
-            `breakage, prefer a minimal backward-compatible change, and RECORD the ` +
-            `affected files in your task's CONTEXT so the engineers inherit this.\n${rc.impact}`;
+          sections.push({
+            id: 'impact', priority: 3, trimmable: true,
+            text: `\n\nREGRESSION IMPACT (auto, computed from the index — NOT ` +
+              `exhaustive, verify): symbols you may change and the files that reference ` +
+              `them. Before altering any symbol below, check EACH listed reference for ` +
+              `breakage, prefer a minimal backward-compatible change, and RECORD the ` +
+              `affected files in your task's CONTEXT so the engineers inherit this.\n${rc.impact}`
+          });
         }
         // 3b) the other half of "what does this touch": what the trigger point
         // ITSELF calls out to (API calls, state setters, redirects, ...) — a
         // human dev traces this before editing, same as who calls it back
         if (rc.callsOut) {
-          fullPrompt += `\n\nCALLS OUT TO (auto, computed from the index — NOT ` +
-            `exhaustive, verify): what the symbols above depend on one hop out. ` +
-            `Editing a symbol below can also change what it calls — check each one.\n${rc.callsOut}`;
+          sections.push({
+            id: 'calls-out', priority: 4, trimmable: true,
+            text: `\n\nCALLS OUT TO (auto, computed from the index — NOT ` +
+              `exhaustive, verify): what the symbols above depend on one hop out. ` +
+              `Editing a symbol below can also change what it calls — check each one.\n${rc.callsOut}`
+          });
         }
         // 4) firm directive: pull code through the indexed tools, not tree surveys.
         // The full pitch is ~1k chars injected EVERY run — overkill for a small
-        // task, so those get a one-liner that still names the tools.
+        // task, so those get a one-liner that still names the tools. Required:
+        // the pull-tool nudge is what makes the slim push viable at all.
         if (inj.tools === 'full') {
-          fullPrompt += `\n\nRETRIEVAL TOOLS (indexed, answer in milliseconds — ` +
-            `PREFER these over Glob/Grep surveys):\n` +
-            `- mcp__deck__search_code — hybrid ranked file/symbol search (lexical+semantic)\n` +
-            `- mcp__deck__get_symbols — implementations + dependencies for a topic (actual code)\n` +
-            `- mcp__deck__who_references — blast radius of a symbol/file before you change it\n` +
-            `- mcp__deck__topic_memory — feature notes recorded by previous runs\n` +
-            `Workflow: the lists above say WHERE the task lives → pull code with ` +
-            `get_symbols/search_code → Read only the exact spans you will edit. ` +
-            `Do not survey the tree.\n\n` +
-            `EXECUTION GATES (call these — they keep you execution-first):\n` +
-            `- mcp__deck__execution_plan — BEFORE editing, lock in root cause + the ` +
-            `WHOLE workflow to change + how you'll validate. Stop investigating once ` +
-            `~80% sure.\n` +
-            `- mcp__deck__done_check — BEFORE reporting done, verify every gate with ` +
-            `evidence. NOT DONE means keep working; locating the bug is not fixing it.`;
+          sections.push({
+            id: 'tools', priority: 2, required: true,
+            text: `\n\nRETRIEVAL TOOLS (indexed, answer in milliseconds — ` +
+              `PREFER these over Glob/Grep surveys):\n` +
+              `- mcp__deck__search_code — hybrid ranked file/symbol search (lexical+semantic)\n` +
+              `- mcp__deck__get_symbols — implementations + dependencies for a topic (actual code)\n` +
+              `- mcp__deck__who_references — blast radius of a symbol/file before you change it\n` +
+              `- mcp__deck__topic_memory — feature notes recorded by previous runs\n` +
+              `Workflow: the lists above say WHERE the task lives → pull code with ` +
+              `get_symbols/search_code → Read only the exact spans you will edit. ` +
+              `Do not survey the tree.\n\n` +
+              `EXECUTION GATES (call these — they keep you execution-first):\n` +
+              `- mcp__deck__execution_plan — BEFORE editing, lock in root cause + the ` +
+              `WHOLE workflow to change + how you'll validate. Stop investigating once ` +
+              `~80% sure.\n` +
+              `- mcp__deck__done_check — BEFORE reporting done, verify every gate with ` +
+              `evidence. NOT DONE means keep working; locating the bug is not fixing it.`
+          });
         } else {
-          fullPrompt += `\n\nRETRIEVAL: prefer the indexed mcp__deck__* tools ` +
-            `(search_code, get_symbols, who_references) over Glob/Grep — pull only ` +
-            `the exact spans you will edit; do not survey the tree.`;
+          sections.push({
+            id: 'tools', priority: 2, required: true,
+            text: `\n\nRETRIEVAL: prefer the indexed mcp__deck__* tools ` +
+              `(search_code, get_symbols, who_references) over Glob/Grep — pull only ` +
+              `the exact spans you will edit; do not survey the tree.`
+          });
         }
       }
     } catch {}
@@ -1900,30 +2067,11 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
   // no whole-file dump (the transcript already holds the session's context).
   if (warm && cwd && a.role !== 'indexer') {
     try {
-      // SMART QUERY — same distillation as the cold front-load above: a long
-      // follow-up message dilutes BM25/vector search just as much as a long
-      // initial issue does. Tight ceiling here too — a follow-up should FEEL
-      // instant, so a slow/failed distill just falls back to the raw message.
-      // Local distill first (instant) so a busy index worker never sends the
-      // raw follow-up into search; the model only refines when it answers fast.
-      let warmQuery = rq.length > 200 ? localIntentQuery(rq) : rq;
+      // SMART QUERY — same distillation as the cold front-load above (shared
+      // helper). Tighter ceiling: a follow-up should FEEL instant, so a slow
+      // refine just falls back to the local keyword distill.
       const warmWs = wsForAgent(agentId);
-      if (rq.length > 200) {
-        feedRaw('RAG', 'sys', `Intent → "${warmQuery}"`, '', warmWs);
-        try { window.deck.dictLearn('intent', warmQuery.split(' ')).catch(() => {}); } catch {}
-        const intent = await withTimeout(
-          window.deck.aiGenerate(
-            'Extract a focused search query from this request, for a code search ' +
-            'index (BM25 + embeddings). Reply with ONLY space-separated keywords: ' +
-            'symbol/function/file/folder names, feature names, and error text ' +
-            'mentioned. No sentences, no punctuation, max 20 words.\n\nREQUEST:\n' + rq,
-            'claude-haiku-4-5-20251001', cwd),
-          5000, null).catch(() => null);
-        if (intent && intent.ok && intent.text && intent.text.trim()) {
-          warmQuery = intent.text.trim();
-          feedRaw('RAG', 'sys', `Intent (AI) → "${warmQuery}"`, '', warmWs);
-        }
-      }
+      const warmQuery = await distillRagQuery(rq, cwd, warmWs, 5000);
       // tight ceiling (was 6s): a follow-up should FEEL instant — if the index
       // worker is busy the message just goes out without per-message targeting.
       // No symbol-pack push here anymore: the agent pulls code via mcp__deck__*.
@@ -1965,27 +2113,46 @@ async function runAgent(agentId, prompt, fork = false, plan = false, opts = {}) 
         const lines = shown.map(f =>
           `- ${f.rel}${f.symbols && f.symbols.length
             ? ' — ' + f.symbols.slice(0, 6).join(', ') : ''}`).join('\n');
-        fullPrompt += `\n\nTARGET FILES for THIS message (auto-retrieved from ` +
-          `the project index — this is where the request lives):\n${lines}`;
-        fullPrompt += `\n\nEFFICIENCY: retrieval already located this ` +
-          `message's code (list above). Pull implementations via ` +
-          `mcp__deck__search_code / mcp__deck__get_symbols (indexed, instant) ` +
-          `instead of Glob/Grep surveys; Read only the exact spans you will edit.`;
+        sections.push({
+          id: 'target-files', priority: 1, trimmable: true,
+          text: `\n\nTARGET FILES for THIS message (auto-retrieved from ` +
+            `the project index — this is where the request lives):\n${lines}`
+        });
+        sections.push({
+          id: 'efficiency', priority: 2, required: true,
+          text: `\n\nEFFICIENCY: retrieval already located this ` +
+            `message's code (list above). Pull implementations via ` +
+            `mcp__deck__search_code / mcp__deck__get_symbols (indexed, instant) ` +
+            `instead of Glob/Grep surveys; Read only the exact spans you will edit.`
+        });
         feedRaw('RAG', 'sys',
           `${files.length} target files`, '', warmWs);
       }
     } catch {}
   }
 
+  // ASSEMBLE under the hard budget. The classifier's charBudget now actually
+  // bounds the inject (it was previously advisory — item counts only). Warm
+  // follow-ups get a small slice: the transcript already carries the session's
+  // context, so per-message targeting must stay cheap.
+  const charBudget = task ? task.charBudget : 12000;
+  const injectBudget = warm ? Math.min(4000, charBudget) : charBudget;
+  const asm = window.deck.assembleContext(sections, injectBudget);
+  fullPrompt = prompt + asm.text;
   // launch transparency — attribute slow starts at a glance: this line is the
   // renderer-side prep cost; the Δ shown on the ⚡session line is the SDK
   // subprocess spawn + session-resume cost. Model latency is everything after.
   const prepMs = Math.round(performance.now() - prepT0);
-  const injectedK = (fullPrompt.length - prompt.length) / 1000;
-  if (prepMs > 300 || injectedK > 0.5) {
-    const cls = task ? ` · ${task.type} budget` : '';
+  const injectedK = asm.chars / 1000;
+  if (prepMs > 300 || injectedK > 0.5 || asm.dropped.length) {
+    const cls = task ? `${task.type} ` : '';
+    const trimmed = asm.included.filter(s => s.trimmed).map(s => s.id);
+    const detail =
+      (trimmed.length ? ` · trimmed: ${trimmed.join(',')}` : '') +
+      (asm.dropped.length ? ` · dropped: ${asm.dropped.join(',')}` : '');
     feed(agentId, 'sys',
-      `context assembled in ${prepMs}ms · +${injectedK.toFixed(1)}k chars injected${cls} · spawning…`, '⏱');
+      `context assembled in ${prepMs}ms · +${injectedK.toFixed(1)}k/` +
+      `${(injectBudget / 1000).toFixed(0)}k chars (${cls}budget)${detail} · spawning…`, '⏱');
   }
   r.spawnT0 = Date.now();
   await window.deck.runAgent({
@@ -2227,8 +2394,38 @@ window.deck.onAgentEvent(ev => {
       if (finishedAgent && finishedAgent.role !== 'indexer' && memCwd) {
         window.deck.memoryReindex(memCwd).catch(() => {});
       }
+      // conversation compression: persist a compact record of this run (task
+      // class, distilled task line, files edited, first line of the outcome).
+      // Cold runs inject the last few records as RECENT WORK — cross-session
+      // continuity without ever replaying a transcript. Written BEFORE the
+      // eval below, which nulls the edited-files set.
+      if (r.cpCwd && r.lastResult === 'success'
+          && finishedAgent && finishedAgent.role !== 'indexer') {
+        try {
+          const rootFwd = String(r.cpCwd).replace(/\\/g, '/').replace(/\/+$/, '') + '/';
+          const norm = (p) => {
+            let s = String(p).replace(/\\/g, '/');
+            if (s.toLowerCase().startsWith(rootFwd.toLowerCase())) s = s.slice(rootFwd.length);
+            return s;
+          };
+          const edited = r.evalEdited ? [...new Set([...r.evalEdited].map(norm))] : [];
+          // only runs that CHANGED something earn a record — chat answers
+          // would churn the 30-record cap and evict the edits that matter
+          if (edited.length) {
+            window.deck.runlogAppend(r.cpCwd, {
+              type: r.taskType || '',
+              task: String(r.evalQuery || '').slice(0, 200),
+              files: edited.slice(0, 8),
+              outcome: String(r.lastText || '').slice(0, 400)
+            }).catch(() => {});
+          }
+        } catch {}
+      }
       // retrieval eval: did the pre-ranked list contain the edited files?
       logRetrievalEval(r, r.cpCwd || memCwd);
+      // a finished run may have created/continued a session on disk — refresh
+      // the sidebar history so it surfaces (chat-owned sessions stay deduped)
+      scheduleHistoryRefresh();
       if (r.planMode && r.lastResult === 'success') {
         feed(ev.agentId, 'sys', 'plan complete — nothing was written yet.', '🗺');
         feedImplementCard(ev.agentId, r.sessionId);
@@ -3435,31 +3632,6 @@ cxInput.addEventListener('keydown', e => {
   else if (e.key === 'Escape' && document.getElementById('cx-mention').classList.contains('hidden') && document.getElementById('cx-slash').classList.contains('hidden')) closeChatExpand();
 });
 
-document.getElementById('btn-new-session').onclick = () => {
-  // a real assistant's "new chat" ALWAYS works — force-stop every run instead of
-  // refusing. Covers a wedged flag (running stuck true with no live process to
-  // abort), the exact trap where the operator couldn't reset a stale session.
-  const runningIds = Object.keys(rt).filter(id => rt[id].running);
-  runningIds.forEach(id => { try { stopAgent(id); } catch {} });
-  Object.keys(rt).forEach(id => {
-    if (rt[id].running) { rt[id].running = false; setRunningUI(id, false); }
-  });
-  clearSession();
-  // wipe this project's visible feed (background workspaces keep their own
-  // buffers untouched — see stashFeed/restoreFeed) so the reset is obvious.
-  feedContentNodes().forEach(n => n.remove());
-  closeAgentView();
-  // 'SESSION' isn't in SILENT_FEED_TAGS (unlike 'PIPELINE'), so this actually
-  // renders — the old plog('info', ...) call here used the silenced tag and
-  // never showed up, leaving the operator with no confirmation.
-  const stopped = runningIds.length
-    ? ` (stopped ${runningIds.length} running agent(s))` : '';
-  feedRaw('SESSION', 'ok',
-    `new session started — console cleared${stopped}. ` +
-    `next run (${currentTargetLabel()}) starts with a fresh context.`,
-    '↺');
-};
-
 // ============================================================
 // Follow-up chat modal (per agent, shared session context)
 // ============================================================
@@ -4135,6 +4307,7 @@ function refreshProjectBindings() {
   if (typeof syncTermsToWorkspace === 'function') syncTermsToWorkspace();
   // re-sync stop button / status bar / console-vs-editor pane for this workspace
   renderActivity();
+  renderSessionHistory();   // this project's past sessions in the sidebar
   if (projectDir) {
     window.deck.symbolEnsure(projectDir)
       .then(r => { if (r && r.ok) window.deck.symbolWatch(projectDir).catch(() => {}); })
